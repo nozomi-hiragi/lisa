@@ -1,6 +1,7 @@
 mod cache;
 #[cfg(debug_assertions)]
 mod debug;
+mod gesture;
 mod layout;
 mod menu;
 mod preview;

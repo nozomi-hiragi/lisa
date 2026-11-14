@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::SystemParam;
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
@@ -27,7 +26,7 @@ use crate::tree::{FileTree, NodeId};
 /// ワールド座標での Root の高さ。幅はウィンドウの縦横比に合わせる。
 const ROOT_HEIGHT: f32 = 1000.0;
 /// ズームにかける時間（秒）。
-const ZOOM_SECONDS: f32 = 0.4;
+pub(crate) const ZOOM_SECONDS: f32 = 0.4;
 /// 画像から本物の描画へ切り替えるときのフェードの時間（秒）。
 const FADE_SECONDS: f32 = 0.1;
 
@@ -52,6 +51,7 @@ impl Plugin for TreeViewPlugin {
         .insert_resource(Bake::Waiting)
         .insert_resource(Breadcrumb("Root".into()))
         .init_resource::<Busy>()
+        .init_resource::<crate::gesture::Gesture>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -61,7 +61,7 @@ impl Plugin for TreeViewPlugin {
                 relayout,
                 show_relayout,
                 navigate,
-                scroll,
+                crate::gesture::gesture,
                 refit_on_resize,
                 animate_camera,
                 fade_scenes,
@@ -76,28 +76,28 @@ impl Plugin for TreeViewPlugin {
 
 /// 開いてきた道のり。最後が今フィーチャーしている（枠が画面いっぱいに映っている）もの。
 #[derive(Resource)]
-struct Nav {
-    stack: Vec<Level>,
+pub(crate) struct Nav {
+    pub(crate) stack: Vec<Level>,
 }
 
 impl Nav {
-    fn top(&self) -> &Level {
+    pub(crate) fn top(&self) -> &Level {
         self.stack.last().expect("Root は常にある")
     }
 }
 
 #[derive(Clone, Copy)]
-struct Level {
-    node: NodeId,
+pub(crate) struct Level {
+    pub(crate) node: NodeId,
     /// 場面全体を上下にずらす量（親がスクロールしていた分）。
-    shift: f32,
+    pub(crate) shift: f32,
     /// 列（ファイル、フォルダ）ごとに、何行目から見せているか。
-    scroll: [usize; 2],
+    pub(crate) scroll: [usize; 2],
 }
 
 impl Level {
     /// 画面に映すべき枠（ワールド座標）。
-    fn frame(&self, layouts: &Layouts) -> Rect {
+    pub(crate) fn frame(&self, layouts: &Layouts) -> Rect {
         let frame = layouts.0[self.node].frame;
         Rect {
             min: frame.min + Vec2::new(0.0, self.shift),
@@ -106,12 +106,12 @@ impl Level {
     }
 
     /// その列の行を描いている位置のずれ（自分のずれ＋その列のスクロールの分）。
-    fn column_shift(&self, layouts: &Layouts, column: usize) -> f32 {
+    pub(crate) fn column_shift(&self, layouts: &Layouts, column: usize) -> f32 {
         self.shift + self.scroll[column] as f32 * layouts.0[self.node].list.row_height
     }
 
     /// 今見えている、その列の子。
-    fn visible(&self, tree: &FileTree, layouts: &Layouts, column: usize) -> Vec<NodeId> {
+    pub(crate) fn visible(&self, tree: &FileTree, layouts: &Layouts, column: usize) -> Vec<NodeId> {
         let items = column_items(tree, self.node, column);
         let fit = layouts.0[self.node].list.fit;
         let first = self.scroll[column].min(items.len());
@@ -121,7 +121,7 @@ impl Level {
 
 /// 今いる場所（Root からの道のり）。
 #[derive(Resource)]
-struct Breadcrumb(String);
+pub(crate) struct Breadcrumb(pub(crate) String);
 
 /// ズームやフェードの最中なら true（毎フレーム描画している）。
 #[derive(Resource, Default)]
@@ -133,49 +133,52 @@ pub struct TitleSuffix(pub Option<String>);
 
 /// 画面を映すカメラ（画像を焼くカメラと区別する）。
 #[derive(Component)]
-struct MainCamera;
+pub(crate) struct MainCamera;
 
 /// 今画面に本物として描いている場面。
 #[derive(Resource)]
-struct CurrentScene(Entity);
+pub(crate) struct CurrentScene(pub(crate) Entity);
 
 /// カメラのズーム中だけ存在する。これがあるあいだはディスプレイの FPS で描画する。
 #[derive(Resource)]
-struct Animating {
-    from_pos: Vec2,
-    from_scale: f32,
-    to_pos: Vec2,
-    to_scale: f32,
+pub(crate) struct Animating {
+    pub(crate) from_pos: Vec2,
+    pub(crate) from_scale: f32,
+    pub(crate) to_pos: Vec2,
+    pub(crate) to_scale: f32,
     /// 待機中は Bevy の Time の進み方が不規則なので、実時間で測る。
-    started: Instant,
+    pub(crate) started: Instant,
     /// ズームが終わったら、今の位置（Nav の最後）の本物の場面に切り替える。
-    then_show: bool,
+    pub(crate) then_show: bool,
+    /// かける時間（秒）と、速さの緩急。
+    pub(crate) seconds: f32,
+    pub(crate) ease: Ease,
 }
 
 /// 場面のフェード。終わったら、フェードアウトなら場面を消し、フェードインなら `replaces` を消す。
 #[derive(Component)]
-struct Fade {
-    started: Instant,
-    fade_in: bool,
-    replaces: Option<Entity>,
+pub(crate) struct Fade {
+    pub(crate) started: Instant,
+    pub(crate) fade_in: bool,
+    pub(crate) replaces: Option<Entity>,
 }
 
 /// 場面を作るのに要るもの。
 #[derive(SystemParam)]
-struct SceneMaker<'w, 's> {
-    commands: Commands<'w, 's>,
-    meshes: ResMut<'w, Assets<Mesh>>,
-    materials: ResMut<'w, Assets<ColorMaterial>>,
-    tree: Res<'w, FileTree>,
-    layouts: Res<'w, Layouts>,
-    images: Res<'w, FolderImages>,
-    font: Res<'w, LabelFont>,
+pub(crate) struct SceneMaker<'w, 's> {
+    pub(crate) commands: Commands<'w, 's>,
+    pub(crate) meshes: ResMut<'w, Assets<Mesh>>,
+    pub(crate) materials: ResMut<'w, Assets<ColorMaterial>>,
+    pub(crate) tree: Res<'w, FileTree>,
+    pub(crate) layouts: Res<'w, Layouts>,
+    pub(crate) images: Res<'w, FolderImages>,
+    pub(crate) font: Res<'w, LabelFont>,
 }
 
 impl SceneMaker<'_, '_> {
     /// 画面に出す本物の場面を作る。`path` の最後がその場面で、手前は外側のフォルダ。
     /// `scale` はその場面を画面いっぱいに見るときの倍率。
-    fn spawn(&mut self, path: &[Level], scale: f32) -> Entity {
+    pub(crate) fn spawn(&mut self, path: &[Level], scale: f32) -> Entity {
         let (level, outer) = path.split_last().expect("場面がある");
         let ancestors: Vec<(NodeId, f32)> = outer.iter().map(|l| (l.node, l.shift)).collect();
         let source = SceneSource {
@@ -366,7 +369,7 @@ fn show_relayout(
 }
 
 /// 本物として描く場面までの道のり。開いているのがファイルなら、その親のフォルダまで。
-fn scene_path<'a>(nav: &'a Nav, tree: &FileTree) -> &'a [Level] {
+pub(crate) fn scene_path<'a>(nav: &'a Nav, tree: &FileTree) -> &'a [Level] {
     let depth = nav
         .stack
         .iter()
@@ -375,8 +378,14 @@ fn scene_path<'a>(nav: &'a Nav, tree: &FileTree) -> &'a [Level] {
     &nav.stack[..=depth]
 }
 
+/// 今いる場所を、ウィンドウのタイトルとメニューバーに出す。
+pub(crate) fn show_breadcrumb(commands: &mut Commands, tree: &FileTree, node: NodeId) {
+    commands.insert_resource(Breadcrumb(tree.path(node)));
+    commands.insert_resource(MenuBreadcrumb(tree.path(node)));
+}
+
 /// `rect` がメニューバーの下の領域いっぱいに収まるカメラの位置と倍率。
-fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
+pub(crate) fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
     let view_height = window.height() - BAR_PX;
     let scale = (rect.width() / window.width()).max(rect.height() / view_height);
     // 画面の中心より、バーの高さの半分だけ下に枠の中心が来るようにする。
@@ -384,7 +393,7 @@ fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
 }
 
 /// メニューバーの上やポップアップを操作しているときは、下の画面は操作しない。
-fn ui_has_pointer(window: &Window, popup: &Popup) -> bool {
+pub(crate) fn ui_has_pointer(window: &Window, popup: &Popup) -> bool {
     popup.open || window.cursor_position().is_some_and(|p| p.y < BAR_PX)
 }
 
@@ -419,9 +428,14 @@ fn navigate(
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
     popup: Res<Popup>,
+    gesture: Res<crate::gesture::Gesture>,
 ) {
-    // 切り替えの途中や、メニューを操作しているときは受け付けない。
-    if animating.is_some() || !fades.is_empty() || ui_has_pointer(&window, &popup) {
+    // 切り替えの途中や、メニューやジェスチャーを操作しているときは受け付けない。
+    if animating.is_some()
+        || !fades.is_empty()
+        || gesture.active()
+        || ui_has_pointer(&window, &popup)
+    {
         return;
     }
     let window = window.into_inner();
@@ -484,12 +498,7 @@ fn navigate(
     };
 
     let next = *nav.top();
-    maker
-        .commands
-        .insert_resource(Breadcrumb(maker.tree.path(next.node)));
-    maker
-        .commands
-        .insert_resource(MenuBreadcrumb(maker.tree.path(next.node)));
+    show_breadcrumb(&mut maker.commands, &maker.tree, next.node);
     let (to_pos, to_scale) = fit(next.frame(&maker.layouts), &window);
     maker.commands.insert_resource(Animating {
         from_pos: camera_transform.translation.truncate(),
@@ -498,70 +507,9 @@ fn navigate(
         to_scale,
         started: Instant::now(),
         then_show,
+        seconds: ZOOM_SECONDS,
+        ease: Ease::InOut,
     });
-}
-
-/// ホイールやトラックパッドで、今のフォルダの行をスクロールする。
-#[allow(clippy::too_many_arguments)]
-fn scroll(
-    mut wheel: MessageReader<MouseWheel>,
-    mut pending: Local<f32>,
-    mut nav: ResMut<Nav>,
-    mut current: ResMut<CurrentScene>,
-    mut maker: SceneMaker,
-    window: Single<&Window, With<PrimaryWindow>>,
-    camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
-    animating: Option<Res<Animating>>,
-    fades: Query<(), With<Fade>>,
-    popup: Res<Popup>,
-) {
-    for event in wheel.read() {
-        // 上へ回すと前の行へ。ピクセル単位（トラックパッド）は 40px で1行。
-        *pending -= match event.unit {
-            MouseScrollUnit::Line => event.y,
-            MouseScrollUnit::Pixel => event.y / 40.0,
-        };
-    }
-    if animating.is_some() || !fades.is_empty() || ui_has_pointer(&window, &popup) {
-        *pending = 0.0;
-        return;
-    }
-    let rows = pending.trunc();
-    if rows == 0.0 {
-        return;
-    }
-    *pending -= rows;
-
-    let top = *nav.top();
-    if !maker.tree.nodes[top.node].is_dir {
-        return;
-    }
-    // カーソルのある列をスクロールする。
-    let (camera, camera_global) = camera.into_inner();
-    let Some(world) = window
-        .cursor_position()
-        .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
-    else {
-        return;
-    };
-    let list = maker.layouts.0[top.node].list;
-    let middle = (list.columns[0].max.x + list.columns[1].min.x) / 2.0;
-    let column = if world.x < middle { 0 } else { 1 };
-    let count = column_items(&maker.tree, top.node, column).len();
-    if count <= list.fit {
-        return;
-    }
-    let scroll = (top.scroll[column] as f32 + rows).clamp(0.0, (count - list.fit) as f32) as usize;
-    if scroll == top.scroll[column] {
-        return;
-    }
-    let level = nav.stack.last_mut().expect("Root は常にある");
-    level.scroll[column] = scroll;
-    let level = *level;
-    // 見えている行だけを作り直す。
-    let (_, scale) = fit(level.frame(&maker.layouts), &window);
-    maker.commands.entity(current.0).despawn();
-    current.0 = maker.spawn(&nav.stack, scale);
 }
 
 /// ウィンドウの大きさが変わったら、フィーチャー中の枠に合わせ直す。
@@ -594,8 +542,8 @@ fn animate_camera(
     let Some(anim) = animating else {
         return;
     };
-    let t = (anim.started.elapsed().as_secs_f32() / ZOOM_SECONDS).min(1.0);
-    let e = ease_in_out(t);
+    let t = (anim.started.elapsed().as_secs_f32() / anim.seconds).min(1.0);
+    let e = anim.ease.apply(t);
 
     // 倍率は対数で補間すると、ズームの速さが一定に見える。
     let scale = (anim.from_scale.ln() + (anim.to_scale.ln() - anim.from_scale.ln()) * e).exp();
@@ -640,6 +588,24 @@ fn zoom_position(anim: &Animating, scale: f32, e: f32) -> Vec2 {
     }
     let center = (anim.to_pos - anim.from_pos * ratio) / (1.0 - ratio);
     center + (anim.from_pos - center) * (scale / anim.from_scale)
+}
+
+/// 速さの緩急。
+#[derive(Clone, Copy)]
+pub(crate) enum Ease {
+    /// ゆっくり始まり、ゆっくり止まる（ズーム）。
+    InOut,
+    /// すぐ動き出し、ゆっくり止まる（ばねで戻る）。
+    Out,
+}
+
+impl Ease {
+    fn apply(self, t: f32) -> f32 {
+        match self {
+            Ease::InOut => ease_in_out(t),
+            Ease::Out => 1.0 - (1.0 - t).powi(3),
+        }
+    }
 }
 
 fn ease_in_out(t: f32) -> f32 {
@@ -701,10 +667,12 @@ fn fade_scenes(
 fn keep_redrawing(
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
+    gesture: Res<crate::gesture::Gesture>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut busy: ResMut<Busy>,
 ) {
-    busy.0 = animating.is_some() || !fades.is_empty();
+    // ジェスチャーの最中も、指を離したのを（入力が止まったことで）見分けるために回し続ける。
+    busy.0 = animating.is_some() || !fades.is_empty() || gesture.active();
     if busy.0 {
         redraw.write(RequestRedraw);
     }
