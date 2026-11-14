@@ -3,12 +3,13 @@
 //! 画面に出す本物の描画にも、キャッシュの画像を焼くときにも、同じ場面を使う。
 
 use bevy::camera::visibility::RenderLayers;
+use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use bevy::sprite_render::ColorMaterial;
 
 use crate::cache::FolderImages;
-use crate::layout::{NodeLayout, folder_body, folder_tab};
+use crate::layout::{MAX_ROWS, NodeLayout, contents_area, folder_body, folder_tab};
 use crate::preview;
 use crate::shapes::{Painter, over};
 use crate::tree::{FileTree, NodeId, format_size};
@@ -26,7 +27,18 @@ pub struct SceneSource<'a> {
     pub font: &'a Handle<Font>,
 }
 
+/// 行の見せ方。
+#[derive(Clone, Copy)]
+pub enum Rows {
+    /// 入る分だけ先頭から並べ、はみ出すときは最後の行を「…ほか N 件」にする（画像用）。
+    Summary,
+    /// 指定した行から MAX_ROWS 行ぶんを並べる（スクロール中の本物の場面用）。
+    Scroll(usize),
+}
+
 /// フォルダ `folder` の場面を作る。`scale` はこの倍率で見たときにくっきり見えるように作る。
+/// `shift` は場面全体を上下にずらす量（親の場面がスクロールしていた分）。
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -35,12 +47,14 @@ pub fn spawn(
     folder: NodeId,
     layer: RenderLayers,
     scale: f32,
+    shift: f32,
+    rows: Rows,
 ) -> Entity {
     let tree = source.tree;
-    let parent = commands
+    let root = commands
         .spawn((
             SceneRoot,
-            Transform::default(),
+            Transform::from_xyz(0.0, shift, 0.0),
             Visibility::default(),
             layer.clone(),
         ))
@@ -49,8 +63,8 @@ pub fn spawn(
         commands,
         meshes,
         materials,
-        parent,
-        layer,
+        parent: root,
+        layer: layer.clone(),
         scale,
         font: source.font.clone(),
     };
@@ -59,14 +73,37 @@ pub fn spawn(
     let node = &tree.nodes[folder];
     let z = node.depth as f32;
     let background = folder_color(tree, folder);
+    let frame = source.layouts[folder].frame;
     if folder != FileTree::ROOT {
-        let frame = source.layouts[folder].frame;
         painter.rect(folder_tab(frame), background, z);
         painter.rect(folder_body(frame), background, z);
     }
 
+    let children = &node.children;
+    if children.is_empty() {
+        return root;
+    }
+    let count = children.len();
+    let row_height = source.layouts[children[0]].row.height();
+
+    // どの行を描くか。スクロールしているときは、行全体を上へずらす。
+    let (first, shown, more) = match rows {
+        Rows::Summary if count > MAX_ROWS => (0, MAX_ROWS - 1, Some(count - (MAX_ROWS - 1))),
+        Rows::Summary => (0, count, None),
+        Rows::Scroll(first) => (first, count.min(first + MAX_ROWS) - first, None),
+    };
+    painter.parent = painter
+        .commands
+        .spawn((
+            ChildOf(root),
+            Transform::from_xyz(0.0, first as f32 * row_height, 0.0),
+            Visibility::default(),
+            layer,
+        ))
+        .id();
+
     // 直下の行。
-    for &child in &node.children {
+    for &child in &children[first..first + shown] {
         let l = &source.layouts[child];
         let child_node = &tree.nodes[child];
         let z = child_node.depth as f32;
@@ -92,18 +129,63 @@ pub fn spawn(
         } else {
             format!("{}  {}", child_node.name, format_size(child_node.size))
         };
-        let left = l.label.min.x + l.label.height() * 0.1;
-        painter.text(
-            text,
-            Vec2::new(left, l.label.center().y),
-            Anchor::CENTER_LEFT,
-            l.label.height() * 0.18,
-            l.label.max.x - left,
-            over(background, Color::WHITE, 0.9),
-            z + 0.2,
+        label(&mut painter, &l.label, text, background, 0.9, z);
+    }
+
+    // はみ出した分の数。
+    if let Some(more) = more {
+        let l = &source.layouts[children[MAX_ROWS - 1]];
+        let z = node.depth as f32 + 1.0;
+        label(
+            &mut painter,
+            &l.label,
+            format!("…ほか {more} 件"),
+            background,
+            0.5,
+            z,
         );
     }
-    parent
+
+    // スクロールできるときは、右端に今どこを見ているかの棒を出す。
+    if let Rows::Scroll(first) = rows
+        && count > MAX_ROWS
+    {
+        painter.parent = root;
+        let area = contents_area(frame);
+        let pad = frame.height() * 0.04;
+        let x = area.max.x + pad * 0.35;
+        let track = Rect::new(x, area.min.y, x + pad * 0.3, area.max.y);
+        let top = area.max.y - area.height() * first as f32 / count as f32;
+        let height = area.height() * MAX_ROWS as f32 / count as f32;
+        painter.rect(track, over(background, Color::WHITE, 0.08), z + 0.3);
+        painter.rect(
+            Rect::new(track.min.x, top - height, track.max.x, top),
+            over(background, Color::WHITE, 0.35),
+            z + 0.4,
+        );
+    }
+    root
+}
+
+/// 行の左に名前を書く。
+fn label(
+    painter: &mut Painter,
+    rect: &Rect,
+    text: String,
+    background: Color,
+    strength: f32,
+    z: f32,
+) {
+    let left = rect.min.x + rect.height() * 0.1;
+    painter.text(
+        text,
+        Vec2::new(left, rect.center().y),
+        Anchor::CENTER_LEFT,
+        rect.height() * 0.18,
+        rect.max.x - left,
+        over(background, Color::WHITE, strength),
+        z + 0.2,
+    );
 }
 
 /// フォルダの枠の色。親の枠の上に、端末の色を薄く重ねる（不透明な色として求める）。

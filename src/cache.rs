@@ -14,7 +14,7 @@ use bevy::sprite_render::ColorMaterial;
 use bevy::window::RequestRedraw;
 
 use crate::layout::Layouts;
-use crate::scene::{self, LabelFont, SceneSource};
+use crate::scene::{self, LabelFont, Rows, SceneSource};
 use crate::tree::{FileTree, NodeId};
 
 /// 画像の幅（ピクセル）。高さはウィンドウの縦横比に合わせる。
@@ -122,6 +122,8 @@ pub fn bake(
                     id,
                     layer.clone(),
                     scale,
+                    0.0,
+                    Rows::Summary,
                 ));
                 entities.push(
                     commands

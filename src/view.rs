@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::SystemParam;
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
@@ -16,8 +17,8 @@ use bevy::window::{PrimaryWindow, RequestRedraw, WindowResized};
 use bevy::winit::{UpdateMode, WinitSettings};
 
 use crate::cache::{self, Bake, BakeFinished, FolderImages};
-use crate::layout::{Layouts, layout};
-use crate::scene::{self, BACKGROUND, LabelFont, SceneRoot, SceneSource};
+use crate::layout::{Layouts, MAX_ROWS, layout};
+use crate::scene::{self, BACKGROUND, LabelFont, Rows, SceneRoot, SceneSource};
 use crate::shapes::BaseAlpha;
 use crate::tree::{FileTree, NodeId};
 
@@ -39,7 +40,13 @@ impl Plugin for TreeViewPlugin {
         })
         .insert_resource(ClearColor(BACKGROUND))
         .insert_resource(FileTree::dummy())
-        .insert_resource(Focus(FileTree::ROOT))
+        .insert_resource(Nav {
+            stack: vec![Level {
+                node: FileTree::ROOT,
+                shift: 0.0,
+                scroll: 0,
+            }],
+        })
         .insert_resource(Bake::Waiting)
         .add_systems(Startup, setup)
         .add_systems(
@@ -48,6 +55,7 @@ impl Plugin for TreeViewPlugin {
                 cache::bake,
                 show_baked,
                 navigate,
+                scroll,
                 refit_on_resize,
                 animate_camera,
                 fade_scenes,
@@ -58,9 +66,46 @@ impl Plugin for TreeViewPlugin {
     }
 }
 
-/// 今フィーチャーしている（枠が画面いっぱいに映っている）フォルダかファイル。
+/// 開いてきた道のり。最後が今フィーチャーしている（枠が画面いっぱいに映っている）もの。
 #[derive(Resource)]
-struct Focus(NodeId);
+struct Nav {
+    stack: Vec<Level>,
+}
+
+impl Nav {
+    fn top(&self) -> &Level {
+        self.stack.last().expect("Root は常にある")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Level {
+    node: NodeId,
+    /// 場面全体を上下にずらす量（親がスクロールしていた分）。
+    shift: f32,
+    /// 何行目から見せているか。
+    scroll: usize,
+}
+
+impl Level {
+    /// 画面に映すべき枠（ワールド座標）。
+    fn frame(&self, layouts: &Layouts) -> Rect {
+        let frame = layouts.0[self.node].frame;
+        Rect {
+            min: frame.min + Vec2::new(0.0, self.shift),
+            max: frame.max + Vec2::new(0.0, self.shift),
+        }
+    }
+
+    /// 子の行を描いている位置のずれ（自分のずれ＋スクロールの分）。
+    fn child_shift(&self, tree: &FileTree, layouts: &Layouts) -> f32 {
+        let row_height = tree.nodes[self.node]
+            .children
+            .first()
+            .map_or(0.0, |c| layouts.0[*c].row.height());
+        self.shift + self.scroll as f32 * row_height
+    }
+}
 
 /// 画面を映すカメラ（画像を焼くカメラと区別する）。
 #[derive(Component)]
@@ -79,8 +124,8 @@ struct Animating {
     to_scale: f32,
     /// 待機中は Bevy の Time の進み方が不規則なので、実時間で測る。
     started: Instant,
-    /// ズームが終わったら本物の場面に切り替えるフォルダ。
-    then_show: Option<NodeId>,
+    /// ズームが終わったら、今の位置（Nav の最後）の本物の場面に切り替える。
+    then_show: bool,
 }
 
 /// 場面のフェード。終わったら、フェードアウトなら場面を消し、フェードインなら `replaces` を消す。
@@ -105,7 +150,7 @@ struct SceneMaker<'w, 's> {
 
 impl SceneMaker<'_, '_> {
     /// 画面に出す本物の場面を作る。`scale` はその場面を画面いっぱいに見るときの倍率。
-    fn spawn(&mut self, folder: NodeId, scale: f32) -> Entity {
+    fn spawn(&mut self, level: &Level, scale: f32) -> Entity {
         let source = SceneSource {
             tree: &self.tree,
             layouts: &self.layouts.0,
@@ -117,9 +162,11 @@ impl SceneMaker<'_, '_> {
             &mut self.meshes,
             &mut self.materials,
             &source,
-            folder,
+            level.node,
             RenderLayers::layer(0),
             scale,
+            level.shift,
+            Rows::Scroll(level.scroll),
         )
     }
 }
@@ -166,6 +213,8 @@ fn setup(
         FileTree::ROOT,
         RenderLayers::layer(0),
         scale,
+        0.0,
+        Rows::Scroll(0),
     );
 
     commands.insert_resource(CurrentScene(root_scene));
@@ -185,7 +234,7 @@ fn show_baked(
     finished: Option<Res<BakeFinished>>,
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
-    focus: Res<Focus>,
+    nav: Res<Nav>,
     window: Single<&Window, With<PrimaryWindow>>,
 ) {
     if finished.is_none() {
@@ -193,8 +242,8 @@ fn show_baked(
     }
     maker.commands.remove_resource::<BakeFinished>();
     maker.commands.entity(current.0).despawn();
-    let (_, scale) = fit(maker.layouts.0[focus.0].frame, &window);
-    current.0 = maker.spawn(focus.0, scale);
+    let (_, scale) = fit(nav.top().frame(&maker.layouts), &window);
+    current.0 = maker.spawn(nav.top(), scale);
 }
 
 /// 左クリックしたフォルダかファイルへズームイン、右クリックか Esc で親へズームアウト。
@@ -204,7 +253,7 @@ fn navigate(
     keys: Res<ButtonInput<KeyCode>>,
     window: Single<&mut Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform, &Transform, &Projection), With<MainCamera>>,
-    mut focus: ResMut<Focus>,
+    mut nav: ResMut<Nav>,
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
     animating: Option<Res<Animating>>,
@@ -219,53 +268,64 @@ fn navigate(
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
+    let top = *nav.top();
 
-    let zoom_in = mouse.just_pressed(MouseButton::Left);
-    let next = if zoom_in {
-        // 今の場面の直下で、クリックした行（名前か枠）。
-        window
+    let then_show = if mouse.just_pressed(MouseButton::Left) {
+        // 今の場面に見えている行のうち、クリックした行（名前か枠）。
+        let shift = top.child_shift(&maker.tree, &maker.layouts);
+        let children = &maker.tree.nodes[top.node].children;
+        let visible =
+            &children[top.scroll.min(children.len())..children.len().min(top.scroll + MAX_ROWS)];
+        let Some(child) = window
             .cursor_position()
             .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
             .and_then(|world| {
-                maker.tree.nodes[focus.0]
-                    .children
+                let world = world - Vec2::new(0.0, shift);
+                visible
                     .iter()
                     .copied()
                     .find(|c| maker.layouts.0[*c].row.contains(world))
             })
-    } else if mouse.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::Escape) {
-        maker.tree.nodes[focus.0].parent
-    } else {
-        None
-    };
-    let Some(next) = next else {
-        return;
-    };
-    window.title = format!("Lisa — {}", maker.tree.path(next));
-    let (to_pos, to_scale) = fit(maker.layouts.0[next].frame, &window);
-    let then_show = if zoom_in {
+        else {
+            return;
+        };
+        nav.stack.push(Level {
+            node: child,
+            shift,
+            scroll: 0,
+        });
         // 画像のままズームして、終わってから本物に切り替える。
         // ファイルは今の場面にそのまま描いてあるので切り替えない。
-        maker.tree.nodes[next].is_dir.then_some(next)
-    } else {
+        maker.tree.nodes[child].is_dir
+    } else if mouse.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::Escape) {
+        if nav.stack.len() < 2 {
+            return;
+        }
+        nav.stack.pop();
         // 親の本物の場面を先に作り、今の場面を上に重ねてフェードアウトさせる。
         // 開いていたのがファイルなら、今の場面がもう親の場面なので何もしない。
-        if maker.tree.nodes[focus.0].is_dir {
+        if maker.tree.nodes[top.node].is_dir {
+            let parent = *nav.top();
+            let (_, scale) = fit(parent.frame(&maker.layouts), &window);
             let old = current.0;
-            current.0 = maker.spawn(next, to_scale);
+            current.0 = maker.spawn(&parent, scale);
             maker.commands.entity(old).insert((
                 Fade {
                     started: Instant::now(),
                     fade_in: false,
                     replaces: None,
                 },
-                Transform::from_xyz(0.0, 0.0, 0.5),
+                Transform::from_xyz(0.0, top.shift, 0.5),
             ));
         }
-        None
+        false
+    } else {
+        return;
     };
 
-    focus.0 = next;
+    let next = *nav.top();
+    window.title = format!("Lisa — {}", maker.tree.path(next.node));
+    let (to_pos, to_scale) = fit(next.frame(&maker.layouts), &window);
     maker.commands.insert_resource(Animating {
         from_pos: camera_transform.translation.truncate(),
         from_scale: ortho.scale,
@@ -276,20 +336,67 @@ fn navigate(
     });
 }
 
+/// ホイールやトラックパッドで、今のフォルダの行をスクロールする。
+#[allow(clippy::too_many_arguments)]
+fn scroll(
+    mut wheel: MessageReader<MouseWheel>,
+    mut pending: Local<f32>,
+    mut nav: ResMut<Nav>,
+    mut current: ResMut<CurrentScene>,
+    mut maker: SceneMaker,
+    window: Single<&Window, With<PrimaryWindow>>,
+    animating: Option<Res<Animating>>,
+    fades: Query<(), With<Fade>>,
+) {
+    for event in wheel.read() {
+        // 上へ回すと前の行へ。ピクセル単位（トラックパッド）は 40px で1行。
+        *pending -= match event.unit {
+            MouseScrollUnit::Line => event.y,
+            MouseScrollUnit::Pixel => event.y / 40.0,
+        };
+    }
+    if animating.is_some() || !fades.is_empty() {
+        *pending = 0.0;
+        return;
+    }
+    let rows = pending.trunc();
+    if rows == 0.0 {
+        return;
+    }
+    *pending -= rows;
+
+    let top = *nav.top();
+    let count = maker.tree.nodes[top.node].children.len();
+    if !maker.tree.nodes[top.node].is_dir || count <= MAX_ROWS {
+        return;
+    }
+    let scroll = (top.scroll as f32 + rows).clamp(0.0, (count - MAX_ROWS) as f32) as usize;
+    if scroll == top.scroll {
+        return;
+    }
+    let level = nav.stack.last_mut().expect("Root は常にある");
+    level.scroll = scroll;
+    let level = *level;
+    // 見えている行だけを作り直す。
+    let (_, scale) = fit(level.frame(&maker.layouts), &window);
+    maker.commands.entity(current.0).despawn();
+    current.0 = maker.spawn(&level, scale);
+}
+
 /// ウィンドウの大きさが変わったら、フィーチャー中の枠に合わせ直す。
 fn refit_on_resize(
     mut resized: MessageReader<WindowResized>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
     layouts: Res<Layouts>,
-    focus: Res<Focus>,
+    nav: Res<Nav>,
     animating: Option<Res<Animating>>,
 ) {
     if resized.read().last().is_none() || animating.is_some() {
         return;
     }
     let (mut transform, mut projection) = camera.into_inner();
-    let (pos, scale) = fit(layouts.0[focus.0].frame, &window);
+    let (pos, scale) = fit(nav.top().frame(&layouts), &window);
     transform.translation = pos.extend(0.0);
     if let Projection::Orthographic(ortho) = projection.as_mut() {
         ortho.scale = scale;
@@ -301,6 +408,7 @@ fn animate_camera(
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
+    nav: Res<Nav>,
 ) {
     let Some(anim) = animating else {
         return;
@@ -322,17 +430,18 @@ fn animate_camera(
         return;
     }
     maker.commands.remove_resource::<Animating>();
-    if let Some(folder) = anim.then_show {
+    if anim.then_show {
         // 画像の上に本物の場面を重ねてフェードインし、終わったら古い場面を消す。
+        let level = *nav.top();
         let old = current.0;
-        current.0 = maker.spawn(folder, anim.to_scale);
+        current.0 = maker.spawn(&level, anim.to_scale);
         maker.commands.entity(current.0).insert((
             Fade {
                 started: Instant::now(),
                 fade_in: true,
                 replaces: Some(old),
             },
-            Transform::from_xyz(0.0, 0.0, 0.5),
+            Transform::from_xyz(0.0, level.shift, 0.5),
         ));
     }
 }
@@ -355,15 +464,16 @@ type ScenePart = (
 
 fn fade_scenes(
     mut commands: Commands,
-    scenes: Query<(Entity, &Fade, &Children), With<SceneRoot>>,
+    scenes: Query<(Entity, &Fade), With<SceneRoot>>,
+    hierarchy: Query<&Children>,
     mut parts: Query<ScenePart>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
-    for (entity, fade, children) in &scenes {
+    for (entity, fade) in &scenes {
         let k = (fade.started.elapsed().as_secs_f32() / FADE_SECONDS).min(1.0);
         let alpha = if fade.fade_in { k } else { 1.0 - k };
-        for child in children {
-            let Ok((base, sprite, text, material)) = parts.get_mut(*child) else {
+        for part in hierarchy.iter_descendants(entity) {
+            let Ok((base, sprite, text, material)) = parts.get_mut(part) else {
                 continue;
             };
             let a = base.0 * alpha;

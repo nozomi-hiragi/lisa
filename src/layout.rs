@@ -28,6 +28,8 @@ pub struct Layouts(pub Vec<NodeLayout>);
 const TAB_RATIO: f32 = 0.1;
 /// 名前の欄に最低限残す幅の割合。
 const MIN_LABEL_RATIO: f32 = 0.3;
+/// ひとつの枠に並べる行の数の上限。これより多いとはみ出し、スクロールで見る。
+pub const MAX_ROWS: usize = 12;
 
 /// `root_rect` を Root の枠として木全体を配置する。`aspect` はフォルダの枠の縦横比（幅 / 高さ）。
 pub fn layout(tree: &FileTree, root_rect: Rect, aspect: f32) -> Vec<NodeLayout> {
@@ -67,7 +69,7 @@ pub fn folder_body(folder: Rect) -> Rect {
 }
 
 /// フォルダの中身を並べる場所（本体の内側）。
-fn contents_area(folder: Rect) -> Rect {
+pub fn contents_area(folder: Rect) -> Rect {
     let body = folder_body(folder);
     let pad = folder.height() * 0.04;
     Rect {
@@ -82,8 +84,9 @@ fn place_children(tree: &FileTree, id: NodeId, area: Rect, aspect: f32, out: &mu
         return;
     }
 
-    // 行の高さは均等割り。ただし枠が広がりすぎて名前の欄が狭くならないよう抑える。
-    let mut row_height = area.height() / children.len() as f32;
+    // 行の高さは均等割り（多いときは MAX_ROWS 行ぶん）。
+    // ただし枠が広がりすぎて名前の欄が狭くならないよう抑える。
+    let mut row_height = area.height() / children.len().min(MAX_ROWS) as f32;
     let max_frame_width = area.width() * (1.0 - MIN_LABEL_RATIO);
     if row_height * 0.9 * aspect > max_frame_width {
         row_height = max_frame_width / aspect / 0.9;

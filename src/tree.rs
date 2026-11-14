@@ -19,16 +19,16 @@ pub struct Node {
 
 /// ダミーの木を書くための入れ物。
 enum Entry {
-    Dir(&'static str, Vec<Entry>),
-    File(&'static str, u64),
+    Dir(String, Vec<Entry>),
+    File(String, u64),
 }
 
-fn dir(name: &'static str, children: Vec<Entry>) -> Entry {
-    Entry::Dir(name, children)
+fn dir(name: impl Into<String>, children: Vec<Entry>) -> Entry {
+    Entry::Dir(name.into(), children)
 }
 
-fn file(name: &'static str, size: u64) -> Entry {
-    Entry::File(name, size)
+fn file(name: impl Into<String>, size: u64) -> Entry {
+    Entry::File(name.into(), size)
 }
 
 #[derive(Resource)]
@@ -115,6 +115,13 @@ impl FileTree {
                     dir(
                         "写真アーカイブ",
                         vec![
+                            // ファイルが多いフォルダ（スクロールの確認用）。
+                            dir(
+                                "スキャン",
+                                (1..=500)
+                                    .map(|i| file(format!("scan_{i:04}.jpg"), (2 + i % 7) * MB))
+                                    .collect(),
+                            ),
                             dir(
                                 "2024",
                                 vec![file("春.zip", 12 * GB), file("夏.zip", 18 * GB)],
@@ -143,10 +150,10 @@ impl FileTree {
     fn insert(&mut self, entry: Entry, parent: NodeId, device: usize) {
         match entry {
             Entry::File(name, size) => {
-                self.push(name, size, Some(parent), device, false);
+                self.push(&name, size, Some(parent), device, false);
             }
             Entry::Dir(name, children) => {
-                let id = self.push(name, 0, Some(parent), device, true);
+                let id = self.push(&name, 0, Some(parent), device, true);
                 for child in children {
                     self.insert(child, id, device);
                 }
