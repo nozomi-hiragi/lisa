@@ -293,12 +293,16 @@ fn relayout(
     mut nav: ResMut<Nav>,
     mut bake: ResMut<Bake>,
     mut pending: Local<bool>,
+    mut laid_out_with: Local<Option<f32>>,
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
 ) {
-    if settings.is_changed() && !settings.is_added() {
+    // 行の高さが変わったときだけ（ほかの設定では配置は変わらない）。
+    let row_height = settings.row_height_px;
+    if laid_out_with.is_some_and(|h| h != row_height) {
         *pending = true;
     }
+    *laid_out_with = Some(row_height);
     // ズームや画像を焼いている途中なら、終わってからやる。
     if !*pending || animating.is_some() || !fades.is_empty() || !matches!(*bake, Bake::Done) {
         return;

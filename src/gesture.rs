@@ -3,8 +3,9 @@
 //! - 2本指で動かすと、カメラが指について動く。今のフォルダの枠からはみ出す方向には、
 //!   はみ出すほど重くなり（ラバーバンド）、指を離すとばねのように戻る。
 //! - リストの上で縦に動かすと、まずその列をスクロールする。端まで行ったら同じように重くなる。
-//! - ピンチでカーソルの位置を中心に拡大縮小する。離したとき、子の枠が画面の大部分を占めて
-//!   いればその子へ移り、今の枠が小さくなっていれば親へ戻る。どちらでもなければ元に戻る。
+//! - ピンチでカーソルの位置を中心に拡大縮小する。離したとき、子の枠が画面の一定の割合を占めて
+//!   いればその子へ移り、今の枠が小さくなっていれば親へ戻る（割合と、勢いで移る感度は設定で変えられる）。
+//!   どちらでもなければ元に戻る。
 //! - マウスはホイールでポインタを中心に拡大縮小し、止まったらピンチと同じように行き先を決める。
 //!   中ボタンで引っぱるとトラックパッドの2本指と同じように動く（リストの上なら縦はスクロール）。
 //!
@@ -44,10 +45,8 @@ const WHEEL_ZOOM_STEP: f32 = 0.12;
 const RUBBER_LIMIT: f32 = 0.35;
 /// Root でさらに縮小しようとしたときの重さ（対数の倍率に対する上限）。
 const ROOT_ZOOM_OUT_LIMIT: f32 = 0.25;
-/// 子の枠が画面の幅のこれ以上を占めて離したら、その子へ移る。
-const SNAP_IN_COVERAGE: f32 = 0.55;
-/// 今の枠が画面の幅のこれより小さくなって離したら、親へ戻る。
-const SNAP_OUT_COVERAGE: f32 = 0.7;
+/// 離す直前のこの時間の拡大縮小の速さを見る。
+const FLICK_WINDOW: Duration = Duration::from_millis(80);
 /// 拡大できる上限（今の枠に合わせた倍率に対して）。
 const MAX_ZOOM_IN: f32 = 40.0;
 /// 縮小できる上限（今の枠に合わせた倍率に対して）。
@@ -72,6 +71,8 @@ pub struct Gesture {
     middle: Option<Vec2>,
     /// 縮小して親が見えてきたときに、下に描いておく親の場面。
     parent_scene: Option<Entity>,
+    /// 入力があったときの倍率の記録（時刻、倍率の対数）。離す直前の速さを求める。
+    history: Vec<(Instant, f32)>,
 }
 
 impl Gesture {
@@ -213,7 +214,11 @@ pub fn gesture(
         return;
     };
     if touched {
-        state.last_input = Some(Instant::now());
+        let now = Instant::now();
+        state.last_input = Some(now);
+        let sample = (now, state.raw_scale.ln());
+        state.history.push(sample);
+        state.history.retain(|(t, _)| now - *t <= FLICK_WINDOW * 2);
     }
 
     // 制限をかけた見え方にする。
@@ -265,6 +270,7 @@ pub fn gesture(
             scale,
             rest_pos,
             rest_scale,
+            &settings,
         );
     }
 }
@@ -368,9 +374,15 @@ fn settle(
     scale: f32,
     rest_pos: Vec2,
     rest_scale: f32,
+    settings: &Settings,
 ) {
+    // しきい値は設定から（子へ移る・親へ戻る割合と、勢いで移る速さ）。
+    let snap_in = settings.snap_in_percent / 100.0;
+    let snap_out = settings.snap_out_percent / 100.0;
+    let flick = settings.flick_rate().unwrap_or(f32::INFINITY);
     let top = *nav.top();
     let parent_scene = state.parent_scene.take();
+    let rate = zoom_rate(&state.history);
     *state = Gesture::default();
 
     // 拡大して、カーソル（無ければ画面の中心）の下の子が画面の大部分を占めていれば、その子へ。
@@ -390,9 +402,10 @@ fn settle(
             })
             .map(|c| (c, shift))
     });
+    // 大きさが足りなくても、勢いよく拡大して離したら移る。
     if scale < rest_scale
         && let Some((child, shift)) = child
-        && maker.layouts.0[child].frame.width() / view_width >= SNAP_IN_COVERAGE
+        && (maker.layouts.0[child].frame.width() / view_width >= snap_in || rate < -flick)
     {
         if let Some(parent) = parent_scene {
             maker.commands.entity(parent).despawn();
@@ -418,7 +431,7 @@ fn settle(
 
     // 縮小して、今の枠が画面のわずかしか占めていなければ、親へ。
     let coverage = top.frame(&maker.layouts).width() / view_width;
-    if nav.stack.len() >= 2 && coverage < SNAP_OUT_COVERAGE {
+    if nav.stack.len() >= 2 && (coverage < snap_out || rate > flick) {
         nav.stack.pop();
         if let Some(parent) = parent_scene {
             // 親の場面はもう下に描いてある。今の場面をフェードアウトさせる。
@@ -457,6 +470,24 @@ fn settle(
         seconds: SPRING_SECONDS,
         ease: Ease::Out,
     });
+}
+
+/// 離す直前の拡大縮小の速さ（倍率の対数で毎秒。正が縮小、負が拡大）。
+fn zoom_rate(history: &[(Instant, f32)]) -> f32 {
+    let Some(&(last_time, last_value)) = history.last() else {
+        return 0.0;
+    };
+    let Some(&(first_time, first_value)) =
+        history.iter().find(|(t, _)| last_time - *t <= FLICK_WINDOW)
+    else {
+        return 0.0;
+    };
+    let seconds = (last_time - first_time).as_secs_f32();
+    // 2つの入力が同じくらいの時刻に来たときは、速さを求められない。
+    if seconds < 0.004 {
+        return 0.0;
+    }
+    (last_value - first_value) / seconds
 }
 
 /// 今の位置（Nav の最後）へ動かす。
