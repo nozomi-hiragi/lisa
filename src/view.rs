@@ -17,16 +17,15 @@ use bevy::window::{PrimaryWindow, RequestRedraw, WindowResized};
 use bevy::winit::{UpdateMode, WinitSettings};
 
 use crate::cache::{self, Bake, BakeFinished, FolderImages};
-use crate::layout::{Layouts, column_items, layout};
+use crate::layout::{Layouts, column_items, column_of, layout};
 use crate::menu::{BAR_PX, MenuBreadcrumb, MenuSystems, Popup};
 use crate::scene::{self, BACKGROUND, LabelFont, Rows, SceneRoot, SceneSource};
+use crate::settings::Settings;
 use crate::shapes::BaseAlpha;
 use crate::tree::{FileTree, NodeId};
 
 /// ワールド座標での Root の高さ。幅はウィンドウの縦横比に合わせる。
 const ROOT_HEIGHT: f32 = 1000.0;
-/// リストの行の高さ（そのフォルダが画面いっぱいのときのピクセル数）。
-const ROW_PX: f32 = 40.0;
 /// ズームにかける時間（秒）。
 const ZOOM_SECONDS: f32 = 0.4;
 /// 画像から本物の描画へ切り替えるときのフェードの時間（秒）。
@@ -59,6 +58,8 @@ impl Plugin for TreeViewPlugin {
             (
                 cache::bake,
                 show_baked,
+                relayout,
+                show_relayout,
                 navigate,
                 scroll,
                 refit_on_resize,
@@ -198,9 +199,11 @@ impl SceneMaker<'_, '_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     tree: Res<FileTree>,
+    settings: Res<Settings>,
     assets: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -213,7 +216,17 @@ fn setup(
     let aspect = window.width() / view_height;
     let root_rect =
         Rect::from_center_size(Vec2::ZERO, Vec2::new(ROOT_HEIGHT * aspect, ROOT_HEIGHT));
-    let layouts = layout(&tree, root_rect, aspect, ROW_PX / view_height);
+    let layouts = layout(
+        &tree,
+        root_rect,
+        aspect,
+        settings.row_height_px / view_height,
+    );
+    commands.insert_resource(Geometry {
+        root_rect,
+        aspect,
+        view_height,
+    });
     let folder_images = cache::create_images(&tree, aspect, &mut images);
 
     let (pos, scale) = fit(root_rect, &window);
@@ -254,6 +267,114 @@ fn setup(
     commands.insert_resource(LabelFont(font));
 }
 
+/// 木を配置したときの条件（設定が変わったら、これで配置し直す）。
+#[derive(Resource)]
+struct Geometry {
+    root_rect: Rect,
+    aspect: f32,
+    view_height: f32,
+}
+
+/// 配置し直したので、今の場面を作り直す。
+#[derive(Resource)]
+struct Relaid;
+
+/// 行の高さの設定が変わったら、木を配置し直し、画像を焼き直す。
+#[allow(clippy::too_many_arguments)]
+fn relayout(
+    mut commands: Commands,
+    settings: Res<Settings>,
+    geometry: Res<Geometry>,
+    tree: Res<FileTree>,
+    mut layouts: ResMut<Layouts>,
+    mut nav: ResMut<Nav>,
+    mut bake: ResMut<Bake>,
+    mut pending: Local<bool>,
+    animating: Option<Res<Animating>>,
+    fades: Query<(), With<Fade>>,
+) {
+    if settings.is_changed() && !settings.is_added() {
+        *pending = true;
+    }
+    // ズームや画像を焼いている途中なら、終わってからやる。
+    if !*pending || animating.is_some() || !fades.is_empty() || !matches!(*bake, Bake::Done) {
+        return;
+    }
+    *pending = false;
+
+    layouts.0 = layout(
+        &tree,
+        geometry.root_rect,
+        geometry.aspect,
+        settings.row_height_px / geometry.view_height,
+    );
+
+    // 開いてきた道のりの位置を、新しい配置で求め直す。開いている子が見えるようにスクロールも直す。
+    for i in 0..nav.stack.len() {
+        let level = nav.stack[i];
+        let list = layouts.0[level.node].list;
+        let mut scroll = level.scroll;
+        for (column, value) in scroll.iter_mut().enumerate() {
+            let count = column_items(&tree, level.node, column).len();
+            *value = (*value).min(count.saturating_sub(list.fit));
+        }
+        if let Some(next) = nav.stack.get(i + 1).map(|l| l.node) {
+            let column = column_of(&tree, next);
+            let index = column_items(&tree, level.node, column)
+                .iter()
+                .position(|c| *c == next)
+                .unwrap_or(0);
+            if index < scroll[column] {
+                scroll[column] = index;
+            } else if index >= scroll[column] + list.fit {
+                scroll[column] = index + 1 - list.fit;
+            }
+            nav.stack[i].scroll = scroll;
+            nav.stack[i + 1].shift = nav.stack[i].column_shift(&layouts, column);
+        } else {
+            nav.stack[i].scroll = scroll;
+        }
+    }
+
+    *bake = Bake::Waiting;
+    commands.insert_resource(Relaid);
+}
+
+/// 配置し直したあと、カメラを合わせ直して今の場面を作り直す。
+fn show_relayout(
+    relaid: Option<Res<Relaid>>,
+    mut current: ResMut<CurrentScene>,
+    mut maker: SceneMaker,
+    nav: Res<Nav>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
+) {
+    if relaid.is_none() {
+        return;
+    }
+    maker.commands.remove_resource::<Relaid>();
+    let (pos, scale) = fit(nav.top().frame(&maker.layouts), &window);
+    let (mut transform, mut projection) = camera.into_inner();
+    transform.translation = pos.extend(0.0);
+    if let Projection::Orthographic(ortho) = projection.as_mut() {
+        ortho.scale = scale;
+    }
+    let path = scene_path(&nav, &maker.tree);
+    let (_, scene_scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
+    maker.commands.entity(current.0).despawn();
+    current.0 = maker.spawn(path, scene_scale);
+}
+
+/// 本物として描く場面までの道のり。開いているのがファイルなら、その親のフォルダまで。
+fn scene_path<'a>(nav: &'a Nav, tree: &FileTree) -> &'a [Level] {
+    let depth = nav
+        .stack
+        .iter()
+        .rposition(|l| tree.nodes[l.node].is_dir)
+        .unwrap_or(0);
+    &nav.stack[..=depth]
+}
+
 /// `rect` がメニューバーの下の領域いっぱいに収まるカメラの位置と倍率。
 fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
     let view_height = window.height() - BAR_PX;
@@ -280,8 +401,9 @@ fn show_baked(
     }
     maker.commands.remove_resource::<BakeFinished>();
     maker.commands.entity(current.0).despawn();
-    let (_, scale) = fit(nav.top().frame(&maker.layouts), &window);
-    current.0 = maker.spawn(&nav.stack, scale);
+    let path = scene_path(&nav, &maker.tree);
+    let (_, scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
+    current.0 = maker.spawn(path, scale);
 }
 
 /// 左クリックしたフォルダかファイルへズームイン、右クリックか Esc で親へズームアウト。

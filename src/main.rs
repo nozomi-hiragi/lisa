@@ -5,6 +5,7 @@ mod layout;
 mod menu;
 mod preview;
 mod scene;
+mod settings;
 mod shapes;
 mod tree;
 mod view;
@@ -20,7 +21,11 @@ fn main() {
         }),
         ..default()
     }))
-    .add_plugins((view::TreeViewPlugin, menu::MenuPlugin));
+    .add_plugins((
+        settings::SettingsPlugin,
+        view::TreeViewPlugin,
+        menu::MenuPlugin,
+    ));
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);
     app.run();

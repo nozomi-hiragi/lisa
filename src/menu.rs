@@ -48,7 +48,7 @@ struct Backdrop;
 #[derive(Component)]
 struct BreadcrumbText;
 
-fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
+pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
     let text_font = TextFont::from_font_size(14.0).with_font(font.0.clone());
 
     // メニューバー。
