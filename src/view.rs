@@ -20,9 +20,7 @@ const ZOOM_SECONDS: f32 = 0.4;
 /// 画面上でこれより小さい図形は描かない（論理ピクセル）。
 const MIN_SHAPE_PX: f32 = 2.0;
 /// 画面上でこれより小さい文字は描かない（論理ピクセル）。
-const MIN_LABEL_PX: f32 = 8.0;
-/// 文字の最大の大きさ（論理ピクセル）。
-const MAX_LABEL_PX: f32 = 36.0;
+const MIN_LABEL_PX: f32 = 4.0;
 
 const BACKGROUND: Color = Color::srgb(0.08, 0.08, 0.1);
 
@@ -72,9 +70,11 @@ struct Animating {
     started: Instant,
 }
 
-/// 文字を作り直す必要がある（ズームが止まったときなど）。
+/// 文字を作り直す必要がある。`scale` はこの倍率で見たときにくっきり見えるように作る。
 #[derive(Resource)]
-struct LabelsDirty;
+struct LabelsDirty {
+    scale: f32,
+}
 
 #[derive(Component)]
 struct NodeLabel {
@@ -170,7 +170,7 @@ fn setup(
         let left = l.label.min.x + l.label.height() * 0.1;
         commands.spawn((
             NodeLabel {
-                world_height: l.label.height() * 0.35,
+                world_height: l.label.height() * 0.18,
                 world_width: l.label.max.x - left,
                 em_width: em_width(&text),
             },
@@ -185,7 +185,7 @@ fn setup(
     }
 
     commands.insert_resource(Layouts(layouts));
-    commands.insert_resource(LabelsDirty);
+    commands.insert_resource(LabelsDirty { scale });
 }
 
 /// 端末ごとの色相。
@@ -254,6 +254,10 @@ fn navigate(
         return;
     };
     let (to_pos, to_scale) = fit(focus_rect(&layouts, next), &window);
+    // ズーム中に拡大されてもぼやけないよう、いちばん寄ったときの大きさで文字を作っておく。
+    commands.insert_resource(LabelsDirty {
+        scale: ortho.scale.min(to_scale),
+    });
     commands.insert_resource(Animating {
         from_pos: camera_transform.translation.truncate(),
         from_scale: ortho.scale,
@@ -282,7 +286,7 @@ fn refit_on_resize(
     if let Projection::Orthographic(ortho) = projection.as_mut() {
         ortho.scale = scale;
     }
-    commands.insert_resource(LabelsDirty);
+    commands.insert_resource(LabelsDirty { scale });
 }
 
 fn animate_camera(
@@ -308,7 +312,9 @@ fn animate_camera(
 
     if t >= 1.0 {
         commands.remove_resource::<Animating>();
-        commands.insert_resource(LabelsDirty);
+        commands.insert_resource(LabelsDirty {
+            scale: anim.to_scale,
+        });
     }
 }
 
@@ -349,18 +355,20 @@ fn update_lod(
         });
     }
 
-    // 文字は大きさを変えるたびにフォントアトラスが作られるので、止まったときだけ更新する。
-    if labels_dirty.is_none() {
+    // 文字はワールド座標で大きさが決まっていて、カメラと一緒に拡大縮小する。
+    // ただし画面上の大きさで作り直さないとぼやけるので、ズームの始めと終わりに作り直す
+    // （大きさを変えるたびにフォントアトラスが作られるので、毎フレームはやらない）。
+    let Some(dirty) = labels_dirty else {
         return;
-    }
+    };
+    let raster_scale = dirty.scale;
     commands.remove_resource::<LabelsDirty>();
     for (label, mut font, mut transform, mut visibility) in &mut labels {
-        // 行の高さと欄の幅の両方に収まる大きさにする。
-        let fit_width = label.world_width / scale * 0.95 / label.em_width;
-        let px = (label.world_height / scale)
-            .min(fit_width)
-            .min(MAX_LABEL_PX)
-            .floor();
+        // 行の高さと欄の幅の両方に収まる大きさ（ワールド座標）。
+        let world_size = label
+            .world_height
+            .min(label.world_width * 0.95 / label.em_width);
+        let px = (world_size / raster_scale).ceil();
         let fits = px >= MIN_LABEL_PX;
         visibility.set_if_neq(if fits {
             Visibility::Inherited
@@ -369,8 +377,8 @@ fn update_lod(
         });
         if fits {
             font.font_size = FontSize::Px(px);
-            // ワールドでは常に `scale` 倍して、画面上で `px` の大きさに見せる。
-            transform.scale = Vec3::splat(scale);
+            // ワールドでの大きさが常に `world_size` になるように縮める。
+            transform.scale = Vec3::splat(world_size / px);
         }
     }
 }
