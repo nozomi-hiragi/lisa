@@ -25,6 +25,8 @@ pub struct Settings {
     pub snap_out_percent: f32,
     /// 勢いで移る感度（0 で切る、1〜10 で大きいほど敏感）。
     pub flick_level: u8,
+    /// 上下に動かして、隣のフォルダが画面の高さのこの割合（%）以上見えたら、そのフォルダへ移る。
+    pub sibling_percent: f32,
 }
 
 impl Default for Settings {
@@ -34,6 +36,7 @@ impl Default for Settings {
             snap_in_percent: 35.0,
             snap_out_percent: 85.0,
             flick_level: 3,
+            sibling_percent: 30.0,
         }
     }
 }
@@ -61,10 +64,17 @@ enum Item {
     SnapIn,
     SnapOut,
     Flick,
+    Sibling,
 }
 
 impl Item {
-    const ALL: [Item; 4] = [Item::RowHeight, Item::SnapIn, Item::SnapOut, Item::Flick];
+    const ALL: [Item; 5] = [
+        Item::RowHeight,
+        Item::SnapIn,
+        Item::SnapOut,
+        Item::Sibling,
+        Item::Flick,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -72,6 +82,7 @@ impl Item {
             Item::SnapIn => "子フォルダへ移るしきい値",
             Item::SnapOut => "親へ戻るしきい値",
             Item::Flick => "勢いで移る感度",
+            Item::Sibling => "隣のフォルダへ移るしきい値",
         }
     }
 
@@ -82,6 +93,7 @@ impl Item {
             Item::SnapIn => (10.0, 90.0, 5.0),
             Item::SnapOut => (50.0, 98.0, 1.0),
             Item::Flick => (0.0, 10.0, 1.0),
+            Item::Sibling => (10.0, 80.0, 5.0),
         }
     }
 
@@ -91,6 +103,7 @@ impl Item {
             Item::SnapIn => settings.snap_in_percent,
             Item::SnapOut => settings.snap_out_percent,
             Item::Flick => settings.flick_level as f32,
+            Item::Sibling => settings.sibling_percent,
         }
     }
 
@@ -102,6 +115,7 @@ impl Item {
             Item::SnapIn => settings.snap_in_percent = value,
             Item::SnapOut => settings.snap_out_percent = value,
             Item::Flick => settings.flick_level = value.round() as u8,
+            Item::Sibling => settings.sibling_percent = value,
         }
     }
 
@@ -112,6 +126,7 @@ impl Item {
             Item::SnapOut => format!("{} %", settings.snap_out_percent),
             Item::Flick if settings.flick_level == 0 => "切".to_string(),
             Item::Flick => format!("{}", settings.flick_level),
+            Item::Sibling => format!("{} %", settings.sibling_percent),
         }
     }
 
@@ -274,6 +289,10 @@ mod tests {
             Settings::default().snap_out_percent
         );
         assert_eq!(settings.flick_level, Settings::default().flick_level);
+        assert_eq!(
+            settings.sibling_percent,
+            Settings::default().sibling_percent
+        );
     }
 
     #[test]

@@ -179,6 +179,12 @@ impl SceneMaker<'_, '_> {
     /// 画面に出す本物の場面を作る。`path` の最後がその場面で、手前は外側のフォルダ。
     /// `scale` はその場面を画面いっぱいに見るときの倍率。
     pub(crate) fn spawn(&mut self, path: &[Level], scale: f32) -> Entity {
+        let level = path.last().expect("場面がある");
+        self.spawn_rows(path, scale, Rows::Scroll(level.scroll))
+    }
+
+    /// `spawn` と同じだが、行の見せ方を指定する。
+    pub(crate) fn spawn_rows(&mut self, path: &[Level], scale: f32, rows: Rows) -> Entity {
         let (level, outer) = path.split_last().expect("場面がある");
         let ancestors: Vec<(NodeId, f32)> = outer.iter().map(|l| (l.node, l.shift)).collect();
         let source = SceneSource {
@@ -196,7 +202,7 @@ impl SceneMaker<'_, '_> {
             RenderLayers::layer(0),
             scale,
             level.shift,
-            Rows::Scroll(level.scroll),
+            rows,
             &ancestors,
         )
     }

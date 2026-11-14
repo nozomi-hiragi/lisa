@@ -34,6 +34,16 @@ pub enum Rows {
     Summary,
     /// 列ごとに、指定した行から入る分だけ並べる（スクロール中の本物の場面用）。
     Scroll([usize; 2]),
+    /// Scroll と同じ位置に並べるが、`column` の列は `from..to` の行も描く
+    /// （見えている範囲の外にある隣のフォルダを見せるため）。`skip` は描かない
+    /// （上に本物が重なっているフォルダ。画像と本物が重なると透けて二重に見える）。
+    Around {
+        scroll: [usize; 2],
+        column: usize,
+        from: usize,
+        to: usize,
+        skip: Option<NodeId>,
+    },
 }
 
 /// フォルダ `folder` の場面を作る。`scale` はこの倍率で見たときにくっきり見えるように作る。
@@ -110,13 +120,28 @@ pub fn spawn(
             continue;
         }
 
-        // どの行を描くか。スクロールしているときは、その列の行を上へずらす。
-        let (first, shown, more) = match rows {
-            Rows::Summary if count > fit => (0, fit - 1, Some(count - (fit - 1))),
-            Rows::Summary => (0, count, None),
+        // どの行を描くか（lo..hi）。スクロールしているときは、その列の行を first 行ぶん上へずらす。
+        let (first, lo, hi, more) = match rows {
+            Rows::Summary if count > fit => (0, 0, fit - 1, Some(count - (fit - 1))),
+            Rows::Summary => (0, 0, count, None),
             Rows::Scroll(scroll) => {
                 let first = scroll[column].min(count.saturating_sub(fit));
-                (first, count.min(first + fit) - first, None)
+                (first, first, count.min(first + fit), None)
+            }
+            Rows::Around {
+                scroll,
+                column: around,
+                from,
+                to,
+                ..
+            } => {
+                let first = scroll[column].min(count.saturating_sub(fit));
+                let hi = count.min(first + fit);
+                if around == column {
+                    (first, first.min(from), hi.max(to.min(count)), None)
+                } else {
+                    (first, first, hi, None)
+                }
             }
         };
         painter.parent = painter
@@ -129,7 +154,11 @@ pub fn spawn(
             ))
             .id();
 
-        for &child in &items[first..first + shown] {
+        let skip = match rows {
+            Rows::Around { skip, .. } => skip,
+            _ => None,
+        };
+        for &child in items[lo..hi].iter().filter(|c| Some(**c) != skip) {
             let l = &source.layouts[child];
             let child_node = &tree.nodes[child];
             let z = child_node.depth as f32;
@@ -173,9 +202,7 @@ pub fn spawn(
         }
 
         // スクロールできるときは、列の右端に今どこを見ているかの棒を出す。
-        if let Rows::Scroll(_) = rows
-            && count > fit
-        {
+        if !matches!(rows, Rows::Summary) && count > fit {
             painter.parent = root;
             let rect = list.columns[column];
             let width = row_height * 0.08;

@@ -3,6 +3,8 @@
 //! - 2本指で動かすと、カメラが指について動く。今のフォルダの枠からはみ出す方向には、
 //!   はみ出すほど重くなり（ラバーバンド）、指を離すとばねのように戻る。
 //! - リストの上で縦に動かすと、まずその列をスクロールする。端まで行ったら同じように重くなる。
+//! - フォルダを開いているとき、上下には同じ階層の隣のフォルダがある。そちらへは軽い重さで動き、
+//!   隣のフォルダが画面の一定の割合まで見えて離すと（または勢いよく動かすと）、そのフォルダへ移る。
 //! - ピンチでカーソルの位置を中心に拡大縮小する。離したとき、子の枠が画面の一定の割合を占めて
 //!   いればその子へ移り、今の枠が小さくなっていれば親へ戻る（割合と、勢いで移る感度は設定で変えられる）。
 //!   どちらでもなければ元に戻る。
@@ -24,7 +26,9 @@ use bevy::window::PrimaryWindow;
 
 use crate::layout::{DIRS, FILES, column_items};
 use crate::menu::{BAR_PX, Popup};
+use crate::scene::Rows;
 use crate::settings::Settings;
+use crate::tree::NodeId;
 use crate::view::{
     Animating, CurrentScene, Ease, Fade, Level, MainCamera, Nav, SceneMaker, ZOOM_SECONDS, fit,
     show_breadcrumb, ui_has_pointer,
@@ -51,6 +55,8 @@ const FLICK_WINDOW: Duration = Duration::from_millis(80);
 const MAX_ZOOM_IN: f32 = 40.0;
 /// 縮小できる上限（今の枠に合わせた倍率に対して）。
 const MAX_ZOOM_OUT: f32 = 4.0;
+/// 隣のフォルダの方向へ動かすときの軽い重さ（指の動きに対して、これだけ動く）。
+const SIBLING_FOLLOW: f32 = 0.85;
 /// ばねで戻るのにかける時間（秒）。
 const SPRING_SECONDS: f32 = 0.3;
 
@@ -73,6 +79,8 @@ pub struct Gesture {
     parent_scene: Option<Entity>,
     /// 入力があったときの倍率の記録（時刻、倍率の対数）。離す直前の速さを求める。
     history: Vec<(Instant, f32)>,
+    /// 入力があったときの縦の位置の記録（時刻、カメラの y）。離す直前の速さを求める。
+    pan_history: Vec<(Instant, f32)>,
 }
 
 impl Gesture {
@@ -172,8 +180,12 @@ pub fn gesture(
         touched = true;
         let displaced = (state.raw_pos - rest_pos).length() > rest_scale * 0.5
             || (state.raw_scale - rest_scale).abs() > rest_scale * 1e-3;
-        // 縦の動きで、リストの上にいて、カメラが元の位置なら、まずリストを動かす。
-        if !displaced && delta.y.abs() > delta.x.abs() && maker.tree.nodes[top.node].is_dir {
+        // 縦の動きで、カーソルの下の列がその向きにまだスクロールでき、カメラが元の位置なら、
+        // まずリストを動かす。スクロールできなければ、カメラを動かす（端の重さや隣のフォルダへ）。
+        if !displaced
+            && delta.y.abs() > delta.x.abs()
+            && list_can_scroll(&nav, &maker, cursor_world, -delta.y)
+        {
             state.pending_rows -= delta.y / settings.row_height_px;
             let rows = state.pending_rows.trunc();
             if rows != 0.0 {
@@ -219,26 +231,45 @@ pub fn gesture(
         let sample = (now, state.raw_scale.ln());
         state.history.push(sample);
         state.history.retain(|(t, _)| now - *t <= FLICK_WINDOW * 2);
+        let sample = (now, state.raw_pos.y);
+        state.pan_history.push(sample);
+        state
+            .pan_history
+            .retain(|(t, _)| now - *t <= FLICK_WINDOW * 2);
     }
 
     // 制限をかけた見え方にする。
     let at_root = nav.stack.len() < 2;
-    let (pos, scale) = constrain(&state, top, &maker, &window, rest_scale, at_root);
+    let siblings = Siblings::of(&nav, &maker);
+    let (pos, scale) = constrain(
+        &state,
+        top,
+        &maker,
+        &window,
+        rest_scale,
+        at_root,
+        siblings.as_ref(),
+    );
     transform.translation = pos.extend(0.0);
     ortho.scale = scale;
 
-    // 縮小して親が見えてきたら、親の場面を下に描いておく。
+    // 縮小したり上下に動かしたりして親（隣のフォルダ）が見えてきたら、親の場面を下に描いておく。
+    let moved_vertically = (pos.y - rest_pos.y).abs() > rest_scale;
     if !at_root
-        && scale > rest_scale * 1.01
+        && (scale > rest_scale * 1.01 || moved_vertically)
         && state.parent_scene.is_none()
         && maker.tree.nodes[top.node].is_dir
     {
-        let parent_path = &nav.stack[..nav.stack.len() - 1];
-        let (_, parent_scale) = fit(
-            parent_path[parent_path.len() - 1].frame(&maker.layouts),
+        let parent = nav.stack[nav.stack.len() - 2];
+        state.parent_scene = Some(spawn_parent_preview(
+            &nav,
+            &mut maker,
             &window,
-        );
-        state.parent_scene = Some(maker.spawn(parent_path, parent_scale));
+            parent.scroll,
+            top.node,
+            top.node,
+            Some(top.node),
+        ));
         maker
             .commands
             .entity(current.0)
@@ -271,8 +302,73 @@ pub fn gesture(
             rest_pos,
             rest_scale,
             &settings,
+            siblings,
         );
     }
+}
+
+/// 開いているフォルダの、同じ階層の隣のフォルダ（親のフォルダの列で上と下）。
+#[derive(Clone)]
+struct Siblings {
+    /// 親のフォルダの列に並ぶフォルダ（名前順）と、その中での今のフォルダの位置。
+    items: Vec<NodeId>,
+    index: usize,
+    /// 親の行の高さ（隣のフォルダまでの距離）。
+    row_height: f32,
+}
+
+impl Siblings {
+    fn of(nav: &Nav, maker: &SceneMaker) -> Option<Self> {
+        let top = nav.top();
+        if nav.stack.len() < 2 || !maker.tree.nodes[top.node].is_dir {
+            return None;
+        }
+        let parent = nav.stack[nav.stack.len() - 2];
+        let items = column_items(&maker.tree, parent.node, DIRS);
+        let index = items.iter().position(|c| *c == top.node)?;
+        Some(Self {
+            items,
+            index,
+            row_height: maker.layouts.0[parent.node].list.row_height,
+        })
+    }
+
+    /// 上の隣（名前順で前）。
+    fn above(&self) -> Option<NodeId> {
+        self.index.checked_sub(1).map(|i| self.items[i])
+    }
+
+    /// 下の隣（名前順で次）。
+    fn below(&self) -> Option<NodeId> {
+        self.items.get(self.index + 1).copied()
+    }
+}
+
+/// 親の場面を、`a` と `b`（とその上下）の行も描いて作る。開いているフォルダの下に敷く。
+fn spawn_parent_preview(
+    nav: &Nav,
+    maker: &mut SceneMaker,
+    window: &Window,
+    parent_scroll: [usize; 2],
+    a: NodeId,
+    b: NodeId,
+    skip: Option<NodeId>,
+) -> Entity {
+    let mut path = nav.stack[..nav.stack.len() - 1].to_vec();
+    let parent = path.last_mut().expect("親がある");
+    parent.scroll = parent_scroll;
+    let items = column_items(&maker.tree, parent.node, DIRS);
+    let ia = items.iter().position(|c| *c == a).unwrap_or(0);
+    let ib = items.iter().position(|c| *c == b).unwrap_or(0);
+    let rows = Rows::Around {
+        scroll: parent.scroll,
+        column: DIRS,
+        from: ia.min(ib).saturating_sub(1),
+        to: ia.max(ib) + 2,
+        skip,
+    };
+    let (_, scale) = fit(parent.frame(&maker.layouts), window);
+    maker.spawn_rows(&path, scale, rows)
 }
 
 /// ジェスチャーを始める。
@@ -320,6 +416,7 @@ fn constrain(
     window: &Window,
     rest_scale: f32,
     at_root: bool,
+    siblings: Option<&Siblings>,
 ) -> (Vec2, f32) {
     // Root でさらに縮小しようとすると重くなる。
     let mut scale = state.raw_scale;
@@ -334,12 +431,31 @@ fn constrain(
     let size = Vec2::new(window.width(), window.height() - BAR_PX) * scale;
     let clamped = view_center.clamp(area.min, area.max);
     let over = view_center - clamped;
-    let shown = clamped
-        + Vec2::new(
-            rubber(over.x, size.x * RUBBER_LIMIT),
-            rubber(over.y, size.y * RUBBER_LIMIT),
-        );
+    // 上下に隣のフォルダがあれば、そこまでは軽い重さで動く（その先は強い重さ）。
+    let room = |up: bool| {
+        siblings
+            .filter(|s| {
+                if up {
+                    s.above().is_some()
+                } else {
+                    s.below().is_some()
+                }
+            })
+            .map_or(0.0, |s| s.row_height)
+    };
+    let over_y = if over.y > 0.0 {
+        follow(over.y, room(true), size.y)
+    } else {
+        -follow(-over.y, room(false), size.y)
+    };
+    let shown = clamped + Vec2::new(rubber(over.x, size.x * RUBBER_LIMIT), over_y);
     (shown + offset, scale)
+}
+
+/// はみ出し `d`（正）を、`room` までは軽い重さで、その先は強い重さで動かした量にする。
+fn follow(d: f32, room: f32, size: f32) -> f32 {
+    let light = (room / SIBLING_FOLLOW).min(d);
+    light * SIBLING_FOLLOW + rubber(d - light, size * RUBBER_LIMIT)
 }
 
 /// 動いてよい範囲からはみ出しているか。
@@ -375,6 +491,7 @@ fn settle(
     rest_pos: Vec2,
     rest_scale: f32,
     settings: &Settings,
+    siblings: Option<Siblings>,
 ) {
     // しきい値は設定から（子へ移る・親へ戻る割合と、勢いで移る速さ）。
     let snap_in = settings.snap_in_percent / 100.0;
@@ -383,6 +500,7 @@ fn settle(
     let top = *nav.top();
     let parent_scene = state.parent_scene.take();
     let rate = zoom_rate(&state.history);
+    let pan_rate = zoom_rate(&state.pan_history);
     *state = Gesture::default();
 
     // 拡大して、カーソル（無ければ画面の中心）の下の子が画面の大部分を占めていれば、その子へ。
@@ -456,6 +574,27 @@ fn settle(
         return;
     }
 
+    // 上下に動かして、隣のフォルダが十分見えていれば（または勢いよく動かしたら）、そちらへ。
+    if let Some(siblings) = siblings
+        && (scale / rest_scale - 1.0).abs() < 0.05
+        && let Some(target) = sibling_target(
+            &siblings, maker, window, pos, scale, rest_pos, pan_rate, settings,
+        )
+    {
+        move_to_sibling(
+            nav,
+            current,
+            maker,
+            window,
+            parent_scene,
+            top,
+            target,
+            pos,
+            scale,
+        );
+        return;
+    }
+
     // どちらでもなければ、ばねで元に戻る。
     if let Some(parent) = parent_scene {
         maker.commands.entity(parent).despawn();
@@ -470,6 +609,93 @@ fn settle(
         seconds: SPRING_SECONDS,
         ease: Ease::Out,
     });
+}
+
+/// 離したときに移るべき隣のフォルダ。
+#[allow(clippy::too_many_arguments)]
+fn sibling_target(
+    siblings: &Siblings,
+    maker: &SceneMaker,
+    window: &Window,
+    pos: Vec2,
+    scale: f32,
+    rest_pos: Vec2,
+    pan_rate: f32,
+    settings: &Settings,
+) -> Option<NodeId> {
+    let moved = pos.y - rest_pos.y;
+    let (target, toward) = if moved > 0.0 {
+        (siblings.above()?, 1.0)
+    } else if moved < 0.0 {
+        (siblings.below()?, -1.0)
+    } else {
+        return None;
+    };
+    // 隣のフォルダの枠が、画面の高さのどれだけを占めているか。
+    let view_height = (window.height() - BAR_PX) * scale;
+    let view_center = pos.y - BAR_PX / 2.0 * scale;
+    let frame_height = maker.layouts.0[target].frame.height();
+    let target_center = view_center - moved + toward * siblings.row_height;
+    let overlap = (view_center + view_height / 2.0).min(target_center + frame_height / 2.0)
+        - (view_center - view_height / 2.0).max(target_center - frame_height / 2.0);
+    let coverage = overlap.max(0.0) / view_height;
+    // 勢い：離す直前に、画面の高さの何倍の速さで隣の方へ動いていたか。
+    let speed = pan_rate * toward / view_height;
+    let flick = settings.flick_rate().unwrap_or(f32::INFINITY);
+    (coverage >= settings.sibling_percent / 100.0 || speed > flick).then_some(target)
+}
+
+/// 隣のフォルダへ移る。親の列のスクロールを、そのフォルダが見える位置に直してから動かす。
+#[allow(clippy::too_many_arguments)]
+fn move_to_sibling(
+    nav: &mut Nav,
+    current: &mut CurrentScene,
+    maker: &mut SceneMaker,
+    window: &Window,
+    parent_scene: Option<Entity>,
+    top: Level,
+    target: NodeId,
+    pos: Vec2,
+    scale: f32,
+) {
+    let parent_index = nav.stack.len() - 2;
+    let parent = nav.stack[parent_index];
+    let list = maker.layouts.0[parent.node].list;
+    let items = column_items(&maker.tree, parent.node, DIRS);
+    let index = items.iter().position(|c| *c == target).unwrap_or(0);
+    let mut scroll = parent.scroll;
+    if index < scroll[DIRS] {
+        scroll[DIRS] = index;
+    } else if index >= scroll[DIRS] + list.fit {
+        scroll[DIRS] = index + 1 - list.fit;
+    }
+    // スクロールが変わると、親の列の中のフォルダはまとめて上下にずれる。カメラも同じだけずらす。
+    let delta = (scroll[DIRS] as f32 - parent.scroll[DIRS] as f32) * list.row_height;
+
+    // 今のフォルダは画像で見せる（親の場面に描いてある）。隣へ着いたら本物に切り替える。
+    if let Some(preview) = parent_scene {
+        maker.commands.entity(preview).despawn();
+    }
+    maker.commands.entity(current.0).despawn();
+    current.0 = spawn_parent_preview(nav, maker, window, scroll, top.node, target, None);
+
+    nav.stack[parent_index].scroll = scroll;
+    let shift = nav.stack[parent_index].column_shift(&maker.layouts, DIRS);
+    *nav.stack.last_mut().expect("今のフォルダ") = Level {
+        node: target,
+        shift,
+        scroll: [0, 0],
+    };
+    go(
+        maker,
+        window,
+        nav,
+        pos + Vec2::new(0.0, delta),
+        scale,
+        true,
+        ZOOM_SECONDS,
+        Ease::Out,
+    );
 }
 
 /// 離す直前の拡大縮小の速さ（倍率の対数で毎秒。正が縮小、負が拡大）。
@@ -517,6 +743,39 @@ fn go(
     });
 }
 
+/// カーソルのある列。今がフォルダでなければ None。
+fn column_under(nav: &Nav, maker: &SceneMaker, cursor_world: Option<Vec2>) -> Option<usize> {
+    let top = nav.top();
+    if !maker.tree.nodes[top.node].is_dir {
+        return None;
+    }
+    let world = cursor_world?;
+    let list = maker.layouts.0[top.node].list;
+    let middle = (list.columns[0].max.x + list.columns[1].min.x) / 2.0;
+    Some(if world.x < middle { FILES } else { DIRS })
+}
+
+/// カーソルのある列が、`direction` の向き（正で下の行へ）にまだスクロールできるか。
+fn list_can_scroll(
+    nav: &Nav,
+    maker: &SceneMaker,
+    cursor_world: Option<Vec2>,
+    direction: f32,
+) -> bool {
+    let Some(column) = column_under(nav, maker, cursor_world) else {
+        return false;
+    };
+    let top = nav.top();
+    let fit = maker.layouts.0[top.node].list.fit;
+    let count = column_items(&maker.tree, top.node, column).len();
+    let scroll = top.scroll[column];
+    if direction > 0.0 {
+        scroll + fit < count
+    } else {
+        scroll > 0
+    }
+}
+
 /// カーソルのある列を `rows` 行スクロールする。端で動かせなかった行数を返す。
 fn scroll_list(
     nav: &mut Nav,
@@ -527,15 +786,10 @@ fn scroll_list(
     rows: f32,
 ) -> f32 {
     let top = *nav.top();
-    if !maker.tree.nodes[top.node].is_dir {
-        return rows;
-    }
-    let Some(world) = cursor_world else {
+    let Some(column) = column_under(nav, maker, cursor_world) else {
         return rows;
     };
     let list = maker.layouts.0[top.node].list;
-    let middle = (list.columns[0].max.x + list.columns[1].min.x) / 2.0;
-    let column = if world.x < middle { FILES } else { DIRS };
     let count = column_items(&maker.tree, top.node, column).len();
     let max = count.saturating_sub(list.fit) as f32;
     let before = top.scroll[column] as f32;
