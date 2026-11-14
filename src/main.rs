@@ -1,4 +1,6 @@
 mod layout;
+mod preview;
+mod shapes;
 mod tree;
 mod view;
 

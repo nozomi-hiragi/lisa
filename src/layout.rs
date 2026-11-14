@@ -1,8 +1,8 @@
 //! 木を「入れ子のリスト」に配置する。
 //!
-//! フォルダの中身は縦に1行ずつ並ぶ。フォルダの行は左に名前、右にフォルダの枠があり、
-//! 枠の中にそのフォルダの中身が同じ規則で小さく描かれる。枠はウィンドウと同じ縦横比なので、
-//! 枠にズームすると、その中身がウィンドウいっぱいに同じ見た目で広がる。
+//! フォルダの中身は縦に1行ずつ並ぶ。どの行も左に名前、右に枠がある。フォルダの枠の中には
+//! そのフォルダの中身が同じ規則で小さく描かれ、ファイルの枠にはプレビューが入る。
+//! 枠はウィンドウと同じ縦横比なので、枠にズームするとウィンドウいっぱいに広がる。
 
 use bevy::math::{Rect, Vec2};
 
@@ -15,8 +15,8 @@ pub struct NodeLayout {
     pub row: Rect,
     /// アイコンと名前を書く場所。
     pub label: Rect,
-    /// フォルダの枠。ファイルには無い。
-    pub folder: Option<Rect>,
+    /// 名前の右の枠。フォルダなら中身、ファイルならプレビューを描く。Root は全体。
+    pub frame: Rect,
 }
 
 /// フォルダの枠のうち、上に出っ張る見出し（タブ）の高さの割合。
@@ -30,7 +30,7 @@ pub fn layout(tree: &FileTree, root_rect: Rect, aspect: f32) -> Vec<NodeLayout> 
     out[FileTree::ROOT] = NodeLayout {
         row: root_rect,
         label: Rect::default(),
-        folder: Some(root_rect),
+        frame: root_rect,
     };
     place_children(
         tree,
@@ -79,39 +79,28 @@ fn place_children(tree: &FileTree, id: NodeId, area: Rect, aspect: f32, out: &mu
 
     // 行の高さは均等割り。ただし枠が広がりすぎて名前の欄が狭くならないよう抑える。
     let mut row_height = area.height() / children.len() as f32;
-    let max_folder_width = area.width() * (1.0 - MIN_LABEL_RATIO);
-    if row_height * 0.9 * aspect > max_folder_width {
-        row_height = max_folder_width / aspect / 0.9;
+    let max_frame_width = area.width() * (1.0 - MIN_LABEL_RATIO);
+    if row_height * 0.9 * aspect > max_frame_width {
+        row_height = max_frame_width / aspect / 0.9;
     }
-    let folder_height = row_height * 0.9;
-    let folder_width = folder_height * aspect;
+    let frame_height = row_height * 0.9;
+    let frame_width = frame_height * aspect;
     let gap = row_height * 0.05;
 
     for (i, &child) in children.iter().enumerate() {
         let top = area.max.y - row_height * i as f32;
         let row = Rect::new(area.min.x, top - row_height, area.max.x, top);
         let center_y = row.center().y;
-
+        let frame = Rect::new(
+            area.max.x - frame_width,
+            center_y - frame_height / 2.0,
+            area.max.x,
+            center_y + frame_height / 2.0,
+        );
+        let label = Rect::new(row.min.x, row.min.y, frame.min.x - gap, row.max.y);
+        out[child] = NodeLayout { row, label, frame };
         if tree.nodes[child].is_dir {
-            let folder = Rect::new(
-                area.max.x - folder_width,
-                center_y - folder_height / 2.0,
-                area.max.x,
-                center_y + folder_height / 2.0,
-            );
-            let label = Rect::new(row.min.x, row.min.y, folder.min.x - gap, row.max.y);
-            out[child] = NodeLayout {
-                row,
-                label,
-                folder: Some(folder),
-            };
-            place_children(tree, child, contents_area(folder), aspect, out);
-        } else {
-            out[child] = NodeLayout {
-                row,
-                label: row,
-                folder: None,
-            };
+            place_children(tree, child, contents_area(frame), aspect, out);
         }
     }
 }

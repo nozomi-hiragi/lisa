@@ -9,6 +9,8 @@ use bevy::window::{PrimaryWindow, RequestRedraw, WindowResized};
 use bevy::winit::{UpdateMode, WinitSettings};
 
 use crate::layout::{NodeLayout, folder_body, folder_tab, layout};
+use crate::preview::{self, PreviewKind};
+use crate::shapes::{LodShape, Painter};
 use crate::tree::{FileTree, NodeId, format_size};
 
 /// ワールド座標での Root の高さ。幅はウィンドウの縦横比に合わせる。
@@ -51,7 +53,7 @@ impl Plugin for TreeViewPlugin {
     }
 }
 
-/// 今フィーチャーしている（枠が画面いっぱいに映っている）フォルダ。
+/// 今フィーチャーしている（枠が画面いっぱいに映っている）フォルダかファイル。
 #[derive(Resource)]
 struct Focus(NodeId);
 
@@ -74,14 +76,8 @@ struct Animating {
 #[derive(Resource)]
 struct LabelsDirty;
 
-/// 図形。画面上で `min_size` が小さすぎたら隠す。
 #[derive(Component)]
-struct Shape {
-    min_size: f32,
-}
-
-#[derive(Component)]
-struct Label {
+struct NodeLabel {
     /// ワールド座標での文字の高さ。
     world_height: f32,
     /// 文字を置ける幅（ワールド座標）。
@@ -94,6 +90,8 @@ fn setup(
     mut commands: Commands,
     tree: Res<FileTree>,
     assets: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
     window: Single<&Window, With<PrimaryWindow>>,
 ) {
     let font = assets.load("fonts/NotoSansJP-Light.otf");
@@ -117,32 +115,50 @@ fn setup(
         let z = node.depth as f32;
         let hue = device_hue(node.device);
 
-        // フォルダの枠：薄いフォルダの形（タブと本体）。中身はこの上に描かれる。
-        if let Some(folder) = l.folder {
+        let mut painter = Painter {
+            commands: &mut commands,
+            meshes: &mut meshes,
+            materials: &mut materials,
+        };
+
+        // 名前の右の枠。フォルダは薄いフォルダの形（中身はこの上に描かれる）、
+        // ファイルは紙の形にプレビュー。
+        let mut extension_area = None;
+        if node.is_dir {
             let fill = Color::hsla(hue, 0.35, 0.55, 0.10);
-            spawn_rect(&mut commands, folder_tab(folder), fill, z);
-            spawn_rect(&mut commands, folder_body(folder), fill, z);
+            painter.rect(folder_tab(l.frame), fill, z);
+            painter.rect(folder_body(l.frame), fill, z);
+        } else {
+            extension_area = preview::draw(
+                &mut painter,
+                l.frame,
+                &PreviewKind::from_name(&node.name),
+                z,
+            );
         }
 
-        // アイコン：フォルダは小さなフォルダの形、ファイルは四角。
-        let icon_size = l.label.height() * 0.4;
-        let icon = Rect::from_center_size(
-            Vec2::new(l.label.min.x + icon_size * 0.6, l.label.center().y),
-            Vec2::splat(icon_size),
-        );
-        if node.is_dir {
-            let color = Color::hsl(hue, 0.5, 0.6);
-            spawn_rect(&mut commands, folder_tab(icon), color, z + 0.1);
-            spawn_rect(&mut commands, folder_body(icon), color, z + 0.1);
-        } else {
-            let file_icon =
-                Rect::from_center_size(icon.center(), icon.size() * Vec2::new(0.75, 1.0));
-            spawn_rect(
-                &mut commands,
-                file_icon,
-                Color::srgb(0.75, 0.75, 0.8),
-                z + 0.1,
-            );
+        // 種類のわからないファイルは、プレビューに拡張子を大きく書く。
+        if let Some(area) = extension_area {
+            let ext = preview::extension(&node.name).to_uppercase();
+            let ext = if ext.is_empty() {
+                "FILE".to_string()
+            } else {
+                ext
+            };
+            commands.spawn((
+                NodeLabel {
+                    world_height: area.height() * 0.4,
+                    world_width: area.width(),
+                    em_width: em_width(&ext),
+                },
+                Text2d::new(ext),
+                TextLayout::no_wrap(),
+                TextFont::from_font_size(16.0).with_font(font.clone()),
+                TextColor(Color::srgba(0.85, 0.87, 0.95, 0.5)),
+                Anchor::CENTER,
+                Transform::from_translation(area.center().extend(z + 0.2)),
+                Visibility::Hidden,
+            ));
         }
 
         // 名前。ファイルは大きさも添える。
@@ -151,9 +167,9 @@ fn setup(
         } else {
             format!("{}  {}", node.name, format_size(node.size))
         };
-        let left = icon.max.x + icon_size * 0.4;
+        let left = l.label.min.x + l.label.height() * 0.1;
         commands.spawn((
-            Label {
+            NodeLabel {
                 world_height: l.label.height() * 0.35,
                 world_width: l.label.max.x - left,
                 em_width: em_width(&text),
@@ -170,16 +186,6 @@ fn setup(
 
     commands.insert_resource(Layouts(layouts));
     commands.insert_resource(LabelsDirty);
-}
-
-fn spawn_rect(commands: &mut Commands, rect: Rect, color: Color, z: f32) {
-    commands.spawn((
-        Shape {
-            min_size: rect.width().min(rect.height()),
-        },
-        Sprite::from_color(color, rect.size()),
-        Transform::from_translation(rect.center().extend(z)),
-    ));
 }
 
 /// 端末ごとの色相。
@@ -200,12 +206,12 @@ fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
     (rect.center(), scale)
 }
 
-/// フィーチャー中のフォルダの枠。
+/// フィーチャー中のノードの枠。
 fn focus_rect(layouts: &Layouts, focus: NodeId) -> Rect {
-    layouts.0[focus].folder.unwrap_or(layouts.0[focus].row)
+    layouts.0[focus].frame
 }
 
-/// 左クリックしたフォルダへズームイン、右クリックか Esc で親へズームアウト。
+/// 左クリックしたフォルダかファイルへズームイン、右クリックか Esc で親へズームアウト。
 #[allow(clippy::too_many_arguments)]
 fn navigate(
     mut commands: Commands,
@@ -221,7 +227,7 @@ fn navigate(
     let (camera, camera_global, camera_transform, projection) = camera.into_inner();
 
     let next = if mouse.just_pressed(MouseButton::Left) {
-        // フィーチャー中のフォルダの直下で、クリックした行（名前か枠）のフォルダ。
+        // フィーチャー中のフォルダの直下で、クリックした行（名前か枠）。
         window
             .cursor_position()
             .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
@@ -230,7 +236,7 @@ fn navigate(
                     .children
                     .iter()
                     .copied()
-                    .find(|c| tree.nodes[*c].is_dir && layouts.0[*c].row.contains(world))
+                    .find(|c| layouts.0[*c].row.contains(world))
             })
     } else if mouse.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::Escape) {
         tree.nodes[focus.0].parent
@@ -257,7 +263,7 @@ fn navigate(
     });
 }
 
-/// ウィンドウの大きさが変わったら、フィーチャー中のフォルダに合わせ直す。
+/// ウィンドウの大きさが変わったら、フィーチャー中の枠に合わせ直す。
 fn refit_on_resize(
     mut commands: Commands,
     mut resized: MessageReader<WindowResized>,
@@ -326,8 +332,8 @@ fn update_lod(
     mut commands: Commands,
     projection: Single<&Projection, (With<Camera2d>, Changed<Projection>)>,
     labels_dirty: Option<Res<LabelsDirty>>,
-    mut shapes: Query<(&Shape, &mut Visibility), Without<Label>>,
-    mut labels: Query<(&Label, &mut TextFont, &mut Transform, &mut Visibility)>,
+    mut shapes: Query<(&LodShape, &mut Visibility), Without<NodeLabel>>,
+    mut labels: Query<(&NodeLabel, &mut TextFont, &mut Transform, &mut Visibility)>,
 ) {
     let Projection::Orthographic(ortho) = *projection else {
         return;
