@@ -124,6 +124,7 @@ pub fn bake(
                     scale,
                     0.0,
                     Rows::Summary,
+                    &[],
                 ));
                 entities.push(
                     commands

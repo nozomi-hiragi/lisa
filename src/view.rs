@@ -164,8 +164,11 @@ struct SceneMaker<'w, 's> {
 }
 
 impl SceneMaker<'_, '_> {
-    /// 画面に出す本物の場面を作る。`scale` はその場面を画面いっぱいに見るときの倍率。
-    fn spawn(&mut self, level: &Level, scale: f32) -> Entity {
+    /// 画面に出す本物の場面を作る。`path` の最後がその場面で、手前は外側のフォルダ。
+    /// `scale` はその場面を画面いっぱいに見るときの倍率。
+    fn spawn(&mut self, path: &[Level], scale: f32) -> Entity {
+        let (level, outer) = path.split_last().expect("場面がある");
+        let ancestors: Vec<(NodeId, f32)> = outer.iter().map(|l| (l.node, l.shift)).collect();
         let source = SceneSource {
             tree: &self.tree,
             layouts: &self.layouts.0,
@@ -182,6 +185,7 @@ impl SceneMaker<'_, '_> {
             scale,
             level.shift,
             Rows::Scroll(level.scroll),
+            &ancestors,
         )
     }
 }
@@ -230,6 +234,7 @@ fn setup(
         scale,
         0.0,
         Rows::Scroll(0),
+        &[],
     );
 
     commands.insert_resource(CurrentScene(root_scene));
@@ -258,7 +263,7 @@ fn show_baked(
     maker.commands.remove_resource::<BakeFinished>();
     maker.commands.entity(current.0).despawn();
     let (_, scale) = fit(nav.top().frame(&maker.layouts), &window);
-    current.0 = maker.spawn(nav.top(), scale);
+    current.0 = maker.spawn(&nav.stack, scale);
 }
 
 /// 左クリックしたフォルダかファイルへズームイン、右クリックか Esc で親へズームアウト。
@@ -320,10 +325,9 @@ fn navigate(
         // 親の本物の場面を先に作り、今の場面を上に重ねてフェードアウトさせる。
         // 開いていたのがファイルなら、今の場面がもう親の場面なので何もしない。
         if maker.tree.nodes[top.node].is_dir {
-            let parent = *nav.top();
-            let (_, scale) = fit(parent.frame(&maker.layouts), &window);
+            let (_, scale) = fit(nav.top().frame(&maker.layouts), &window);
             let old = current.0;
-            current.0 = maker.spawn(&parent, scale);
+            current.0 = maker.spawn(&nav.stack, scale);
             maker.commands.entity(old).insert((
                 Fade {
                     started: Instant::now(),
@@ -397,7 +401,7 @@ fn scroll(
     // 見えている行だけを作り直す。
     let (_, scale) = fit(level.frame(&maker.layouts), &window);
     maker.commands.entity(current.0).despawn();
-    current.0 = maker.spawn(&level, scale);
+    current.0 = maker.spawn(&nav.stack, scale);
 }
 
 /// ウィンドウの大きさが変わったら、フィーチャー中の枠に合わせ直す。
@@ -451,7 +455,7 @@ fn animate_camera(
         // 画像の上に本物の場面を重ねてフェードインし、終わったら古い場面を消す。
         let level = *nav.top();
         let old = current.0;
-        current.0 = maker.spawn(&level, anim.to_scale);
+        current.0 = maker.spawn(&nav.stack, anim.to_scale);
         maker.commands.entity(current.0).insert((
             Fade {
                 started: Instant::now(),

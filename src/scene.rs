@@ -38,6 +38,7 @@ pub enum Rows {
 
 /// フォルダ `folder` の場面を作る。`scale` はこの倍率で見たときにくっきり見えるように作る。
 /// `shift` は場面全体を上下にずらす量（親の場面がスクロールしていた分）。
+/// `ancestors` は外側のフォルダと、それぞれのずらす量。枠の外に見える背景として描く。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     commands: &mut Commands,
@@ -49,6 +50,7 @@ pub fn spawn(
     scale: f32,
     shift: f32,
     rows: Rows,
+    ancestors: &[(NodeId, f32)],
 ) -> Entity {
     let tree = source.tree;
     let root = commands
@@ -68,6 +70,23 @@ pub fn spawn(
         scale,
         font: source.font.clone(),
     };
+
+    // 外側のフォルダの枠。ズームの前後で、枠の外に見える色が変わらないようにする。
+    for &(ancestor, ancestor_shift) in ancestors {
+        if ancestor == FileTree::ROOT {
+            continue;
+        }
+        let offset = Vec2::new(0.0, ancestor_shift - shift);
+        let frame = source.layouts[ancestor].frame;
+        let frame = Rect {
+            min: frame.min + offset,
+            max: frame.max + offset,
+        };
+        let color = folder_color(tree, ancestor);
+        let z = tree.nodes[ancestor].depth as f32 - 0.5;
+        painter.rect(folder_tab(frame), color, z);
+        painter.rect(folder_body(frame), color, z);
+    }
 
     // フォルダ自身の枠（Root には描かない）。
     let node = &tree.nodes[folder];
