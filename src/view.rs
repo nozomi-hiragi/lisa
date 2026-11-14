@@ -18,6 +18,7 @@ use bevy::winit::{UpdateMode, WinitSettings};
 
 use crate::cache::{self, Bake, BakeFinished, FolderImages};
 use crate::layout::{Layouts, column_items, layout};
+use crate::menu::{BAR_PX, MenuBreadcrumb, MenuSystems, Popup};
 use crate::scene::{self, BACKGROUND, LabelFont, Rows, SceneRoot, SceneSource};
 use crate::shapes::BaseAlpha;
 use crate::tree::{FileTree, NodeId};
@@ -66,7 +67,8 @@ impl Plugin for TreeViewPlugin {
                 keep_redrawing,
                 update_title,
             )
-                .chain(),
+                .chain()
+                .after(MenuSystems),
         );
     }
 }
@@ -206,15 +208,18 @@ fn setup(
     window: Single<&Window, With<PrimaryWindow>>,
 ) {
     let font = assets.load("fonts/NotoSansJP-Light.otf");
-    let aspect = window.width() / window.height();
+    // 枠はメニューバーの下の領域と同じ縦横比にする。
+    let view_height = window.height() - BAR_PX;
+    let aspect = window.width() / view_height;
     let root_rect =
         Rect::from_center_size(Vec2::ZERO, Vec2::new(ROOT_HEIGHT * aspect, ROOT_HEIGHT));
-    let layouts = layout(&tree, root_rect, aspect, ROW_PX / window.height());
+    let layouts = layout(&tree, root_rect, aspect, ROW_PX / view_height);
     let folder_images = cache::create_images(&tree, aspect, &mut images);
 
     let (pos, scale) = fit(root_rect, &window);
     commands.spawn((
         MainCamera,
+        IsDefaultUiCamera,
         Camera2d,
         Projection::Orthographic(OrthographicProjection {
             scale,
@@ -249,10 +254,17 @@ fn setup(
     commands.insert_resource(LabelFont(font));
 }
 
-/// `rect` が画面いっぱいに収まるカメラの位置と倍率。
+/// `rect` がメニューバーの下の領域いっぱいに収まるカメラの位置と倍率。
 fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
-    let scale = (rect.width() / window.width()).max(rect.height() / window.height());
-    (rect.center(), scale)
+    let view_height = window.height() - BAR_PX;
+    let scale = (rect.width() / window.width()).max(rect.height() / view_height);
+    // 画面の中心より、バーの高さの半分だけ下に枠の中心が来るようにする。
+    (rect.center() + Vec2::new(0.0, BAR_PX / 2.0 * scale), scale)
+}
+
+/// メニューバーの上やポップアップを操作しているときは、下の画面は操作しない。
+fn ui_has_pointer(window: &Window, popup: &Popup) -> bool {
+    popup.open || window.cursor_position().is_some_and(|p| p.y < BAR_PX)
 }
 
 /// 画像が焼き上がったら、今の場面を作り直して画像を使う。
@@ -284,9 +296,10 @@ fn navigate(
     mut maker: SceneMaker,
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
+    popup: Res<Popup>,
 ) {
-    // 切り替えの途中は受け付けない。
-    if animating.is_some() || !fades.is_empty() {
+    // 切り替えの途中や、メニューを操作しているときは受け付けない。
+    if animating.is_some() || !fades.is_empty() || ui_has_pointer(&window, &popup) {
         return;
     }
     let window = window.into_inner();
@@ -352,6 +365,9 @@ fn navigate(
     maker
         .commands
         .insert_resource(Breadcrumb(maker.tree.path(next.node)));
+    maker
+        .commands
+        .insert_resource(MenuBreadcrumb(maker.tree.path(next.node)));
     let (to_pos, to_scale) = fit(next.frame(&maker.layouts), &window);
     maker.commands.insert_resource(Animating {
         from_pos: camera_transform.translation.truncate(),
@@ -375,6 +391,7 @@ fn scroll(
     camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
+    popup: Res<Popup>,
 ) {
     for event in wheel.read() {
         // 上へ回すと前の行へ。ピクセル単位（トラックパッド）は 40px で1行。
@@ -383,7 +400,7 @@ fn scroll(
             MouseScrollUnit::Pixel => event.y / 40.0,
         };
     }
-    if animating.is_some() || !fades.is_empty() {
+    if animating.is_some() || !fades.is_empty() || ui_has_pointer(&window, &popup) {
         *pending = 0.0;
         return;
     }

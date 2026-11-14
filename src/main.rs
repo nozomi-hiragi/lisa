@@ -2,6 +2,7 @@ mod cache;
 #[cfg(debug_assertions)]
 mod debug;
 mod layout;
+mod menu;
 mod preview;
 mod scene;
 mod shapes;
@@ -19,7 +20,7 @@ fn main() {
         }),
         ..default()
     }))
-    .add_plugins(view::TreeViewPlugin);
+    .add_plugins((view::TreeViewPlugin, menu::MenuPlugin));
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);
     app.run();
