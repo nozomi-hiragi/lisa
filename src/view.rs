@@ -48,6 +48,8 @@ impl Plugin for TreeViewPlugin {
             }],
         })
         .insert_resource(Bake::Waiting)
+        .insert_resource(Breadcrumb("Root".into()))
+        .init_resource::<Busy>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -60,6 +62,7 @@ impl Plugin for TreeViewPlugin {
                 animate_camera,
                 fade_scenes,
                 keep_redrawing,
+                update_title,
             )
                 .chain(),
         );
@@ -106,6 +109,18 @@ impl Level {
         self.shift + self.scroll as f32 * row_height
     }
 }
+
+/// 今いる場所（Root からの道のり）。
+#[derive(Resource)]
+struct Breadcrumb(String);
+
+/// ズームやフェードの最中なら true（毎フレーム描画している）。
+#[derive(Resource, Default)]
+pub struct Busy(pub bool);
+
+/// タイトルの後ろに添える文字（デバッグ用）。None なら何も添えない。
+#[derive(Resource, Default)]
+pub struct TitleSuffix(pub Option<String>);
 
 /// 画面を映すカメラ（画像を焼くカメラと区別する）。
 #[derive(Component)]
@@ -263,7 +278,7 @@ fn navigate(
     if animating.is_some() || !fades.is_empty() {
         return;
     }
-    let mut window = window.into_inner();
+    let window = window.into_inner();
     let (camera, camera_global, camera_transform, projection) = camera.into_inner();
     let Projection::Orthographic(ortho) = projection else {
         return;
@@ -324,7 +339,9 @@ fn navigate(
     };
 
     let next = *nav.top();
-    window.title = format!("Lisa — {}", maker.tree.path(next.node));
+    maker
+        .commands
+        .insert_resource(Breadcrumb(maker.tree.path(next.node)));
     let (to_pos, to_scale) = fit(next.frame(&maker.layouts), &window);
     maker.commands.insert_resource(Animating {
         from_pos: camera_transform.translation.truncate(),
@@ -506,8 +523,25 @@ fn keep_redrawing(
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
     mut redraw: MessageWriter<RequestRedraw>,
+    mut busy: ResMut<Busy>,
 ) {
-    if animating.is_some() || !fades.is_empty() {
+    busy.0 = animating.is_some() || !fades.is_empty();
+    if busy.0 {
         redraw.write(RequestRedraw);
+    }
+}
+
+/// ウィンドウのタイトル。今いる場所に、あればデバッグ情報を添える。変わったときだけ書き換える。
+fn update_title(
+    breadcrumb: Res<Breadcrumb>,
+    debug: Option<Res<TitleSuffix>>,
+    mut window: Single<&mut Window, With<PrimaryWindow>>,
+) {
+    let title = match debug.as_deref() {
+        Some(TitleSuffix(Some(suffix))) => format!("Lisa — {}  |  {suffix}", breadcrumb.0),
+        _ => format!("Lisa — {}", breadcrumb.0),
+    };
+    if window.title != title {
+        window.title = title;
     }
 }

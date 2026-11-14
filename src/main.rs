@@ -1,4 +1,6 @@
 mod cache;
+#[cfg(debug_assertions)]
+mod debug;
 mod layout;
 mod preview;
 mod scene;
@@ -9,14 +11,16 @@ mod view;
 use bevy::prelude::*;
 
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Lisa — Root".into(),
-                ..default()
-            }),
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "Lisa — Root".into(),
             ..default()
-        }))
-        .add_plugins(view::TreeViewPlugin)
-        .run();
+        }),
+        ..default()
+    }))
+    .add_plugins(view::TreeViewPlugin);
+    #[cfg(debug_assertions)]
+    app.add_plugins(debug::DebugTitlePlugin);
+    app.run();
 }
