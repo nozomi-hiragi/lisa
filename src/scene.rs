@@ -9,7 +9,7 @@ use bevy::sprite::Anchor;
 use bevy::sprite_render::ColorMaterial;
 
 use crate::cache::FolderImages;
-use crate::layout::{MAX_ROWS, NodeLayout, contents_area, folder_body, folder_tab};
+use crate::layout::{DIRS, FILES, NodeLayout, column_items, folder_body, folder_tab};
 use crate::preview;
 use crate::shapes::{Painter, over};
 use crate::tree::{FileTree, NodeId, format_size};
@@ -32,8 +32,8 @@ pub struct SceneSource<'a> {
 pub enum Rows {
     /// 入る分だけ先頭から並べ、はみ出すときは最後の行を「…ほか N 件」にする（画像用）。
     Summary,
-    /// 指定した行から MAX_ROWS 行ぶんを並べる（スクロール中の本物の場面用）。
-    Scroll(usize),
+    /// 列ごとに、指定した行から入る分だけ並べる（スクロール中の本物の場面用）。
+    Scroll([usize; 2]),
 }
 
 /// フォルダ `folder` の場面を作る。`scale` はこの倍率で見たときにくっきり見えるように作る。
@@ -98,90 +98,98 @@ pub fn spawn(
         painter.rect(folder_body(frame), background, z);
     }
 
-    let children = &node.children;
-    if children.is_empty() {
-        return root;
-    }
-    let count = children.len();
-    let row_height = source.layouts[children[0]].row.height();
+    let list = source.layouts[folder].list;
+    let row_height = list.row_height;
+    let fit = list.fit;
+    let layer = painter.layer.clone();
 
-    // どの行を描くか。スクロールしているときは、行全体を上へずらす。
-    let (first, shown, more) = match rows {
-        Rows::Summary if count > MAX_ROWS => (0, MAX_ROWS - 1, Some(count - (MAX_ROWS - 1))),
-        Rows::Summary => (0, count, None),
-        Rows::Scroll(first) => (first, count.min(first + MAX_ROWS) - first, None),
-    };
-    painter.parent = painter
-        .commands
-        .spawn((
-            ChildOf(root),
-            Transform::from_xyz(0.0, first as f32 * row_height, 0.0),
-            Visibility::default(),
-            layer,
-        ))
-        .id();
-
-    // 直下の行。
-    for &child in &children[first..first + shown] {
-        let l = &source.layouts[child];
-        let child_node = &tree.nodes[child];
-        let z = child_node.depth as f32;
-
-        if child_node.is_dir {
-            match source.images.ready(child) {
-                // 画像には子の枠の形と中身が焼いてある。
-                Some(image) => painter.image(l.frame, image, z),
-                // まだ画像が無いときは、空の枠だけ。
-                None => {
-                    let color = folder_color(tree, child);
-                    painter.rect(folder_tab(l.frame), color, z);
-                    painter.rect(folder_body(l.frame), color, z);
-                }
-            }
-        } else {
-            preview::draw(&mut painter, &child_node.name, l.frame, background, z);
+    for column in [FILES, DIRS] {
+        let items = column_items(tree, folder, column);
+        let count = items.len();
+        if count == 0 {
+            continue;
         }
 
-        // 名前。ファイルは大きさも添える。
-        let text = if child_node.is_dir {
-            child_node.name.clone()
-        } else {
-            format!("{}  {}", child_node.name, format_size(child_node.size))
+        // どの行を描くか。スクロールしているときは、その列の行を上へずらす。
+        let (first, shown, more) = match rows {
+            Rows::Summary if count > fit => (0, fit - 1, Some(count - (fit - 1))),
+            Rows::Summary => (0, count, None),
+            Rows::Scroll(scroll) => {
+                let first = scroll[column].min(count.saturating_sub(fit));
+                (first, count.min(first + fit) - first, None)
+            }
         };
-        label(&mut painter, &l.label, text, background, 0.9, z);
-    }
+        painter.parent = painter
+            .commands
+            .spawn((
+                ChildOf(root),
+                Transform::from_xyz(0.0, first as f32 * row_height, 0.0),
+                Visibility::default(),
+                layer.clone(),
+            ))
+            .id();
 
-    // はみ出した分の数。
-    if let Some(more) = more {
-        let l = &source.layouts[children[MAX_ROWS - 1]];
-        let z = node.depth as f32 + 1.0;
-        label(
-            &mut painter,
-            &l.label,
-            format!("…ほか {more} 件"),
-            background,
-            0.5,
-            z,
-        );
-    }
+        for &child in &items[first..first + shown] {
+            let l = &source.layouts[child];
+            let child_node = &tree.nodes[child];
+            let z = child_node.depth as f32;
 
-    // スクロールできるときは、右端に今どこを見ているかの棒を出す。
-    if let Rows::Scroll(first) = rows
-        && count > MAX_ROWS
-    {
-        painter.parent = root;
-        let area = contents_area(frame);
-        let pad = frame.height() * 0.04;
-        let x = area.max.x + pad * 0.35;
-        let track = Rect::new(x, area.min.y, x + pad * 0.3, area.max.y);
-        let top = area.max.y - area.height() * first as f32 / count as f32;
-        let height = area.height() * MAX_ROWS as f32 / count as f32;
-        painter.rect(track, over(background, Color::WHITE, 0.08), z + 0.3);
-        painter.rect(
-            Rect::new(track.min.x, top - height, track.max.x, top),
-            over(background, Color::WHITE, 0.35),
-            z + 0.4,
-        );
+            if child_node.is_dir {
+                match source.images.ready(child) {
+                    // 画像には子の枠の形と中身が焼いてある。
+                    Some(image) => painter.image(l.frame, image, z),
+                    // まだ画像が無いときは、空の枠だけ。
+                    None => {
+                        let color = folder_color(tree, child);
+                        painter.rect(folder_tab(l.frame), color, z);
+                        painter.rect(folder_body(l.frame), color, z);
+                    }
+                }
+            } else {
+                preview::draw(&mut painter, &child_node.name, l.frame, background, z);
+            }
+
+            // 名前。ファイルは大きさも添える。
+            let text = if child_node.is_dir {
+                child_node.name.clone()
+            } else {
+                format!("{}  {}", child_node.name, format_size(child_node.size))
+            };
+            label(&mut painter, &l.label, text, background, 0.9, z);
+        }
+
+        // はみ出した分の数。
+        if let Some(more) = more {
+            let l = &source.layouts[items[fit - 1]];
+            let z = node.depth as f32 + 1.0;
+            label(
+                &mut painter,
+                &l.label,
+                format!("…ほか {more} 件"),
+                background,
+                0.5,
+                z,
+            );
+        }
+
+        // スクロールできるときは、列の右端に今どこを見ているかの棒を出す。
+        if let Rows::Scroll(_) = rows
+            && count > fit
+        {
+            painter.parent = root;
+            let rect = list.columns[column];
+            let width = row_height * 0.08;
+            let x = rect.max.x + width;
+            let track = Rect::new(x, rect.min.y, x + width, rect.max.y);
+            let top = rect.max.y - rect.height() * first as f32 / count as f32;
+            let height = rect.height() * fit as f32 / count as f32;
+            painter.rect(track, over(background, Color::WHITE, 0.08), z + 0.3);
+            painter.rect(
+                Rect::new(track.min.x, top - height, track.max.x, top),
+                over(background, Color::WHITE, 0.35),
+                z + 0.4,
+            );
+        }
     }
     root
 }
@@ -200,7 +208,7 @@ fn label(
         text,
         Vec2::new(left, rect.center().y),
         Anchor::CENTER_LEFT,
-        rect.height() * 0.18,
+        rect.height() * 0.45,
         rect.max.x - left,
         over(background, Color::WHITE, strength),
         z + 0.2,

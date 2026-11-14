@@ -17,13 +17,15 @@ use bevy::window::{PrimaryWindow, RequestRedraw, WindowResized};
 use bevy::winit::{UpdateMode, WinitSettings};
 
 use crate::cache::{self, Bake, BakeFinished, FolderImages};
-use crate::layout::{Layouts, MAX_ROWS, layout};
+use crate::layout::{Layouts, column_items, layout};
 use crate::scene::{self, BACKGROUND, LabelFont, Rows, SceneRoot, SceneSource};
 use crate::shapes::BaseAlpha;
 use crate::tree::{FileTree, NodeId};
 
 /// ワールド座標での Root の高さ。幅はウィンドウの縦横比に合わせる。
 const ROOT_HEIGHT: f32 = 1000.0;
+/// リストの行の高さ（そのフォルダが画面いっぱいのときのピクセル数）。
+const ROW_PX: f32 = 40.0;
 /// ズームにかける時間（秒）。
 const ZOOM_SECONDS: f32 = 0.4;
 /// 画像から本物の描画へ切り替えるときのフェードの時間（秒）。
@@ -44,7 +46,7 @@ impl Plugin for TreeViewPlugin {
             stack: vec![Level {
                 node: FileTree::ROOT,
                 shift: 0.0,
-                scroll: 0,
+                scroll: [0, 0],
             }],
         })
         .insert_resource(Bake::Waiting)
@@ -86,8 +88,8 @@ struct Level {
     node: NodeId,
     /// 場面全体を上下にずらす量（親がスクロールしていた分）。
     shift: f32,
-    /// 何行目から見せているか。
-    scroll: usize,
+    /// 列（ファイル、フォルダ）ごとに、何行目から見せているか。
+    scroll: [usize; 2],
 }
 
 impl Level {
@@ -100,13 +102,17 @@ impl Level {
         }
     }
 
-    /// 子の行を描いている位置のずれ（自分のずれ＋スクロールの分）。
-    fn child_shift(&self, tree: &FileTree, layouts: &Layouts) -> f32 {
-        let row_height = tree.nodes[self.node]
-            .children
-            .first()
-            .map_or(0.0, |c| layouts.0[*c].row.height());
-        self.shift + self.scroll as f32 * row_height
+    /// その列の行を描いている位置のずれ（自分のずれ＋その列のスクロールの分）。
+    fn column_shift(&self, layouts: &Layouts, column: usize) -> f32 {
+        self.shift + self.scroll[column] as f32 * layouts.0[self.node].list.row_height
+    }
+
+    /// 今見えている、その列の子。
+    fn visible(&self, tree: &FileTree, layouts: &Layouts, column: usize) -> Vec<NodeId> {
+        let items = column_items(tree, self.node, column);
+        let fit = layouts.0[self.node].list.fit;
+        let first = self.scroll[column].min(items.len());
+        items[first..items.len().min(first + fit)].to_vec()
     }
 }
 
@@ -203,7 +209,7 @@ fn setup(
     let aspect = window.width() / window.height();
     let root_rect =
         Rect::from_center_size(Vec2::ZERO, Vec2::new(ROOT_HEIGHT * aspect, ROOT_HEIGHT));
-    let layouts = layout(&tree, root_rect, aspect);
+    let layouts = layout(&tree, root_rect, aspect, ROW_PX / window.height());
     let folder_images = cache::create_images(&tree, aspect, &mut images);
 
     let (pos, scale) = fit(root_rect, &window);
@@ -233,7 +239,7 @@ fn setup(
         RenderLayers::layer(0),
         scale,
         0.0,
-        Rows::Scroll(0),
+        Rows::Scroll([0, 0]),
         &[],
     );
 
@@ -292,27 +298,27 @@ fn navigate(
 
     let then_show = if mouse.just_pressed(MouseButton::Left) {
         // 今の場面に見えている行のうち、クリックした行（名前か枠）。
-        let shift = top.child_shift(&maker.tree, &maker.layouts);
-        let children = &maker.tree.nodes[top.node].children;
-        let visible =
-            &children[top.scroll.min(children.len())..children.len().min(top.scroll + MAX_ROWS)];
-        let Some(child) = window
+        let Some(world) = window
             .cursor_position()
             .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
-            .and_then(|world| {
-                let world = world - Vec2::new(0.0, shift);
-                visible
-                    .iter()
-                    .copied()
-                    .find(|c| maker.layouts.0[*c].row.contains(world))
-            })
         else {
+            return;
+        };
+        let hit = (0..2).find_map(|column| {
+            let shift = top.column_shift(&maker.layouts, column);
+            let local = world - Vec2::new(0.0, shift);
+            top.visible(&maker.tree, &maker.layouts, column)
+                .into_iter()
+                .find(|c| maker.layouts.0[*c].row.contains(local))
+                .map(|c| (c, shift))
+        });
+        let Some((child, shift)) = hit else {
             return;
         };
         nav.stack.push(Level {
             node: child,
             shift,
-            scroll: 0,
+            scroll: [0, 0],
         });
         // 画像のままズームして、終わってから本物に切り替える。
         // ファイルは今の場面にそのまま描いてあるので切り替えない。
@@ -366,6 +372,7 @@ fn scroll(
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
     window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
 ) {
@@ -387,16 +394,30 @@ fn scroll(
     *pending -= rows;
 
     let top = *nav.top();
-    let count = maker.tree.nodes[top.node].children.len();
-    if !maker.tree.nodes[top.node].is_dir || count <= MAX_ROWS {
+    if !maker.tree.nodes[top.node].is_dir {
         return;
     }
-    let scroll = (top.scroll as f32 + rows).clamp(0.0, (count - MAX_ROWS) as f32) as usize;
-    if scroll == top.scroll {
+    // カーソルのある列をスクロールする。
+    let (camera, camera_global) = camera.into_inner();
+    let Some(world) = window
+        .cursor_position()
+        .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
+    else {
+        return;
+    };
+    let list = maker.layouts.0[top.node].list;
+    let middle = (list.columns[0].max.x + list.columns[1].min.x) / 2.0;
+    let column = if world.x < middle { 0 } else { 1 };
+    let count = column_items(&maker.tree, top.node, column).len();
+    if count <= list.fit {
+        return;
+    }
+    let scroll = (top.scroll[column] as f32 + rows).clamp(0.0, (count - list.fit) as f32) as usize;
+    if scroll == top.scroll[column] {
         return;
     }
     let level = nav.stack.last_mut().expect("Root は常にある");
-    level.scroll = scroll;
+    level.scroll[column] = scroll;
     let level = *level;
     // 見えている行だけを作り直す。
     let (_, scale) = fit(level.frame(&maker.layouts), &window);

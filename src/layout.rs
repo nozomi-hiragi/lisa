@@ -1,8 +1,9 @@
 //! 木を「入れ子のリスト」に配置する。
 //!
-//! フォルダの中身は縦に1行ずつ並ぶ。どの行も左に名前、右に枠がある。フォルダの枠の中には
-//! そのフォルダの中身が同じ規則で小さく描かれ、ファイルの枠にはプレビューが入る。
-//! 枠はウィンドウと同じ縦横比なので、枠にズームするとウィンドウいっぱいに広がる。
+//! フォルダの中身は2列に分かれる。左はファイル、右はフォルダで、どちらも名前順に縦に並ぶ。
+//! どの行も左に名前、右に枠がある。フォルダの枠の中にはそのフォルダの中身が同じ規則で
+//! 小さく描かれ、ファイルの枠にはプレビューが入る。枠は画面と同じ縦横比なので、枠にズーム
+//! すると画面いっぱいに広がる。行の高さは「その枠が画面いっぱいのときに何ピクセルか」で決める。
 
 use bevy::math::{Rect, Vec2};
 use bevy::prelude::Resource;
@@ -18,6 +19,37 @@ pub struct NodeLayout {
     pub label: Rect,
     /// 名前の右の枠。フォルダなら中身、ファイルならプレビューを描く。Root は全体。
     pub frame: Rect,
+    /// フォルダの中身の並べ方（フォルダのみ）。
+    pub list: ListLayout,
+}
+
+/// フォルダの中身の並べ方。
+#[derive(Clone, Copy, Default)]
+pub struct ListLayout {
+    pub row_height: f32,
+    /// 1列に入る行の数。
+    pub fit: usize,
+    /// 左がファイル、右がフォルダの列。
+    pub columns: [Rect; 2],
+}
+
+/// ファイルの列とフォルダの列。
+pub const FILES: usize = 0;
+pub const DIRS: usize = 1;
+
+/// 子がどちらの列に入るか。
+pub fn column_of(tree: &FileTree, id: NodeId) -> usize {
+    if tree.nodes[id].is_dir { DIRS } else { FILES }
+}
+
+/// その列に入る子（名前順）。
+pub fn column_items(tree: &FileTree, folder: NodeId, column: usize) -> Vec<NodeId> {
+    tree.nodes[folder]
+        .children
+        .iter()
+        .copied()
+        .filter(|c| column_of(tree, *c) == column)
+        .collect()
 }
 
 /// 全ノードの配置。
@@ -26,26 +58,20 @@ pub struct Layouts(pub Vec<NodeLayout>);
 
 /// フォルダの枠のうち、上に出っ張る見出し（タブ）の高さの割合。
 const TAB_RATIO: f32 = 0.1;
-/// 名前の欄に最低限残す幅の割合。
-const MIN_LABEL_RATIO: f32 = 0.3;
-/// ひとつの枠に並べる行の数の上限。これより多いとはみ出し、スクロールで見る。
-pub const MAX_ROWS: usize = 12;
+/// 列の中で、枠に使ってよい幅の割合（残りは名前の欄）。
+const MAX_FRAME_RATIO: f32 = 0.45;
 
 /// `root_rect` を Root の枠として木全体を配置する。`aspect` はフォルダの枠の縦横比（幅 / 高さ）。
-pub fn layout(tree: &FileTree, root_rect: Rect, aspect: f32) -> Vec<NodeLayout> {
+/// `row_ratio` は行の高さを枠の高さに対する割合で表したもの。
+pub fn layout(tree: &FileTree, root_rect: Rect, aspect: f32, row_ratio: f32) -> Vec<NodeLayout> {
     let mut out = vec![NodeLayout::default(); tree.nodes.len()];
     out[FileTree::ROOT] = NodeLayout {
         row: root_rect,
         label: Rect::default(),
         frame: root_rect,
+        list: ListLayout::default(),
     };
-    place_children(
-        tree,
-        FileTree::ROOT,
-        contents_area(root_rect),
-        aspect,
-        &mut out,
-    );
+    place_children(tree, FileTree::ROOT, root_rect, aspect, row_ratio, &mut out);
     out
 }
 
@@ -78,37 +104,76 @@ pub fn contents_area(folder: Rect) -> Rect {
     }
 }
 
-fn place_children(tree: &FileTree, id: NodeId, area: Rect, aspect: f32, out: &mut [NodeLayout]) {
-    let children = &tree.nodes[id].children;
-    if children.is_empty() || area.is_empty() {
+fn place_children(
+    tree: &FileTree,
+    id: NodeId,
+    frame: Rect,
+    aspect: f32,
+    row_ratio: f32,
+    out: &mut [NodeLayout],
+) {
+    let area = contents_area(frame);
+    if area.is_empty() {
         return;
     }
-
-    // 行の高さは均等割り（多いときは MAX_ROWS 行ぶん）。
-    // ただし枠が広がりすぎて名前の欄が狭くならないよう抑える。
-    let mut row_height = area.height() / children.len().min(MAX_ROWS) as f32;
-    let max_frame_width = area.width() * (1.0 - MIN_LABEL_RATIO);
-    if row_height * 0.9 * aspect > max_frame_width {
-        row_height = max_frame_width / aspect / 0.9;
-    }
-    let frame_height = row_height * 0.9;
-    let frame_width = frame_height * aspect;
-    let gap = row_height * 0.05;
-
-    for (i, &child) in children.iter().enumerate() {
-        let top = area.max.y - row_height * i as f32;
-        let row = Rect::new(area.min.x, top - row_height, area.max.x, top);
-        let center_y = row.center().y;
-        let frame = Rect::new(
-            area.max.x - frame_width,
-            center_y - frame_height / 2.0,
+    let row_height = frame.height() * row_ratio;
+    let fit = ((area.height() / row_height).floor() as usize).max(1);
+    let gap = area.width() * 0.03;
+    let column_width = (area.width() - gap) / 2.0;
+    let columns = [
+        Rect::new(
+            area.min.x,
+            area.min.y,
+            area.min.x + column_width,
+            area.max.y,
+        ),
+        Rect::new(
+            area.max.x - column_width,
+            area.min.y,
             area.max.x,
-            center_y + frame_height / 2.0,
-        );
-        let label = Rect::new(row.min.x, row.min.y, frame.min.x - gap, row.max.y);
-        out[child] = NodeLayout { row, label, frame };
-        if tree.nodes[child].is_dir {
-            place_children(tree, child, contents_area(frame), aspect, out);
+            area.max.y,
+        ),
+    ];
+    out[id].list = ListLayout {
+        row_height,
+        fit,
+        columns,
+    };
+
+    // 枠は行の高さに収め、列の幅の MAX_FRAME_RATIO までにする。縦横比は画面と同じ。
+    let mut frame_height = row_height * 0.85;
+    if frame_height * aspect > column_width * MAX_FRAME_RATIO {
+        frame_height = column_width * MAX_FRAME_RATIO / aspect;
+    }
+    let frame_width = frame_height * aspect;
+    let label_gap = row_height * 0.1;
+
+    for (column, rect) in columns.iter().enumerate() {
+        for (i, child) in column_items(tree, id, column).into_iter().enumerate() {
+            let top = rect.max.y - row_height * i as f32;
+            let row = Rect::new(rect.min.x, top - row_height, rect.max.x, top);
+            let center_y = row.center().y;
+            let child_frame = Rect::new(
+                rect.max.x - frame_width,
+                center_y - frame_height / 2.0,
+                rect.max.x,
+                center_y + frame_height / 2.0,
+            );
+            let label = Rect::new(
+                row.min.x,
+                row.min.y,
+                child_frame.min.x - label_gap,
+                row.max.y,
+            );
+            out[child] = NodeLayout {
+                row,
+                label,
+                frame: child_frame,
+                list: ListLayout::default(),
+            };
+            if tree.nodes[child].is_dir {
+                place_children(tree, child, child_frame, aspect, row_ratio, out);
+            }
         }
     }
 }
