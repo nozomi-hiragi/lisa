@@ -1,125 +1,117 @@
-//! 木を入れ子の四角（squarified treemap）に配置する。
+//! 木を「入れ子のリスト」に配置する。
+//!
+//! フォルダの中身は縦に1行ずつ並ぶ。フォルダの行は左に名前、右にフォルダの枠があり、
+//! 枠の中にそのフォルダの中身が同じ規則で小さく描かれる。枠はウィンドウと同じ縦横比なので、
+//! 枠にズームすると、その中身がウィンドウいっぱいに同じ見た目で広がる。
 
-use bevy::math::Rect;
+use bevy::math::{Rect, Vec2};
 
 use crate::tree::{FileTree, NodeId};
 
 /// 各ノードの領域（ワールド座標、y は上向き）。
+#[derive(Clone, Copy, Default)]
 pub struct NodeLayout {
-    /// ノード全体の四角。
-    pub rect: Rect,
-    /// 名前を書く上端の帯の高さ。
-    pub label_height: f32,
-    /// 四角の内側の余白。
-    pub padding: f32,
+    /// 行全体（クリックの判定に使う）。
+    pub row: Rect,
+    /// アイコンと名前を書く場所。
+    pub label: Rect,
+    /// フォルダの枠。ファイルには無い。
+    pub folder: Option<Rect>,
 }
 
-pub fn layout(tree: &FileTree, root_rect: Rect) -> Vec<NodeLayout> {
-    let mut out: Vec<NodeLayout> = (0..tree.nodes.len())
-        .map(|_| NodeLayout {
-            rect: Rect::default(),
-            label_height: 0.0,
-            padding: 0.0,
-        })
-        .collect();
-    place(tree, FileTree::ROOT, root_rect, &mut out);
+/// フォルダの枠のうち、上に出っ張る見出し（タブ）の高さの割合。
+const TAB_RATIO: f32 = 0.1;
+/// 名前の欄に最低限残す幅の割合。
+const MIN_LABEL_RATIO: f32 = 0.3;
+
+/// `root_rect` を Root の枠として木全体を配置する。`aspect` はフォルダの枠の縦横比（幅 / 高さ）。
+pub fn layout(tree: &FileTree, root_rect: Rect, aspect: f32) -> Vec<NodeLayout> {
+    let mut out = vec![NodeLayout::default(); tree.nodes.len()];
+    out[FileTree::ROOT] = NodeLayout {
+        row: root_rect,
+        label: Rect::default(),
+        folder: Some(root_rect),
+    };
+    place_children(
+        tree,
+        FileTree::ROOT,
+        contents_area(root_rect),
+        aspect,
+        &mut out,
+    );
     out
 }
 
-fn place(tree: &FileTree, id: NodeId, rect: Rect, out: &mut [NodeLayout]) {
-    let short = rect.width().min(rect.height());
-    let padding = short * 0.015;
-    let label_height = (rect.height() * 0.08).min(rect.width() * 0.08);
-    out[id] = NodeLayout {
-        rect,
-        label_height,
-        padding,
-    };
+/// フォルダの枠のうち、タブ（左上の出っ張り）。
+pub fn folder_tab(folder: Rect) -> Rect {
+    let h = folder.height() * TAB_RATIO;
+    Rect::new(
+        folder.min.x,
+        folder.max.y - h,
+        folder.min.x + folder.width() * 0.35,
+        folder.max.y,
+    )
+}
 
-    let node = &tree.nodes[id];
-    if node.children.is_empty() {
-        return;
-    }
-    let inner = Rect {
-        min: rect.min + padding,
-        max: rect.max - padding - bevy::math::Vec2::new(0.0, label_height),
-    };
-    if inner.width() <= 0.0 || inner.height() <= 0.0 {
-        return;
-    }
-
-    let mut children = node.children.clone();
-    children.sort_by(|a, b| tree.nodes[*b].size.cmp(&tree.nodes[*a].size));
-    let sizes: Vec<f64> = children
-        .iter()
-        .map(|c| tree.nodes[*c].size.max(1) as f64)
-        .collect();
-    let gap = padding * 0.5;
-    for (child, child_rect) in children.iter().zip(squarify(&sizes, inner)) {
-        let shrunk = Rect {
-            min: child_rect.min + gap,
-            max: child_rect.max - gap,
-        };
-        // 細すぎて余白で潰れる場合は余白なしで置く。
-        let shrunk = if shrunk.is_empty() {
-            child_rect
-        } else {
-            shrunk
-        };
-        place(tree, *child, shrunk, out);
+/// フォルダの枠のうち、タブを除いた本体。
+pub fn folder_body(folder: Rect) -> Rect {
+    Rect {
+        min: folder.min,
+        max: Vec2::new(folder.max.x, folder.max.y - folder.height() * TAB_RATIO),
     }
 }
 
-/// 大きい順に並んだ `sizes` を、面積が比例するように `rect` の中へ敷き詰める。
-fn squarify(sizes: &[f64], rect: Rect) -> Vec<Rect> {
-    let total: f64 = sizes.iter().sum();
-    let scale = (rect.width() as f64 * rect.height() as f64) / total;
-    let areas: Vec<f64> = sizes.iter().map(|s| s * scale).collect();
-
-    let mut result = Vec::with_capacity(areas.len());
-    let mut free = rect;
-    let mut i = 0;
-    while i < areas.len() {
-        let short = free.width().min(free.height()) as f64;
-        let mut j = i + 1;
-        while j < areas.len() && worst(&areas[i..=j], short) <= worst(&areas[i..j], short) {
-            j += 1;
-        }
-        let row = &areas[i..j];
-        let row_sum: f64 = row.iter().sum();
-
-        if free.width() >= free.height() {
-            // 左端に縦の列を置く。
-            let width = (row_sum / free.height() as f64) as f32;
-            let mut y = free.max.y;
-            for a in row {
-                let h = (*a / width as f64) as f32;
-                result.push(Rect::new(free.min.x, y - h, free.min.x + width, y));
-                y -= h;
-            }
-            free.min.x += width;
-        } else {
-            // 上端に横の行を置く。
-            let height = (row_sum / free.width() as f64) as f32;
-            let mut x = free.min.x;
-            for a in row {
-                let w = (*a / height as f64) as f32;
-                result.push(Rect::new(x, free.max.y - height, x + w, free.max.y));
-                x += w;
-            }
-            free.max.y -= height;
-        }
-        i = j;
+/// フォルダの中身を並べる場所（本体の内側）。
+fn contents_area(folder: Rect) -> Rect {
+    let body = folder_body(folder);
+    let pad = folder.height() * 0.04;
+    Rect {
+        min: body.min + pad,
+        max: body.max - pad,
     }
-    result
 }
 
-/// 行の中でいちばん細長い四角の縦横比。
-fn worst(row: &[f64], short: f64) -> f64 {
-    let sum: f64 = row.iter().sum();
-    let max = row.iter().cloned().fold(f64::MIN, f64::max);
-    let min = row.iter().cloned().fold(f64::MAX, f64::min);
-    let s2 = short * short;
-    let sum2 = sum * sum;
-    (s2 * max / sum2).max(sum2 / (s2 * min))
+fn place_children(tree: &FileTree, id: NodeId, area: Rect, aspect: f32, out: &mut [NodeLayout]) {
+    let children = &tree.nodes[id].children;
+    if children.is_empty() || area.is_empty() {
+        return;
+    }
+
+    // 行の高さは均等割り。ただし枠が広がりすぎて名前の欄が狭くならないよう抑える。
+    let mut row_height = area.height() / children.len() as f32;
+    let max_folder_width = area.width() * (1.0 - MIN_LABEL_RATIO);
+    if row_height * 0.9 * aspect > max_folder_width {
+        row_height = max_folder_width / aspect / 0.9;
+    }
+    let folder_height = row_height * 0.9;
+    let folder_width = folder_height * aspect;
+    let gap = row_height * 0.05;
+
+    for (i, &child) in children.iter().enumerate() {
+        let top = area.max.y - row_height * i as f32;
+        let row = Rect::new(area.min.x, top - row_height, area.max.x, top);
+        let center_y = row.center().y;
+
+        if tree.nodes[child].is_dir {
+            let folder = Rect::new(
+                area.max.x - folder_width,
+                center_y - folder_height / 2.0,
+                area.max.x,
+                center_y + folder_height / 2.0,
+            );
+            let label = Rect::new(row.min.x, row.min.y, folder.min.x - gap, row.max.y);
+            out[child] = NodeLayout {
+                row,
+                label,
+                folder: Some(folder),
+            };
+            place_children(tree, child, contents_area(folder), aspect, out);
+        } else {
+            out[child] = NodeLayout {
+                row,
+                label: row,
+                folder: None,
+            };
+        }
+    }
 }

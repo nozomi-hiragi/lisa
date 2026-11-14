@@ -4,10 +4,6 @@ use bevy::prelude::*;
 
 pub type NodeId = usize;
 
-/// ダミーの木の定義：(名前, 大きさ)。
-type Files = &'static [(&'static str, u64)];
-type Folders = &'static [(&'static str, Files)];
-
 pub struct Node {
     pub name: String,
     /// バイト数。フォルダは子の合計。
@@ -17,6 +13,22 @@ pub struct Node {
     pub children: Vec<NodeId>,
     /// どの端末の下にあるか（色分けに使う）。Root は 0。
     pub device: usize,
+    /// フォルダ（Root と端末も含む）なら true。
+    pub is_dir: bool,
+}
+
+/// ダミーの木を書くための入れ物。
+enum Entry {
+    Dir(&'static str, Vec<Entry>),
+    File(&'static str, u64),
+}
+
+fn dir(name: &'static str, children: Vec<Entry>) -> Entry {
+    Entry::Dir(name, children)
+}
+
+fn file(name: &'static str, size: u64) -> Entry {
+    Entry::File(name, size)
 }
 
 #[derive(Resource)]
@@ -27,84 +39,91 @@ pub struct FileTree {
 impl FileTree {
     pub const ROOT: NodeId = 0;
 
-    /// 実験用のダミーの木（Root → 端末 → フォルダ → ファイル の3階層）。
+    /// 実験用のダミーの木。
     pub fn dummy() -> Self {
         const MB: u64 = 1024 * 1024;
         const GB: u64 = 1024 * MB;
-        let devices: &[(&str, Folders)] = &[
-            (
+        let devices = vec![
+            dir(
                 "MacBook",
-                &[
-                    (
+                vec![
+                    dir(
                         "書類",
-                        &[
-                            ("企画書.pdf", 3 * MB),
-                            ("見積もり.xlsx", MB),
-                            ("議事録.md", MB / 4),
-                            ("契約書.pdf", 2 * MB),
+                        vec![
+                            file("企画書.pdf", 3 * MB),
+                            file("見積もり.xlsx", MB),
+                            file("議事録.md", MB / 4),
+                            file("契約書.pdf", 2 * MB),
                         ],
                     ),
-                    (
+                    dir(
                         "写真",
-                        &[
-                            ("旅行_京都.mov", 30 * GB),
-                            ("旅行_札幌.mov", 22 * GB),
-                            ("家族.heic", 8 * GB),
-                            ("スクショ.png", GB),
+                        vec![
+                            dir(
+                                "旅行",
+                                vec![file("京都.mov", 30 * GB), file("札幌.mov", 22 * GB)],
+                            ),
+                            file("家族.heic", 8 * GB),
+                            file("スクショ.png", GB),
                         ],
                     ),
-                    (
+                    dir(
                         "ダウンロード",
-                        &[
-                            ("installer.dmg", 12 * GB),
-                            ("dataset.zip", 40 * GB),
-                            ("manual.pdf", 40 * MB),
+                        vec![
+                            file("installer.dmg", 12 * GB),
+                            file("dataset.zip", 40 * GB),
+                            file("manual.pdf", 40 * MB),
                         ],
                     ),
                 ],
             ),
-            (
+            dir(
                 "Windows PC",
-                &[
-                    (
+                vec![
+                    dir(
                         "ドキュメント",
-                        &[("レポート.docx", 5 * MB), ("家計簿.xlsx", 2 * MB)],
+                        vec![file("レポート.docx", 5 * MB), file("家計簿.xlsx", 2 * MB)],
                     ),
-                    (
+                    dir(
                         "ゲーム",
-                        &[
-                            ("game_a", 60 * GB),
-                            ("game_b", 35 * GB),
-                            ("セーブデータ", 200 * MB),
+                        vec![
+                            dir("game_a", vec![file("game_a.exe", 60 * GB)]),
+                            dir("game_b", vec![file("game_b.exe", 35 * GB)]),
+                            file("セーブデータ.zip", 200 * MB),
                         ],
                     ),
-                    (
+                    dir(
                         "動画",
-                        &[
-                            ("運動会.mp4", 8 * GB),
-                            ("発表会.mp4", 5 * GB),
-                            ("編集中.prproj", 300 * MB),
+                        vec![
+                            file("運動会.mp4", 8 * GB),
+                            file("発表会.mp4", 5 * GB),
+                            file("編集中.prproj", 300 * MB),
                         ],
                     ),
                 ],
             ),
-            (
+            dir(
                 "外付けSSD",
-                &[
-                    (
+                vec![
+                    dir(
                         "バックアップ",
-                        &[
-                            ("MacBook_2026-10.sparsebundle", 60 * GB),
-                            ("WindowsPC_2026-09.img", 45 * GB),
+                        vec![
+                            file("MacBook_2026-10.sparsebundle", 60 * GB),
+                            file("WindowsPC_2026-09.img", 45 * GB),
                         ],
                     ),
-                    (
+                    dir(
                         "写真アーカイブ",
-                        &[
-                            ("2023", 20 * GB),
-                            ("2024", 30 * GB),
-                            ("2025", 35 * GB),
-                            ("未整理", 15 * GB),
+                        vec![
+                            dir(
+                                "2024",
+                                vec![file("春.zip", 12 * GB), file("夏.zip", 18 * GB)],
+                            ),
+                            dir(
+                                "2025",
+                                vec![file("春.zip", 15 * GB), file("秋.zip", 20 * GB)],
+                            ),
+                            file("未整理.zip", 15 * GB),
                         ],
                     ),
                 ],
@@ -112,21 +131,37 @@ impl FileTree {
         ];
 
         let mut tree = FileTree { nodes: Vec::new() };
-        let root = tree.push("Root", 0, None, 0);
-        for (i, (device_name, folders)) in devices.iter().enumerate() {
-            let device = tree.push(device_name, 0, Some(root), i);
-            for (folder_name, files) in folders.iter() {
-                let folder = tree.push(folder_name, 0, Some(device), i);
-                for (file_name, size) in files.iter() {
-                    tree.push(file_name, *size, Some(folder), i);
-                }
-            }
+        let root = tree.push("Root", 0, None, 0, true);
+        for (i, device) in devices.into_iter().enumerate() {
+            tree.insert(device, root, i);
         }
         tree.sum_sizes(root);
+        tree.sort_children();
         tree
     }
 
-    fn push(&mut self, name: &str, size: u64, parent: Option<NodeId>, device: usize) -> NodeId {
+    fn insert(&mut self, entry: Entry, parent: NodeId, device: usize) {
+        match entry {
+            Entry::File(name, size) => {
+                self.push(name, size, Some(parent), device, false);
+            }
+            Entry::Dir(name, children) => {
+                let id = self.push(name, 0, Some(parent), device, true);
+                for child in children {
+                    self.insert(child, id, device);
+                }
+            }
+        }
+    }
+
+    fn push(
+        &mut self,
+        name: &str,
+        size: u64,
+        parent: Option<NodeId>,
+        device: usize,
+        is_dir: bool,
+    ) -> NodeId {
         let id = self.nodes.len();
         let depth = parent.map_or(0, |p| self.nodes[p].depth + 1);
         self.nodes.push(Node {
@@ -136,11 +171,24 @@ impl FileTree {
             parent,
             children: Vec::new(),
             device,
+            is_dir,
         });
         if let Some(p) = parent {
             self.nodes[p].children.push(id);
         }
         id
+    }
+
+    /// 子を「フォルダを名前順、そのあとファイルを名前順」に並べる。
+    fn sort_children(&mut self) {
+        for id in 0..self.nodes.len() {
+            let mut children = std::mem::take(&mut self.nodes[id].children);
+            children.sort_by(|a, b| {
+                let (a, b) = (&self.nodes[*a], &self.nodes[*b]);
+                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
+            });
+            self.nodes[id].children = children;
+        }
     }
 
     fn sum_sizes(&mut self, id: NodeId) -> u64 {
