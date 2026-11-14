@@ -599,7 +599,7 @@ fn animate_camera(
 
     // 倍率は対数で補間すると、ズームの速さが一定に見える。
     let scale = (anim.from_scale.ln() + (anim.to_scale.ln() - anim.from_scale.ln()) * e).exp();
-    let pos = anim.from_pos.lerp(anim.to_pos, e);
+    let pos = zoom_position(&anim, scale, e);
 
     let (mut transform, mut projection) = camera.into_inner();
     transform.translation = pos.extend(0.0);
@@ -625,6 +625,21 @@ fn animate_camera(
             Transform::from_xyz(0.0, level.shift, 0.5),
         ));
     }
+}
+
+/// ズーム中のカメラの位置。
+///
+/// 始めと終わりの見え方は、ある1点（ズームの中心）を中心に拡大縮小した関係になっている。
+/// その点を中心に倍率だけを変えれば、画面上のどの点も中心から（へ）まっすぐ動く。
+/// 速さの緩急は倍率の補間（イージング）でつける。
+fn zoom_position(anim: &Animating, scale: f32, e: f32) -> Vec2 {
+    let ratio = anim.to_scale / anim.from_scale;
+    // 倍率がほとんど変わらない（ただの移動）ときは、まっすぐ動かすだけ。
+    if (ratio - 1.0).abs() < 1e-3 {
+        return anim.from_pos.lerp(anim.to_pos, e);
+    }
+    let center = (anim.to_pos - anim.from_pos * ratio) / (1.0 - ratio);
+    center + (anim.from_pos - center) * (scale / anim.from_scale)
 }
 
 fn ease_in_out(t: f32) -> f32 {
