@@ -1,5 +1,7 @@
+mod cache;
 mod layout;
 mod preview;
+mod scene;
 mod shapes;
 mod tree;
 mod view;

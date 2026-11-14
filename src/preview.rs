@@ -3,7 +3,9 @@
 use bevy::math::Rect;
 use bevy::prelude::*;
 
-use crate::shapes::Painter;
+use bevy::sprite::Anchor;
+
+use crate::shapes::{Painter, over};
 
 pub enum PreviewKind {
     Image,
@@ -29,11 +31,11 @@ pub fn extension(name: &str) -> &str {
     name.rsplit_once('.').map_or("", |(_, ext)| ext)
 }
 
-/// 紙の形の背景（右上が折れている）と、種類ごとの仮の絵を描く。
-/// 「その他」の場合は拡張子を大きく書くため、文字を置く場所を返す。
-pub fn draw(painter: &mut Painter, frame: Rect, kind: &PreviewKind, z: f32) -> Option<Rect> {
-    let page = Color::srgba(0.85, 0.87, 0.95, 0.10);
-    let fold = Color::srgba(0.85, 0.87, 0.95, 0.22);
+/// 紙の形の背景（右上が折れている）と、種類ごとの仮の絵を描く。`background` は下の色。
+pub fn draw(painter: &mut Painter, name: &str, frame: Rect, background: Color, z: f32) {
+    let paper = Color::srgb(0.85, 0.87, 0.95);
+    let page = over(background, paper, 0.10);
+    let fold = over(background, paper, 0.22);
     let c = frame.height() * 0.15;
     painter.rect(
         Rect::new(frame.min.x, frame.min.y, frame.max.x - c, frame.max.y),
@@ -61,7 +63,7 @@ pub fn draw(painter: &mut Painter, frame: Rect, kind: &PreviewKind, z: f32) -> O
         max: frame.max - pad,
     };
     let z = z + 0.05;
-    match kind {
+    match PreviewKind::from_name(name) {
         PreviewKind::Image => {
             // 空、山ふたつ、太陽。
             painter.rect(inner, Color::srgb(0.35, 0.5, 0.65), z);
@@ -91,7 +93,6 @@ pub fn draw(painter: &mut Painter, frame: Rect, kind: &PreviewKind, z: f32) -> O
                 Color::srgb(0.95, 0.85, 0.5),
                 z + 0.01,
             );
-            None
         }
         PreviewKind::Text => {
             // 灰色の行を何本か。
@@ -102,11 +103,10 @@ pub fn draw(painter: &mut Painter, frame: Rect, kind: &PreviewKind, z: f32) -> O
                 let width = inner.width() * [1.0, 0.92, 0.97, 0.85, 0.95, 0.6][i];
                 painter.rect(
                     Rect::new(inner.min.x, top - line_h, inner.min.x + width, top),
-                    Color::srgba(0.8, 0.8, 0.85, 0.35),
+                    over(page, Color::srgb(0.8, 0.8, 0.85), 0.35),
                     z,
                 );
             }
-            None
         }
         PreviewKind::Video => {
             // 暗い画面に再生ボタン。
@@ -122,8 +122,24 @@ pub fn draw(painter: &mut Painter, frame: Rect, kind: &PreviewKind, z: f32) -> O
                 Color::srgba(1.0, 1.0, 1.0, 0.8),
                 z + 0.01,
             );
-            None
         }
-        PreviewKind::Other => Some(inner),
+        PreviewKind::Other => {
+            // 種類のわからないファイルは、拡張子を大きく書く。
+            let ext = extension(name).to_uppercase();
+            let ext = if ext.is_empty() {
+                "FILE".to_string()
+            } else {
+                ext
+            };
+            painter.text(
+                ext,
+                inner.center(),
+                Anchor::CENTER,
+                inner.height() * 0.4,
+                inner.width(),
+                over(page, paper, 0.5),
+                z,
+            );
+        }
     }
 }

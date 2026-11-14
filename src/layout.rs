@@ -5,6 +5,7 @@
 //! 枠はウィンドウと同じ縦横比なので、枠にズームするとウィンドウいっぱいに広がる。
 
 use bevy::math::{Rect, Vec2};
+use bevy::prelude::Resource;
 
 use crate::tree::{FileTree, NodeId};
 
@@ -18,6 +19,10 @@ pub struct NodeLayout {
     /// 名前の右の枠。フォルダなら中身、ファイルならプレビューを描く。Root は全体。
     pub frame: Rect,
 }
+
+/// 全ノードの配置。
+#[derive(Resource)]
+pub struct Layouts(pub Vec<NodeLayout>);
 
 /// フォルダの枠のうち、上に出っ張る見出し（タブ）の高さの割合。
 const TAB_RATIO: f32 = 0.1;
