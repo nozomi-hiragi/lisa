@@ -35,12 +35,19 @@ cd lisa
 cargo run              # ビルドして起動
 cargo build            # ビルドのみ
 cargo build --release  # リリースビルド（target/release/lisa）
-cargo test             # テスト
+cargo test --workspace # テスト（スキャンの crate も）
+
+# スキャンだけを試す（Bevy をビルドしないので速い）
+cargo run -p lisa-scan -- ls ~/Documents     # 1 段だけ読んで一覧を出す
+cargo run -p lisa-scan -- tree ~ 3           # 3 段下までたどって数と速さを出す
 ```
 
 - 初回のビルドは、依存している Bevy のコンパイルに十数分かかります。2 回目以降は数秒です。
 - フォント（`assets/fonts/NotoSansJP-Light.otf`）はリポジトリからの相対パスで読みます。
   `target/debug/lisa` を直接起動すると文字が出ないので、`cargo run` で起動してください。
+- `lisa-scan` はファイルの中身を読みません（名前、大きさ、日時だけ）。Mac では、クラウドにだけある
+  ファイルを読んでもダウンロードしない設定にしてから動きます。`~/Documents` などを初めて読むときは、
+  起動した Terminal にアクセスの許可を聞かれます。
 
 ## 操作
 
