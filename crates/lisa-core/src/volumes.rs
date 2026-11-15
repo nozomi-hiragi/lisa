@@ -84,14 +84,19 @@ mod imp {
             .filter_map(|url| read(&url, &keys, &key_array))
             .collect();
         // 起動ディスクの Data のボリューム（ユーザーのファイルがあるところ）は、一覧に出てこない。
-        // 「/」は読み取り専用のシステム側なので、Data を足して、こちらを読むものにする。
+        // 代わりに出てくる「/」は読み取り専用のシステム側で、しかも ID としてボリュームグループの
+        // UUID（= Data の UUID）を返すので、Data とぶつかる。「/」を Data に置き換える。
+        // 名前は Finder と同じ起動ディスクの名前（「Macintosh HD」など）になる。
         let data = Path::new(DATA_VOLUME);
         if data.is_dir() && !volumes.iter().any(|v| v.mount_path == data) {
             let url = NSURL::fileURLWithPath(&NSString::from_str(DATA_VOLUME));
             if let Some(mut volume) = read(&url, &keys, &key_array) {
                 volume.mount_path = data.to_path_buf();
                 volume.hidden = false;
-                volumes.insert(1.min(volumes.len()), volume);
+                match volumes.iter().position(|v| v.mount_path == Path::new("/")) {
+                    Some(root) => volumes[root] = volume,
+                    None => volumes.insert(0, volume),
+                }
             }
         }
         Ok(volumes)
