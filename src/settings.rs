@@ -8,8 +8,8 @@ use bevy::prelude::*;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::menu::{PopupBody, spawn_menu};
-use crate::scene::LabelFont;
+use crate::render::scene::LabelFont;
+use crate::ui::menu::{PopupBody, spawn_menu};
 
 const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
 const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
@@ -17,49 +17,22 @@ const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
 #[derive(Resource, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
-    /// リストの行の高さ。そのフォルダが画面いっぱいのときのピクセル数。
-    pub row_height_px: f32,
-    /// ズームして、子の枠が画面の幅のこの割合（%）以上になったら子へ移る。
-    pub snap_in_percent: f32,
-    /// ズームアウトして、今の枠が画面の幅のこの割合（%）より小さくなったら親へ戻る。
-    pub snap_out_percent: f32,
-    /// 勢いで移る感度（0 で切る、1〜10 で大きいほど敏感）。
-    pub flick_level: u8,
-    /// 上下に動かして、隣のフォルダが画面の高さのこの割合（%）以上見えたら、そのフォルダへ移る。
-    pub sibling_percent: f32,
-    /// 慣性の強さ（0 で使わない、10 で macOS のまま、間は数字が大きいほど長く続く）。
-    pub inertia_level: u8,
+    /// 開いたフォルダの耳の高さ（画面上のピクセル数）。
+    pub ear_selected_px: f32,
+    /// 一覧の中のフォルダの耳の高さ（その一覧のフォルダを開いたときの、画面上のピクセル数）。
+    pub ear_preview_px: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            row_height_px: 40.0,
-            snap_in_percent: 35.0,
-            snap_out_percent: 85.0,
-            flick_level: 3,
-            sibling_percent: 30.0,
-            inertia_level: 3,
+            ear_selected_px: 28.0,
+            ear_preview_px: 16.0,
         }
     }
 }
 
 impl Settings {
-    /// 勢いで移る速さのしきい値（倍率の対数で毎秒）。切っていれば None。
-    pub fn flick_rate(&self) -> Option<f32> {
-        (self.flick_level > 0).then(|| 9.0 / self.flick_level as f32)
-    }
-
-    /// 慣性を弱める速さ（指を離してからの時間の時定数、秒）。0 なら None（慣性を使わない）、
-    /// 10 なら無限大（弱めない）。
-    pub fn momentum_decay(&self) -> Option<f32> {
-        match self.inertia_level {
-            0 => None,
-            10.. => Some(f32::INFINITY),
-            level => Some(0.04 * level as f32),
-        }
-    }
-
     /// 範囲の外の値を直す（手で書き換えた settings.json などのため）。
     fn sanitized(mut self) -> Self {
         for item in Item::ALL {
@@ -73,55 +46,32 @@ impl Settings {
 /// ポップアップに並べる項目。どれも −/+ で変える。
 #[derive(Component, Clone, Copy, PartialEq)]
 enum Item {
-    RowHeight,
-    SnapIn,
-    SnapOut,
-    Flick,
-    Sibling,
-    Inertia,
+    EarSelected,
+    EarPreview,
 }
 
 impl Item {
-    const ALL: [Item; 6] = [
-        Item::RowHeight,
-        Item::SnapIn,
-        Item::SnapOut,
-        Item::Sibling,
-        Item::Flick,
-        Item::Inertia,
-    ];
+    const ALL: [Item; 2] = [Item::EarSelected, Item::EarPreview];
 
     fn label(self) -> &'static str {
         match self {
-            Item::RowHeight => "リストの行の高さ",
-            Item::SnapIn => "子フォルダへ移るしきい値",
-            Item::SnapOut => "親へ戻るしきい値",
-            Item::Flick => "勢いで移る感度",
-            Item::Sibling => "隣のフォルダへ移るしきい値",
-            Item::Inertia => "慣性の強さ",
+            Item::EarSelected => "耳の高さ（開いたとき）",
+            Item::EarPreview => "耳の高さ（一覧の中）",
         }
     }
 
     /// 最小、最大、刻み。
     fn range(self) -> (f32, f32, f32) {
         match self {
-            Item::RowHeight => (24.0, 96.0, 4.0),
-            Item::SnapIn => (10.0, 90.0, 5.0),
-            Item::SnapOut => (50.0, 98.0, 1.0),
-            Item::Flick => (0.0, 10.0, 1.0),
-            Item::Sibling => (10.0, 80.0, 5.0),
-            Item::Inertia => (0.0, 10.0, 1.0),
+            Item::EarSelected => (12.0, 64.0, 2.0),
+            Item::EarPreview => (6.0, 48.0, 2.0),
         }
     }
 
     fn get(self, settings: &Settings) -> f32 {
         match self {
-            Item::RowHeight => settings.row_height_px,
-            Item::SnapIn => settings.snap_in_percent,
-            Item::SnapOut => settings.snap_out_percent,
-            Item::Flick => settings.flick_level as f32,
-            Item::Sibling => settings.sibling_percent,
-            Item::Inertia => settings.inertia_level as f32,
+            Item::EarSelected => settings.ear_selected_px,
+            Item::EarPreview => settings.ear_preview_px,
         }
     }
 
@@ -129,26 +79,15 @@ impl Item {
         let (min, max, _) = self.range();
         let value = value.clamp(min, max);
         match self {
-            Item::RowHeight => settings.row_height_px = value,
-            Item::SnapIn => settings.snap_in_percent = value,
-            Item::SnapOut => settings.snap_out_percent = value,
-            Item::Flick => settings.flick_level = value.round() as u8,
-            Item::Sibling => settings.sibling_percent = value,
-            Item::Inertia => settings.inertia_level = value.round() as u8,
+            Item::EarSelected => settings.ear_selected_px = value,
+            Item::EarPreview => settings.ear_preview_px = value,
         }
     }
 
     fn show(self, settings: &Settings) -> String {
         match self {
-            Item::RowHeight => format!("{} px", settings.row_height_px),
-            Item::SnapIn => format!("{} %", settings.snap_in_percent),
-            Item::SnapOut => format!("{} %", settings.snap_out_percent),
-            Item::Flick if settings.flick_level == 0 => "切".to_string(),
-            Item::Flick => format!("{}", settings.flick_level),
-            Item::Sibling => format!("{} %", settings.sibling_percent),
-            Item::Inertia if settings.inertia_level == 0 => "切".to_string(),
-            Item::Inertia if settings.inertia_level >= 10 => "macOS".to_string(),
-            Item::Inertia => format!("{}", settings.inertia_level),
+            Item::EarSelected => format!("{} px", settings.ear_selected_px),
+            Item::EarPreview => format!("{} px", settings.ear_preview_px),
         }
     }
 
@@ -299,31 +238,25 @@ mod tests {
 
     #[test]
     fn old_settings_file_still_loads() {
-        // 行の高さしか無かった頃の settings.json。足りない項目は既定値になる。
-        let settings: Settings = serde_json::from_str(r#"{ "row_height_px": 48.0 }"#).unwrap();
-        assert_eq!(settings.row_height_px, 48.0);
+        // 今は使わない項目（行の高さ、しきい値など）が入った古い settings.json。
+        // 足りない項目は既定値になる。
+        let settings: Settings = serde_json::from_str(
+            r#"{ "row_height_px": 48.0, "snap_in_percent": 40.0, "ear_preview_px": 20.0 }"#,
+        )
+        .unwrap();
+        assert_eq!(settings.ear_preview_px, 20.0);
         assert_eq!(
-            settings.snap_in_percent,
-            Settings::default().snap_in_percent
+            settings.ear_selected_px,
+            Settings::default().ear_selected_px
         );
-        assert_eq!(
-            settings.snap_out_percent,
-            Settings::default().snap_out_percent
-        );
-        assert_eq!(settings.flick_level, Settings::default().flick_level);
-        assert_eq!(
-            settings.sibling_percent,
-            Settings::default().sibling_percent
-        );
-        assert_eq!(settings.inertia_level, Settings::default().inertia_level);
     }
 
     #[test]
     fn out_of_range_values_are_clamped() {
         let settings: Settings =
-            serde_json::from_str(r#"{ "row_height_px": 500.0, "snap_in_percent": 1.0 }"#).unwrap();
+            serde_json::from_str(r#"{ "ear_selected_px": 500.0, "ear_preview_px": 1.0 }"#).unwrap();
         let settings = settings.sanitized();
-        assert_eq!(settings.row_height_px, 96.0);
-        assert_eq!(settings.snap_in_percent, 10.0);
+        assert_eq!(settings.ear_selected_px, 64.0);
+        assert_eq!(settings.ear_preview_px, 6.0);
     }
 }

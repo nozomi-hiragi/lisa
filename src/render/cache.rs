@@ -14,10 +14,11 @@ use bevy::sprite_render::ColorMaterial;
 use bevy::window::RequestRedraw;
 
 use crate::layout::Layouts;
-use crate::scene::{self, LabelFont, Rows, SceneSource};
-use crate::tree::{FileTree, NodeId};
+use crate::model::tree::{FileTree, NodeId};
+use crate::render::ear::EarSizes;
+use crate::render::scene::{self, LabelFont, SceneSource};
 
-/// 画像の幅（ピクセル）。高さはウィンドウの縦横比に合わせる。
+/// 画像の幅（ピクセル）。高さは本体の縦横比（√2:1）に合わせる。
 const IMAGE_WIDTH: u32 = 1024;
 /// 焼くカメラを何フレーム残すか（描き終わるまでの余裕）。
 const BAKE_FRAMES: u32 = 3;
@@ -91,6 +92,7 @@ pub fn bake(
     font: Res<LabelFont>,
     tree: Res<FileTree>,
     layouts: Res<Layouts>,
+    ears: Res<EarSizes>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut redraw: MessageWriter<RequestRedraw>,
@@ -108,6 +110,7 @@ pub fn bake(
                 layouts: &layouts.0,
                 images: &images,
                 font: &font.0,
+                ears: &ears,
             };
             let mut entities = Vec::new();
             for (i, (&id, image)) in images.images.iter().enumerate() {
@@ -122,9 +125,9 @@ pub fn bake(
                     id,
                     layer.clone(),
                     scale,
-                    0.0,
-                    Rows::Summary,
+                    false,
                     &[],
+                    None,
                 ));
                 entities.push(
                     commands

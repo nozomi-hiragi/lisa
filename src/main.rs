@@ -1,15 +1,11 @@
-mod cache;
 #[cfg(debug_assertions)]
 mod debug;
-mod gesture;
+mod input;
 mod layout;
-mod menu;
-mod preview;
-mod scene;
-mod scroll_input;
+mod model;
+mod render;
 mod settings;
-mod shapes;
-mod tree;
+mod ui;
 mod view;
 
 use bevy::log::{DEFAULT_FILTER, LogPlugin};
@@ -38,7 +34,7 @@ fn main() {
     .add_plugins((
         settings::SettingsPlugin,
         view::TreeViewPlugin,
-        menu::MenuPlugin,
+        ui::menu::MenuPlugin,
     ));
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);

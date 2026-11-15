@@ -115,7 +115,7 @@ impl FileTree {
                     dir(
                         "写真アーカイブ",
                         vec![
-                            // ファイルが多いフォルダ（スクロールの確認用）。
+                            // ファイルが多いフォルダ（タイルが小さくなるときの確認用）。
                             dir(
                                 "スキャン",
                                 (1..=500)
@@ -186,14 +186,11 @@ impl FileTree {
         id
     }
 
-    /// 子を「フォルダを名前順、そのあとファイルを名前順」に並べる。
+    /// 子を、フォルダとファイルをまとめて名前順に並べる。
     fn sort_children(&mut self) {
         for id in 0..self.nodes.len() {
             let mut children = std::mem::take(&mut self.nodes[id].children);
-            children.sort_by(|a, b| {
-                let (a, b) = (&self.nodes[*a], &self.nodes[*b]);
-                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name))
-            });
+            children.sort_by(|a, b| self.nodes[*a].name.cmp(&self.nodes[*b].name));
             self.nodes[id].children = children;
         }
     }
@@ -216,20 +213,5 @@ impl FileTree {
         }
         names.reverse();
         names.join(" / ")
-    }
-}
-
-pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }

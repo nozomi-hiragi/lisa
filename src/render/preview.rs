@@ -5,7 +5,7 @@ use bevy::prelude::*;
 
 use bevy::sprite::Anchor;
 
-use crate::shapes::{Painter, over};
+use crate::render::shapes::{Painter, over};
 
 pub enum PreviewKind {
     Image,
