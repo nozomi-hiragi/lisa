@@ -17,6 +17,10 @@ use crate::tree::{FileTree, NodeId, format_size};
 pub const BACKGROUND: Color = Color::srgb(0.08, 0.08, 0.1);
 
 /// 場面の根。これを消すと場面の中身もまとめて消える。
+///
+/// 注意: 重なった場面どうしは、z の大小ではなく作った順に描かれる（後に作ったほうが上）。
+/// Bevy 0.20 のスプライトのまとめ描きで、z の並べ替えが効かない場合があるため。
+/// 上に見せたい場面は、必ず後から作る。
 #[derive(Component)]
 pub struct SceneRoot;
 
@@ -35,14 +39,12 @@ pub enum Rows {
     /// 列ごとに、指定した行から入る分だけ並べる（スクロール中の本物の場面用）。
     Scroll([usize; 2]),
     /// Scroll と同じ位置に並べるが、`column` の列は `from..to` の行も描く
-    /// （見えている範囲の外にある隣のフォルダを見せるため）。`skip` は描かない
-    /// （上に本物が重なっているフォルダ。画像と本物が重なると透けて二重に見える）。
+    /// （見えている範囲の外にある隣のフォルダを見せるため）。
     Around {
         scroll: [usize; 2],
         column: usize,
         from: usize,
         to: usize,
-        skip: Option<NodeId>,
     },
 }
 
@@ -133,7 +135,6 @@ pub fn spawn(
                 column: around,
                 from,
                 to,
-                ..
             } => {
                 let first = scroll[column].min(count.saturating_sub(fit));
                 let hi = count.min(first + fit);
@@ -154,11 +155,7 @@ pub fn spawn(
             ))
             .id();
 
-        let skip = match rows {
-            Rows::Around { skip, .. } => skip,
-            _ => None,
-        };
-        for &child in items[lo..hi].iter().filter(|c| Some(**c) != skip) {
+        for &child in &items[lo..hi] {
             let l = &source.layouts[child];
             let child_node = &tree.nodes[child];
             let z = child_node.depth as f32;

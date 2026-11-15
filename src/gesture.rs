@@ -268,8 +268,11 @@ pub fn gesture(
             parent.scroll,
             top.node,
             top.node,
-            Some(top.node),
         ));
+        // 今の場面を下敷きより後に作り直して、上に描かれるようにする（作った順に重なるため）。
+        let (_, own_scale) = fit(top.frame(&maker.layouts), &window);
+        maker.commands.entity(current.0).despawn();
+        current.0 = maker.spawn(&nav.stack, own_scale);
         maker
             .commands
             .entity(current.0)
@@ -352,7 +355,6 @@ fn spawn_parent_preview(
     parent_scroll: [usize; 2],
     a: NodeId,
     b: NodeId,
-    skip: Option<NodeId>,
 ) -> Entity {
     let mut path = nav.stack[..nav.stack.len() - 1].to_vec();
     let parent = path.last_mut().expect("親がある");
@@ -365,7 +367,6 @@ fn spawn_parent_preview(
         column: DIRS,
         from: ia.min(ib).saturating_sub(1),
         to: ia.max(ib) + 2,
-        skip,
     };
     let (_, scale) = fit(parent.frame(&maker.layouts), window);
     maker.spawn_rows(&path, scale, rows)
@@ -677,7 +678,7 @@ fn move_to_sibling(
         maker.commands.entity(preview).despawn();
     }
     maker.commands.entity(current.0).despawn();
-    current.0 = spawn_parent_preview(nav, maker, window, scroll, top.node, target, None);
+    current.0 = spawn_parent_preview(nav, maker, window, scroll, top.node, target);
 
     nav.stack[parent_index].scroll = scroll;
     let shift = nav.stack[parent_index].column_shift(&maker.layouts, DIRS);

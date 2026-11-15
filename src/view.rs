@@ -491,8 +491,13 @@ fn navigate(
         // 開いていたのがファイルなら、今の場面がもう親の場面なので何もしない。
         if maker.tree.nodes[top.node].is_dir {
             let (_, scale) = fit(nav.top().frame(&maker.layouts), &window);
-            let old = current.0;
+            let (_, own_scale) = fit(top.frame(&maker.layouts), &window);
+            let mut leaving = nav.stack.clone();
+            leaving.push(top);
+            maker.commands.entity(current.0).despawn();
             current.0 = maker.spawn(&nav.stack, scale);
+            // 重なった場面は作った順に描かれるので、去る場面は親の後に作り直して上に重ねる。
+            let old = maker.spawn(&leaving, own_scale);
             maker.commands.entity(old).insert((
                 Fade {
                     started: Instant::now(),
