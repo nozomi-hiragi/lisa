@@ -6,3 +6,4 @@
 pub mod cloud;
 pub mod listing;
 pub mod name;
+pub mod volumes;

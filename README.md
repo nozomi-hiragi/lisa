@@ -40,6 +40,7 @@ cargo test --workspace # テスト（スキャンの crate も）
 # スキャンだけを試す（Bevy をビルドしないので速い）
 cargo run -p lisa-scan -- ls ~/Documents     # 1 段だけ読んで一覧を出す
 cargo run -p lisa-scan -- tree ~ 3           # 3 段下までたどって数と速さを出す
+cargo run -p lisa-scan -- drives             # つながっているドライブの一覧と ID
 ```
 
 - 初回のビルドは、依存している Bevy のコンパイルに十数分かかります。2 回目以降は数秒です。

@@ -36,6 +36,7 @@ crates/lisa-core/          スキャンの中身（Bevy に依存しない）
   src/listing.rs           フォルダを 1 段読む（種類、大きさ、日時、リンク先、クラウドのみ、別のボリューム）
   src/name.rs              名前（ディスク上のバイト列、NFC、フォルダのハッシュと同じ並び、OS のゴミ）
   src/cloud.rs             Mac: クラウドにだけあるファイルを読んでもダウンロードしない設定
+  src/volumes.rs           つながっているドライブの一覧（ID、名前、ファイルシステム、容量、外付けか）
 crates/lisa-scan/          lisa-core を Bevy なしで試す CLI
 docs/                      このドキュメント
 assets/fonts/              Noto Sans JP と、そのライセンス

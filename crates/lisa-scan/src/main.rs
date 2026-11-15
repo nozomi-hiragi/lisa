@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run -p lisa-scan -- ls <フォルダ>            1 段だけ読んで一覧を出す
 //! cargo run -p lisa-scan -- tree <フォルダ> [深さ]   下までたどって数と速さを出す
+//! cargo run -p lisa-scan -- drives                    つながっているドライブの一覧
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -13,7 +14,8 @@ use lisa_core::listing::{self, Entry, Kind};
 
 const USAGE: &str = "使い方:
   lisa-scan ls <フォルダ>            1 段だけ読んで一覧を出す
-  lisa-scan tree <フォルダ> [深さ]   下までたどって数と速さを出す（別のボリュームには入らない）";
+  lisa-scan tree <フォルダ> [深さ]   下までたどって数と速さを出す（別のボリュームには入らない）
+  lisa-scan drives                    つながっているドライブの一覧";
 
 fn main() -> ExitCode {
     if let Err(error) = lisa_core::cloud::prevent_downloads() {
@@ -23,6 +25,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["ls", path] => ls(Path::new(path)),
+        ["drives"] => drives(),
         ["tree", path] => tree(Path::new(path), usize::MAX),
         ["tree", path, depth] => match depth.parse() {
             Ok(depth) => tree(Path::new(path), depth),
@@ -100,7 +103,9 @@ struct Counts {
     symlinks: u64,
     other: u64,
     bytes: u64,
-    cloud_only: u64,
+    cloud_files: u64,
+    cloud_bytes: u64,
+    cloud_dirs: u64,
     hard_linked: u64,
     junk: u64,
     other_volumes: u64,
@@ -132,19 +137,23 @@ fn tree(root: &Path, max_depth: usize) -> Result<(), String> {
         counts.junk += listing.junk as u64;
         counts.failed_entries += listing.failed.len() as u64;
         for entry in listing.entries {
-            if entry.cloud_only {
-                counts.cloud_only += 1;
-            }
             match entry.kind {
                 Kind::File => {
                     counts.files += 1;
                     counts.bytes += entry.size;
+                    if entry.cloud_only {
+                        counts.cloud_files += 1;
+                        counts.cloud_bytes += entry.size;
+                    }
                     if entry.nlink.is_some_and(|n| n > 1) {
                         counts.hard_linked += 1;
                     }
                 }
                 Kind::Dir => {
                     counts.dirs += 1;
+                    if entry.cloud_only {
+                        counts.cloud_dirs += 1;
+                    }
                     if entry.other_volume {
                         counts.other_volumes += 1;
                     } else if !entry.cloud_only && depth + 1 < max_depth {
@@ -167,14 +176,20 @@ fn tree(root: &Path, max_depth: usize) -> Result<(), String> {
     let seconds = start.elapsed().as_secs_f64();
     let total = counts.files + counts.dirs + counts.symlinks + counts.other;
     println!(
-        "ファイル        {}（{}）",
+        "ファイル        {}（{}。うち手元にある分 {}）",
         counts.files,
-        human(counts.bytes)
+        human(counts.bytes),
+        human(counts.bytes - counts.cloud_bytes)
     );
     println!("フォルダ        {}", counts.dirs);
     println!("リンク          {}", counts.symlinks);
     println!("そのほか        {}", counts.other);
-    println!("クラウドのみ    {}", counts.cloud_only);
+    println!(
+        "クラウドのみ    ファイル {}（{}）、フォルダ {}（中は数えていない）",
+        counts.cloud_files,
+        human(counts.cloud_bytes),
+        counts.cloud_dirs
+    );
     println!(
         "ハードリンク    {}（リンクが 2 つ以上あるファイル）",
         counts.hard_linked
@@ -187,6 +202,46 @@ fn tree(root: &Path, max_depth: usize) -> Result<(), String> {
         "{total} 件を {seconds:.1} 秒（1 秒に {:.0} 件）",
         total as f64 / seconds.max(1e-9)
     );
+    Ok(())
+}
+
+fn drives() -> Result<(), String> {
+    let volumes = lisa_core::volumes::list().map_err(|e| e.to_string())?;
+    for v in &volumes {
+        let mut marks = Vec::new();
+        if v.removable {
+            marks.push("外付け");
+        }
+        if v.network {
+            marks.push("ネットワーク");
+        }
+        if v.read_only {
+            marks.push("読み取り専用");
+        }
+        match v.case_sensitive {
+            Some(true) => marks.push("大文字小文字を区別"),
+            Some(false) => {}
+            None => marks.push("大文字小文字は不明"),
+        }
+        if v.hidden {
+            marks.push("既定では読まない");
+        }
+        let size = match (v.capacity, v.available) {
+            (Some(total), Some(free)) => format!("{} / 空き {}", human(total), human(free)),
+            (Some(total), None) => human(total),
+            _ => String::new(),
+        };
+        println!(
+            "{}  [{}]  {}  {}\n    ID {}  {}",
+            v.mount_path.display(),
+            v.label,
+            v.fs,
+            size,
+            v.id.as_deref().unwrap_or("（無し）"),
+            marks.join("、")
+        );
+    }
+    println!("--\n{} 個", volumes.len());
     Ok(())
 }
 
