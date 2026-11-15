@@ -67,8 +67,9 @@ pub struct Entry {
     pub link_target: Option<PathBuf>,
     /// クラウドにだけあって、手元に中身が無い。読むとダウンロードが始まるので、ハッシュしない。
     pub cloud_only: bool,
-    /// 読んでいるフォルダと別のボリューム（マウントした場所）。Mac の firmlink の二重数えを避けるため、
-    /// ふつうは下りない。
+    /// 読んでいるフォルダと別のボリューム（マウントした場所）。ふつうは下りない。
+    /// Mac の起動ディスクの一番上にある firmlink（`/Users` など、中身は Data のボリューム）もここに入る。
+    /// `st_dev` では見分けられないので、`/usr/share/firmlinks` の一覧で見る。
     pub other_volume: bool,
 }
 
@@ -86,6 +87,7 @@ pub struct Listing {
 /// `dir` の中を 1 段読む。`dir` 自体が読めなければエラー。
 pub fn read_dir(dir: &Path) -> io::Result<Listing> {
     let dir_meta = fs::metadata(dir)?;
+    let firmlinks = firmlinks_in(dir);
     let mut listing = Listing::default();
     for item in fs::read_dir(dir)? {
         let item = match item {
@@ -111,6 +113,8 @@ pub fn read_dir(dir: &Path) -> io::Result<Listing> {
             }
         };
         let kind = kind_of(&meta);
+        let other_volume =
+            kind == Kind::Dir && (other_volume(&dir_meta, &meta) || firmlinks.contains(&file_name));
         let link_target = if kind == Kind::Symlink {
             fs::read_link(item.path()).ok()
         } else {
@@ -127,11 +131,34 @@ pub fn read_dir(dir: &Path) -> io::Result<Listing> {
             nlink: nlink(&meta),
             link_target,
             cloud_only: cloud_only(&meta),
-            other_volume: kind == Kind::Dir && other_volume(&dir_meta, &meta),
+            other_volume,
         });
     }
     listing.entries.sort_by(compare);
     Ok(listing)
+}
+
+/// Mac の firmlink の一覧（`/usr/share/firmlinks`）。各行は「/Users<TAB>Users」のように、起動ディスクの
+/// 一番上の名前と、Data のボリュームの中の場所。
+const FIRMLINKS: &str = "/usr/share/firmlinks";
+
+/// `dir` の中にある firmlink の名前。Mac の起動ディスクの一番上（`/`）だけにある。
+fn firmlinks_in(dir: &Path) -> Vec<OsString> {
+    if !cfg!(target_os = "macos") || dir != Path::new("/") {
+        return Vec::new();
+    }
+    fs::read_to_string(FIRMLINKS)
+        .map(|text| parse_firmlinks(&text))
+        .unwrap_or_default()
+}
+
+fn parse_firmlinks(text: &str) -> Vec<OsString> {
+    text.lines()
+        .filter_map(|line| line.split('\t').next())
+        .filter_map(|path| path.strip_prefix('/'))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+        .map(OsString::from)
+        .collect()
 }
 
 fn compare(a: &Entry, b: &Entry) -> Ordering {
@@ -305,6 +332,15 @@ mod tests {
         let (one, two) = (&listing.entries[0], &listing.entries[1]);
         assert_eq!(one.file_id, two.file_id);
         assert_eq!(one.nlink, Some(2));
+    }
+
+    #[test]
+    fn firmlinks_are_top_level_names() {
+        let text = "/AppleInternal\tAppleInternal\n/Applications\tApplications\n\
+                    /Library\tLibrary\n/System/Library/Caches\tSystem/Library/Caches\n\
+                    /Users\tUsers\n";
+        let names = parse_firmlinks(text);
+        assert_eq!(names, ["AppleInternal", "Applications", "Library", "Users"]);
     }
 
     #[test]

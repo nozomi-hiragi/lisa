@@ -38,7 +38,7 @@ pub fn hash_order(a_nfc: &str, a_raw: &[u8], b_nfc: &str, b_raw: &[u8]) -> Order
 pub fn is_os_junk(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
-        Some(".DS_Store" | "Thumbs.db" | "desktop.ini" | "Desktop.ini")
+        Some(".DS_Store" | ".localized" | "Thumbs.db" | "desktop.ini" | "Desktop.ini")
     )
 }
 
@@ -77,6 +77,7 @@ mod tests {
     #[test]
     fn junk() {
         assert!(is_os_junk(OsStr::new(".DS_Store")));
+        assert!(is_os_junk(OsStr::new(".localized")));
         assert!(!is_os_junk(OsStr::new("DS_Store")));
     }
 }
