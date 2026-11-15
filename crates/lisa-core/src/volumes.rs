@@ -46,9 +46,10 @@ mod imp {
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2_foundation::{
-        NSArray, NSDictionary, NSFileManager, NSNumber, NSString, NSURLResourceKey,
+        NSArray, NSDictionary, NSFileManager, NSNumber, NSString, NSURL, NSURLResourceKey,
         NSVolumeEnumerationOptions,
     };
+    use std::path::Path;
 
     pub fn list() -> io::Result<Vec<Volume>> {
         // SAFETY: Foundation が持っている定数の文字列を読むだけ。
@@ -78,48 +79,65 @@ mod imp {
                 NSVolumeEnumerationOptions::empty(),
             )
             .ok_or_else(|| io::Error::other("ボリュームの一覧が取れませんでした"))?;
-        let mut volumes = Vec::new();
-        for url in urls.iter() {
-            let Some(path) = url.path() else { continue };
-            let values = match url.resourceValuesForKeys_error(&key_array) {
-                Ok(values) => values,
-                Err(_) => continue,
-            };
-            let [
-                uuid,
-                name,
-                type_name,
-                total,
-                available,
-                removable,
-                ejectable,
-                internal,
-                local,
-                read_only,
-                case_sensitive,
-                browsable,
-                root,
-            ] = keys;
-            let is_root = flag(&values, root).unwrap_or(false);
-            let removable = flag(&values, removable).unwrap_or(false)
-                || flag(&values, ejectable).unwrap_or(false)
-                || flag(&values, internal) == Some(false);
-            volumes.push(Volume {
-                id: string(&values, uuid).map(|u| format!("mac:{u}")),
-                label: string(&values, name).unwrap_or_default(),
-                fs: string(&values, type_name).unwrap_or_default(),
-                mount_path: PathBuf::from(path.to_string()),
-                capacity: number(&values, total),
-                available: number(&values, available),
-                removable: removable && local_or(&values, local),
-                network: !local_or(&values, local),
-                read_only: flag(&values, read_only).unwrap_or(false),
-                case_sensitive: flag(&values, case_sensitive),
-                // 起動ディスクの「/」は読み取り専用のシステムのボリューム。中身は Data のほうを読む。
-                hidden: is_root || flag(&values, browsable) == Some(false),
-            });
+        let mut volumes: Vec<Volume> = urls
+            .iter()
+            .filter_map(|url| read(&url, &keys, &key_array))
+            .collect();
+        // 起動ディスクの Data のボリューム（ユーザーのファイルがあるところ）は、一覧に出てこない。
+        // 「/」は読み取り専用のシステム側なので、Data を足して、こちらを読むものにする。
+        let data = Path::new(DATA_VOLUME);
+        if data.is_dir() && !volumes.iter().any(|v| v.mount_path == data) {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(DATA_VOLUME));
+            if let Some(mut volume) = read(&url, &keys, &key_array) {
+                volume.mount_path = data.to_path_buf();
+                volume.hidden = false;
+                volumes.insert(1.min(volumes.len()), volume);
+            }
         }
         Ok(volumes)
+    }
+
+    /// 起動ディスクの Data のボリュームのマウント位置。
+    const DATA_VOLUME: &str = "/System/Volumes/Data";
+
+    type Keys = [&'static NSURLResourceKey; 13];
+
+    fn read(url: &NSURL, keys: &Keys, key_array: &NSArray<NSURLResourceKey>) -> Option<Volume> {
+        let path = url.path()?;
+        let values = url.resourceValuesForKeys_error(key_array).ok()?;
+        let [
+            uuid,
+            name,
+            type_name,
+            total,
+            available,
+            removable,
+            ejectable,
+            internal,
+            local,
+            read_only,
+            case_sensitive,
+            browsable,
+            root,
+        ] = *keys;
+        let is_root = flag(&values, root).unwrap_or(false);
+        let removable = flag(&values, removable).unwrap_or(false)
+            || flag(&values, ejectable).unwrap_or(false)
+            || flag(&values, internal) == Some(false);
+        Some(Volume {
+            id: string(&values, uuid).map(|u| format!("mac:{u}")),
+            label: string(&values, name).unwrap_or_default(),
+            fs: string(&values, type_name).unwrap_or_default(),
+            mount_path: PathBuf::from(path.to_string()),
+            capacity: number(&values, total),
+            available: number(&values, available),
+            removable: removable && local_or(&values, local),
+            network: !local_or(&values, local),
+            read_only: flag(&values, read_only).unwrap_or(false),
+            case_sensitive: flag(&values, case_sensitive),
+            // 起動ディスクの「/」は読み取り専用のシステムのボリューム。中身は Data のほうを読む。
+            hidden: is_root || flag(&values, browsable) == Some(false),
+        })
     }
 
     fn value(
