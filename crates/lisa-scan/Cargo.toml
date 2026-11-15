@@ -1,0 +1,8 @@
+[package]
+name = "lisa-scan"
+version = "0.1.0"
+edition = "2024"
+description = "lisa-core を Bevy なしで試す CLI"
+
+[dependencies]
+lisa-core = { path = "../lisa-core" }

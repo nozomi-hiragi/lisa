@@ -3,6 +3,11 @@ name = "lisa"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+# スキャンの中身（Bevy に依存しない）と、それを試す CLI。`cargo run` は今までどおりアプリを動かす。
+members = ["crates/lisa-core", "crates/lisa-scan"]
+default-members = ["."]
+
 [dependencies]
 bevy = "0.20.1"
 directories = "6.0.0"
