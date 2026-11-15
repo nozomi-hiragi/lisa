@@ -116,6 +116,8 @@ cargo test             # テスト
 - [docs/architecture.md](docs/architecture.md) — ソースの構成、描画の流れ、画像キャッシュ、描画頻度
 - [docs/input.md](docs/input.md) — 入力の扱い（2 本指スクロールの状態機械、ラバーバンド、離したあとの動き、ピンチで止まる段）
 - [docs/design.md](docs/design.md) — ハッシュでの管理の計画（未実装）
+- [docs/schema.md](docs/schema.md) — 保存するデータの形（未実装）
+- [docs/scan.md](docs/scan.md) — 実際のスキャンに要るものと、実装の順番（未実装）
 
 ## ライセンス
 
