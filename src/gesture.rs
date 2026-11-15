@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 
 use bevy::input::gestures::PinchGesture;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
-use bevy::input::touch::TouchPhase;
 use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -32,6 +31,7 @@ use bevy::window::PrimaryWindow;
 use crate::layout::{DIRS, FILES, column_items};
 use crate::menu::{BAR_PX, Popup};
 use crate::scene::{self, ColumnRows, Rows};
+use crate::scroll_input::{Action, ScrollMachine};
 use crate::settings::Settings;
 use crate::tree::NodeId;
 use crate::view::{
@@ -64,8 +64,6 @@ const MAX_ZOOM_OUT: f32 = 4.0;
 const SIBLING_FOLLOW: f32 = 0.85;
 /// ばねで戻るのにかける時間（秒）。
 const SPRING_SECONDS: f32 = 0.3;
-/// 2本指を離したあと、これ以内に始まったスクロールは慣性とみなす。
-const MOMENTUM_GAP: Duration = Duration::from_millis(150);
 /// 慣性がここまで弱まったら（倍率）、残りの慣性は捨てる。
 const MOMENTUM_CUTOFF: f32 = 0.05;
 /// 慣性の1回の動きがこれより小さくなったら（ピクセル）、残りの慣性は捨てる。
@@ -104,17 +102,59 @@ impl Gesture {
     }
 }
 
-/// 2本指のスクロールの指の状態と、そのあとの慣性。ジェスチャーが終わっても残す。
-#[derive(Resource, Default)]
-pub struct ScrollPhase {
-    /// 指が置かれている。
-    finger_down: bool,
-    /// 最後に指を離した時刻。
-    lifted_at: Option<Instant>,
-    /// 慣性のスクロールが続いている。
-    momentum: bool,
-    /// 今の慣性はもう使わない（弱まりきった、またはカメラが動いている）。
-    momentum_dropped: bool,
+/// 2本指のスクロールの状態（`scroll_input` の状態機械）。ジェスチャーが終わっても残す。
+#[derive(Resource)]
+pub struct TrackpadInput {
+    machine: ScrollMachine,
+    /// 時刻の起点（状態機械には、ここからの秒数を渡す）。
+    epoch: Instant,
+    /// デバッグ用の入力の記録先（LISA_INPUT_LOG=1 のときだけ）。
+    log: Option<std::fs::File>,
+}
+
+impl Default for TrackpadInput {
+    fn default() -> Self {
+        Self {
+            machine: ScrollMachine::default(),
+            epoch: Instant::now(),
+            log: input_log(),
+        }
+    }
+}
+
+impl TrackpadInput {
+    fn now(&self) -> f64 {
+        self.epoch.elapsed().as_secs_f64()
+    }
+
+    fn write_log(&mut self, line: std::fmt::Arguments) {
+        let ms = self.now() * 1000.0;
+        if let Some(file) = &mut self.log {
+            use std::io::Write;
+            let _ = writeln!(file, "{ms:.1} {line}");
+        }
+    }
+
+    fn drop_momentum(&mut self) {
+        let before = self.machine.state;
+        self.machine.drop_momentum();
+        if before != self.machine.state {
+            let after = self.machine.state;
+            self.write_log(format_args!("drop_momentum {before:?} -> {after:?}"));
+        }
+    }
+}
+
+/// デバッグビルドで LISA_INPUT_LOG=1 のとき、入力を /tmp/lisa-input.log に書き足す。
+fn input_log() -> Option<std::fs::File> {
+    if !cfg!(debug_assertions) || std::env::var("LISA_INPUT_LOG").as_deref() != Ok("1") {
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/lisa-input.log")
+        .ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -132,23 +172,62 @@ pub fn gesture(
     popup: Res<Popup>,
     settings: Res<Settings>,
     buttons: Res<ButtonInput<MouseButton>>,
-    mut phase: ResMut<ScrollPhase>,
+    mut input: ResMut<TrackpadInput>,
     mut column_rows: Query<(&ColumnRows, &ChildOf, &mut Transform), Without<MainCamera>>,
 ) {
     let wheel: Vec<MouseWheel> = wheel.read().cloned().collect();
     let pinch: f32 = pinch.read().map(|p| p.0).sum();
-    // 切り替えの途中やメニューの操作中は、入力を捨てる（慣性も、この先は使わない）。
-    if animating.is_some() || !fades.is_empty() || (popup.open && !state.active()) {
-        for event in &wheel {
-            if event.unit == MouseScrollUnit::Pixel {
-                match event.phase {
-                    TouchPhase::Started => phase.finger_down = true,
-                    TouchPhase::Ended | TouchPhase::Canceled => phase.finger_down = false,
-                    TouchPhase::Moved => {}
+
+    // 2本指のスクロールは、まず状態機械に通して「指」「離した」「慣性」に分ける。
+    // アニメーション中でも通すので、状態がずれない。
+    let mut touches: Vec<Vec2> = Vec::new();
+    let mut momentum: Vec<(Vec2, f32)> = Vec::new();
+    let mut lifted_now = false;
+    let mut line_zoom = 0.0;
+    let now = input.now();
+    input.machine.tick(now);
+    for event in &wheel {
+        match event.unit {
+            MouseScrollUnit::Line => line_zoom += event.y,
+            MouseScrollUnit::Pixel => {
+                let before = input.machine.state;
+                let delta = Vec2::new(event.x, event.y);
+                let action = input.machine.event(now, event.phase, delta);
+                let after = input.machine.state;
+                input.write_log(format_args!(
+                    "wheel px phase={:?} dx={} dy={} -> {action:?} state={after:?}{}",
+                    event.phase,
+                    event.x,
+                    event.y,
+                    if before != after { " (changed)" } else { "" }
+                ));
+                match action {
+                    Action::Touch(d) => touches.push(d),
+                    Action::Lift => lifted_now = true,
+                    Action::Momentum { delta, since_lift } => momentum.push((delta, since_lift)),
+                    Action::None => {}
                 }
             }
         }
-        phase.momentum_dropped = true;
+    }
+    if pinch != 0.0 {
+        input.write_log(format_args!("pinch {pinch}"));
+    }
+
+    // ばねで戻っている最中に新しく指で動かしたら、今の位置からそのまま続ける。
+    if let Some(anim) = &animating
+        && anim.interruptible
+        && (!touches.is_empty() || pinch != 0.0)
+        && fades.is_empty()
+        && !popup.open
+    {
+        maker.commands.remove_resource::<Animating>();
+        input.write_log(format_args!("spring interrupted by new touch"));
+    } else if animating.is_some() || !fades.is_empty() || (popup.open && !state.active()) {
+        // 切り替えの途中やメニューの操作中は、入力を捨てる。慣性はこの先も使わない。
+        if !momentum.is_empty() || lifted_now {
+            input.drop_momentum();
+        }
         return;
     }
     let (camera, camera_global, mut transform, mut projection) = camera.into_inner();
@@ -164,61 +243,20 @@ pub fn gesture(
     let mut touched = false;
     let mut zoom = 0.0;
     let mut pan: Vec<Vec2> = Vec::new();
-    let mut momentum: Vec<f32> = Vec::new();
-    let mut lifted_now = false;
-    for event in &wheel {
-        if over_ui {
-            continue;
+    if !over_ui {
+        // マウスのホイールは、ポインタを中心にした拡大縮小。
+        if line_zoom != 0.0 {
+            zoom += line_zoom * WHEEL_ZOOM_STEP;
+            state.by_wheel = true;
         }
-        match event.unit {
-            // マウスのホイールは、ポインタを中心にした拡大縮小。
-            MouseScrollUnit::Line => {
-                zoom += event.y * WHEEL_ZOOM_STEP;
-                state.by_wheel = true;
-            }
-            MouseScrollUnit::Pixel => {
-                match event.phase {
-                    TouchPhase::Started => {
-                        let recent = phase.lifted_at.is_some_and(|t| t.elapsed() <= MOMENTUM_GAP);
-                        if !phase.finger_down && recent {
-                            // 指を離した直後に始まるのは慣性。
-                            phase.momentum = true;
-                            phase.momentum_dropped = settings.momentum_decay().is_none();
-                        } else {
-                            phase.finger_down = true;
-                            phase.momentum = false;
-                        }
-                        // 始まりの入力にも動きが付いていることがあるので、続けて扱う。
-                    }
-                    TouchPhase::Ended | TouchPhase::Canceled => {
-                        if phase.momentum {
-                            phase.momentum = false;
-                        } else {
-                            phase.finger_down = false;
-                            phase.lifted_at = Some(Instant::now());
-                            lifted_now = true;
-                        }
-                        continue;
-                    }
-                    TouchPhase::Moved => {}
-                }
-                // 動きの無い入力（始まりの合図だけのものなど）は、ここで終わり。
-                if event.x == 0.0 && event.y == 0.0 {
-                    continue;
-                }
-                if phase.momentum || (!phase.finger_down && phase.lifted_at.is_some()) {
-                    // 慣性。カメラには使わず、リストだけを（早めに弱めて）動かす。
-                    momentum.push(event.y);
-                    continue;
-                }
-                state.by_wheel = false;
-                state.by_scroll = true;
-                if TRACKPAD_SCROLL_ZOOMS {
-                    zoom += event.y * TRACKPAD_ZOOM_PER_PX;
-                    pan.push(Vec2::new(event.x, 0.0));
-                } else {
-                    pan.push(Vec2::new(event.x, event.y));
-                }
+        for delta in &touches {
+            state.by_wheel = false;
+            state.by_scroll = true;
+            if TRACKPAD_SCROLL_ZOOMS {
+                zoom += delta.y * TRACKPAD_ZOOM_PER_PX;
+                pan.push(Vec2::new(delta.x, 0.0));
+            } else {
+                pan.push(*delta);
             }
         }
     }
@@ -274,19 +312,19 @@ pub fn gesture(
     // macOS の慣性より早く弱まるように、離してからの時間で小さくしていく。
     // リストの端まで行ったら、残りはカメラを端の重さに押し込む（止まったらすぐ戻す）。
     let mut momentum_pushed = false;
-    if !momentum.is_empty() && !phase.momentum_dropped && (!state.active() || state.momentum_rubber)
-    {
-        let elapsed = phase.lifted_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
+    if !momentum.is_empty() && (!state.active() || state.momentum_rubber) {
+        let since_lift = momentum.last().map_or(0.0, |(_, t)| *t);
         let factor = settings.momentum_decay().map_or(0.0, |tau| {
             if tau.is_infinite() {
                 1.0
             } else {
-                (-elapsed / tau).exp()
+                (-since_lift / tau).exp()
             }
         });
-        let dy: f32 = momentum.iter().sum::<f32>() * factor;
+        let dy: f32 = momentum.iter().map(|(d, _)| d.y).sum::<f32>() * factor;
         if factor < MOMENTUM_CUTOFF || dy.abs() < MOMENTUM_MIN_PX {
-            phase.momentum_dropped = true;
+            // 弱まりきった。残りの慣性は捨てる。
+            input.drop_momentum();
         } else if state.momentum_rubber {
             state.raw_pos.y += dy * ortho.scale;
             momentum_pushed = true;
@@ -308,10 +346,9 @@ pub fn gesture(
                 momentum_pushed = true;
             }
         }
-    }
-    if lifted_now || phase.finger_down {
-        // 新しく指を置いたり離したりしたら、次の慣性は新しく数える。
-        phase.momentum_dropped = false;
+    } else if !momentum.is_empty() {
+        // カメラを動かしている最中の慣性は使わない。
+        input.drop_momentum();
     }
 
     // ピンチ（指を広げると正）とホイール（上へ回すと正）は、どちらも正で拡大。
@@ -406,7 +443,7 @@ pub fn gesture(
     } else {
         RELEASE_AFTER
     };
-    let holding = state.middle.is_some() || (state.by_scroll && phase.finger_down);
+    let holding = state.middle.is_some() || (state.by_scroll && input.machine.touching());
     let released = if holding {
         false
     } else {
@@ -417,10 +454,10 @@ pub fn gesture(
     };
     if stalled {
         // 重さが勝ったら、残りの慣性は捨てる。
-        phase.momentum_dropped = true;
+        input.drop_momentum();
     }
     if released {
-        settle(
+        let animated = settle(
             &mut state,
             &mut nav,
             &mut current,
@@ -435,6 +472,11 @@ pub fn gesture(
             &settings,
             siblings,
         );
+        // 離した瞬間にカメラが動き出したら（戻る・移る）、その指から来る慣性は使わない。
+        if animated {
+            input.drop_momentum();
+        }
+        input.write_log(format_args!("settle animated={animated}"));
     }
 }
 
@@ -602,7 +644,7 @@ fn settle(
     rest_scale: f32,
     settings: &Settings,
     siblings: Option<Siblings>,
-) {
+) -> bool {
     // しきい値は設定から（子へ移る・親へ戻る割合と、勢いで移る速さ）。
     let snap_in = settings.snap_in_percent / 100.0;
     let snap_out = settings.snap_out_percent / 100.0;
@@ -654,7 +696,7 @@ fn settle(
             ZOOM_SECONDS,
             Ease::Out,
         );
-        return;
+        return true;
     }
 
     // 縮小して、今の枠が画面のわずかしか占めていなければ、親へ。
@@ -681,7 +723,7 @@ fn settle(
             ZOOM_SECONDS,
             Ease::Out,
         );
-        return;
+        return true;
     }
 
     // 上下に動かして、隣のフォルダが十分見えていれば（または勢いよく動かしたら）、そちらへ。
@@ -702,7 +744,7 @@ fn settle(
             pos,
             scale,
         );
-        return;
+        return true;
     }
 
     // どちらでもなければ、ばねで元に戻る。
@@ -713,7 +755,7 @@ fn settle(
     // ばねのアニメーションを挟むと、その間の慣性や入力を受け付けなくなる。
     let moved_px = (pos - rest_pos).length() / rest_scale;
     if moved_px < 0.5 && (scale / rest_scale - 1.0).abs() < 1e-3 {
-        return;
+        return false;
     }
     maker.commands.insert_resource(Animating {
         from_pos: pos,
@@ -724,7 +766,9 @@ fn settle(
         then_show: false,
         seconds: SPRING_SECONDS,
         ease: Ease::Out,
+        interruptible: true,
     });
+    true
 }
 
 /// 離したときに移るべき隣のフォルダ。
@@ -856,6 +900,7 @@ fn go(
         then_show,
         seconds,
         ease,
+        interruptible: false,
     });
 }
 

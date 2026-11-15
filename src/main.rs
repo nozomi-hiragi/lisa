@@ -6,6 +6,7 @@ mod layout;
 mod menu;
 mod preview;
 mod scene;
+mod scroll_input;
 mod settings;
 mod shapes;
 mod tree;

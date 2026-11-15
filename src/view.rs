@@ -52,7 +52,7 @@ impl Plugin for TreeViewPlugin {
         .insert_resource(Breadcrumb("Root".into()))
         .init_resource::<Busy>()
         .init_resource::<crate::gesture::Gesture>()
-        .init_resource::<crate::gesture::ScrollPhase>()
+        .init_resource::<crate::gesture::TrackpadInput>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -155,6 +155,8 @@ pub(crate) struct Animating {
     /// かける時間（秒）と、速さの緩急。
     pub(crate) seconds: f32,
     pub(crate) ease: Ease,
+    /// 新しく指で動かしたら止めてよいか（ばねで戻るときだけ）。
+    pub(crate) interruptible: bool,
 }
 
 /// 場面のフェード。終わったら、フェードアウトなら場面を消し、フェードインなら `replaces` を消す。
@@ -526,6 +528,7 @@ fn navigate(
         then_show,
         seconds: ZOOM_SECONDS,
         ease: Ease::InOut,
+        interruptible: false,
     });
 }
 
