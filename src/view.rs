@@ -58,6 +58,7 @@ impl Plugin for TreeViewPlugin {
         .insert_resource(Bake::Waiting)
         .insert_resource(Breadcrumb("Root".into()))
         .init_resource::<Busy>()
+        .init_resource::<crate::render::status::PulseClock>()
         .init_resource::<crate::input::gesture::Gesture>()
         .init_resource::<crate::input::gesture::TrackpadInput>()
         .add_systems(
@@ -77,6 +78,7 @@ impl Plugin for TreeViewPlugin {
                 animate_camera,
                 update_ears,
                 fade_scenes,
+                crate::render::status::pulse_loading,
                 keep_redrawing,
                 update_title,
             )

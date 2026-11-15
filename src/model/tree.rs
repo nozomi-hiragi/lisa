@@ -4,6 +4,23 @@ use bevy::prelude::*;
 
 pub type NodeId = usize;
 
+/// 読み込みの状態。ファイルはハッシュとプレビュー、フォルダは中身全部とフォルダの画像キャッシュ。
+/// 読み込み済みと言えるのは、ハッシュと画像キャッシュが両方そろったとき。中身が変われば
+/// ハッシュと画像キャッシュは同じタイミングで作り直すので、そのあいだは古いになる。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoadState {
+    /// まだ読み込んでいない。
+    Unloaded,
+    /// 読み込んでいる最中（待ち行列に入っているものも含む）。
+    Loading,
+    /// 読み込み済みで、今の中身と合っている。
+    Loaded,
+    /// 読み込んだあとに中身が変わった（読み込み直しが要る）。
+    Stale,
+    /// 読み込めなかった（権限がない、途中で消えた、ディスクのエラーなど）。
+    Failed,
+}
+
 pub struct Node {
     pub name: String,
     /// バイト数。フォルダは子の合計。
@@ -15,6 +32,7 @@ pub struct Node {
     pub device: usize,
     /// フォルダ（Root と端末も含む）なら true。
     pub is_dir: bool,
+    pub state: LoadState,
 }
 
 /// ダミーの木を書くための入れ物。
@@ -143,6 +161,7 @@ impl FileTree {
             tree.insert(device, root, i);
         }
         tree.sum_sizes(root);
+        tree.derive_states(root);
         tree.sort_children();
         tree
     }
@@ -170,6 +189,7 @@ impl FileTree {
         is_dir: bool,
     ) -> NodeId {
         let id = self.nodes.len();
+        let state = dummy_state(name);
         let depth = parent.map_or(0, |p| self.nodes[p].depth + 1);
         self.nodes.push(Node {
             name: name.to_string(),
@@ -179,6 +199,7 @@ impl FileTree {
             children: Vec::new(),
             device,
             is_dir,
+            state,
         });
         if let Some(p) = parent {
             self.nodes[p].children.push(id);
@@ -203,6 +224,37 @@ impl FileTree {
         self.nodes[id].size
     }
 
+    /// フォルダの状態を子から決める。読み込み中か未読み込みの子があれば、全部が未読み込みなら
+    /// 未読み込み、そうでなければ読み込み中。次に古い子があれば古い。子の失敗はフォルダの失敗に
+    /// しない（フォルダの失敗は、そのフォルダの一覧が読めなかったときだけ）。
+    fn derive_states(&mut self, id: NodeId) -> LoadState {
+        let children = self.nodes[id].children.clone();
+        if !self.nodes[id].is_dir
+            || children.is_empty()
+            || self.nodes[id].state == LoadState::Failed
+        {
+            return self.nodes[id].state;
+        }
+        let states: Vec<LoadState> = children
+            .into_iter()
+            .map(|c| self.derive_states(c))
+            .collect();
+        let counted = states.iter().filter(|s| **s != LoadState::Failed);
+        let has = |want: LoadState| states.contains(&want);
+        let state =
+            if counted.clone().all(|s| *s == LoadState::Unloaded) && has(LoadState::Unloaded) {
+                LoadState::Unloaded
+            } else if has(LoadState::Loading) || has(LoadState::Unloaded) {
+                LoadState::Loading
+            } else if has(LoadState::Stale) {
+                LoadState::Stale
+            } else {
+                LoadState::Loaded
+            };
+        self.nodes[id].state = state;
+        state
+    }
+
     /// Root からそのノードまでの名前を " / " でつなぐ。
     pub fn path(&self, id: NodeId) -> String {
         let mut names = Vec::new();
@@ -213,5 +265,32 @@ impl FileTree {
         }
         names.reverse();
         names.join(" / ")
+    }
+}
+
+/// ダミーの木の読み込みの状態。見た目を確かめられるよう、名前でいくつかに散らす。
+fn dummy_state(name: &str) -> LoadState {
+    if let Some(n) = name
+        .strip_prefix("scan_")
+        .and_then(|rest| rest.strip_suffix(".jpg"))
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        // 前から順に読み込んでいる途中、というつもり。ところどころ失敗している。
+        return match n {
+            _ if n % 97 == 0 => LoadState::Failed,
+            1..=300 => LoadState::Loaded,
+            301..=312 => LoadState::Loading,
+            _ => LoadState::Unloaded,
+        };
+    }
+    match name {
+        "dataset.zip" | "manual.pdf" => LoadState::Loading,
+        "MacBook_2026-10.sparsebundle" | "WindowsPC_2026-09.img" | "未整理.zip" => {
+            LoadState::Unloaded
+        }
+        "秋.zip" | "編集中.prproj" | "見積もり.xlsx" => LoadState::Stale,
+        // game_a はフォルダの一覧そのものが読めなかった、というつもり。
+        "installer.dmg" | "セーブデータ.zip" | "家族.heic" | "game_a" => LoadState::Failed,
+        _ => LoadState::Loaded,
     }
 }

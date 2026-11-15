@@ -10,8 +10,8 @@ use crate::layout::NodeLayout;
 use crate::model::tree::{FileTree, NodeId};
 use crate::render::cache::FolderImages;
 use crate::render::ear::{self, EarSizes};
-use crate::render::preview;
 use crate::render::shapes::{Painter, over};
+use crate::render::status;
 
 pub const BACKGROUND: Color = Color::srgb(0.08, 0.08, 0.1);
 
@@ -155,16 +155,30 @@ fn draw_children(
         if child_node.is_dir {
             let color = folder_color(tree, child);
             let image = source.images.ready(child);
-            in_group(painter, slot, size, |painter| match image {
-                // 画像には子の本体と中身が焼いてある（耳は入っていない）。
-                Some(image) => painter.image(l.frame, image, z),
-                // まだ画像が無いときは、空の本体だけ。
-                None => painter.rect(l.frame, color, z),
+            in_group(painter, slot, size, |painter| {
+                status::draw_folder(
+                    painter,
+                    child_node.state,
+                    l.frame,
+                    image,
+                    color,
+                    background,
+                    z,
+                    live,
+                );
             });
             ear::draw_ear(painter, slot, size, &child_node.name, color, z);
         } else {
             in_group(painter, slot, size, |painter| {
-                preview::draw(painter, &child_node.name, l.frame, background, z);
+                status::draw_file(
+                    painter,
+                    child_node.state,
+                    &child_node.name,
+                    l.frame,
+                    background,
+                    z,
+                    live,
+                );
             });
             // 名前はプレビューの下に、同じフォルダの中のフォルダの耳の名前と同じ大きさで書く。
             let color = over(background, Color::WHITE, 0.9);
