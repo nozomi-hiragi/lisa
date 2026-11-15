@@ -45,13 +45,14 @@ impl Plugin for TreeViewPlugin {
             stack: vec![Level {
                 node: FileTree::ROOT,
                 shift: 0.0,
-                scroll: [0, 0],
+                scroll: [0.0, 0.0],
             }],
         })
         .insert_resource(Bake::Waiting)
         .insert_resource(Breadcrumb("Root".into()))
         .init_resource::<Busy>()
         .init_resource::<crate::gesture::Gesture>()
+        .init_resource::<crate::gesture::ScrollPhase>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -91,8 +92,8 @@ pub(crate) struct Level {
     pub(crate) node: NodeId,
     /// 場面全体を上下にずらす量（親がスクロールしていた分）。
     pub(crate) shift: f32,
-    /// 列（ファイル、フォルダ）ごとに、何行目から見せているか。
-    pub(crate) scroll: [usize; 2],
+    /// 列（ファイル、フォルダ）ごとに、何行目から見せているか（小数で行の途中も）。
+    pub(crate) scroll: [f32; 2],
 }
 
 impl Level {
@@ -107,15 +108,16 @@ impl Level {
 
     /// その列の行を描いている位置のずれ（自分のずれ＋その列のスクロールの分）。
     pub(crate) fn column_shift(&self, layouts: &Layouts, column: usize) -> f32 {
-        self.shift + self.scroll[column] as f32 * layouts.0[self.node].list.row_height
+        self.shift + self.scroll[column] * layouts.0[self.node].list.row_height
     }
 
     /// 今見えている、その列の子。
     pub(crate) fn visible(&self, tree: &FileTree, layouts: &Layouts, column: usize) -> Vec<NodeId> {
         let items = column_items(tree, self.node, column);
         let fit = layouts.0[self.node].list.fit;
-        let first = self.scroll[column].min(items.len());
-        items[first..items.len().min(first + fit)].to_vec()
+        let first = (self.scroll[column].floor() as usize).min(items.len());
+        let last = ((self.scroll[column] + fit as f32).ceil() as usize).min(items.len());
+        items[first..last].to_vec()
     }
 }
 
@@ -266,7 +268,7 @@ fn setup(
         RenderLayers::layer(0),
         scale,
         0.0,
-        Rows::Scroll([0, 0]),
+        Rows::Scroll([0.0, 0.0]),
         &[],
     );
 
@@ -329,18 +331,18 @@ fn relayout(
         let mut scroll = level.scroll;
         for (column, value) in scroll.iter_mut().enumerate() {
             let count = column_items(&tree, level.node, column).len();
-            *value = (*value).min(count.saturating_sub(list.fit));
+            *value = value.min(count.saturating_sub(list.fit) as f32);
         }
         if let Some(next) = nav.stack.get(i + 1).map(|l| l.node) {
             let column = column_of(&tree, next);
             let index = column_items(&tree, level.node, column)
                 .iter()
                 .position(|c| *c == next)
-                .unwrap_or(0);
+                .unwrap_or(0) as f32;
             if index < scroll[column] {
                 scroll[column] = index;
-            } else if index >= scroll[column] + list.fit {
-                scroll[column] = index + 1 - list.fit;
+            } else if index + 1.0 > scroll[column] + list.fit as f32 {
+                scroll[column] = index + 1.0 - list.fit as f32;
             }
             nav.stack[i].scroll = scroll;
             nav.stack[i + 1].shift = nav.stack[i].column_shift(&layouts, column);
@@ -477,7 +479,7 @@ fn navigate(
         nav.stack.push(Level {
             node: child,
             shift,
-            scroll: [0, 0],
+            scroll: [0.0, 0.0],
         });
         // 画像のままズームして、終わってから本物に切り替える。
         // ファイルは今の場面にそのまま描いてあるので切り替えない。

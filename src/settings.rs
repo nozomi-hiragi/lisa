@@ -27,6 +27,8 @@ pub struct Settings {
     pub flick_level: u8,
     /// 上下に動かして、隣のフォルダが画面の高さのこの割合（%）以上見えたら、そのフォルダへ移る。
     pub sibling_percent: f32,
+    /// 慣性の強さ（0 で使わない、10 で macOS のまま、間は数字が大きいほど長く続く）。
+    pub inertia_level: u8,
 }
 
 impl Default for Settings {
@@ -37,6 +39,7 @@ impl Default for Settings {
             snap_out_percent: 85.0,
             flick_level: 3,
             sibling_percent: 30.0,
+            inertia_level: 3,
         }
     }
 }
@@ -45,6 +48,16 @@ impl Settings {
     /// 勢いで移る速さのしきい値（倍率の対数で毎秒）。切っていれば None。
     pub fn flick_rate(&self) -> Option<f32> {
         (self.flick_level > 0).then(|| 9.0 / self.flick_level as f32)
+    }
+
+    /// 慣性を弱める速さ（指を離してからの時間の時定数、秒）。0 なら None（慣性を使わない）、
+    /// 10 なら無限大（弱めない）。
+    pub fn momentum_decay(&self) -> Option<f32> {
+        match self.inertia_level {
+            0 => None,
+            10.. => Some(f32::INFINITY),
+            level => Some(0.04 * level as f32),
+        }
     }
 
     /// 範囲の外の値を直す（手で書き換えた settings.json などのため）。
@@ -65,15 +78,17 @@ enum Item {
     SnapOut,
     Flick,
     Sibling,
+    Inertia,
 }
 
 impl Item {
-    const ALL: [Item; 5] = [
+    const ALL: [Item; 6] = [
         Item::RowHeight,
         Item::SnapIn,
         Item::SnapOut,
         Item::Sibling,
         Item::Flick,
+        Item::Inertia,
     ];
 
     fn label(self) -> &'static str {
@@ -83,6 +98,7 @@ impl Item {
             Item::SnapOut => "親へ戻るしきい値",
             Item::Flick => "勢いで移る感度",
             Item::Sibling => "隣のフォルダへ移るしきい値",
+            Item::Inertia => "慣性の強さ",
         }
     }
 
@@ -94,6 +110,7 @@ impl Item {
             Item::SnapOut => (50.0, 98.0, 1.0),
             Item::Flick => (0.0, 10.0, 1.0),
             Item::Sibling => (10.0, 80.0, 5.0),
+            Item::Inertia => (0.0, 10.0, 1.0),
         }
     }
 
@@ -104,6 +121,7 @@ impl Item {
             Item::SnapOut => settings.snap_out_percent,
             Item::Flick => settings.flick_level as f32,
             Item::Sibling => settings.sibling_percent,
+            Item::Inertia => settings.inertia_level as f32,
         }
     }
 
@@ -116,6 +134,7 @@ impl Item {
             Item::SnapOut => settings.snap_out_percent = value,
             Item::Flick => settings.flick_level = value.round() as u8,
             Item::Sibling => settings.sibling_percent = value,
+            Item::Inertia => settings.inertia_level = value.round() as u8,
         }
     }
 
@@ -127,6 +146,9 @@ impl Item {
             Item::Flick if settings.flick_level == 0 => "切".to_string(),
             Item::Flick => format!("{}", settings.flick_level),
             Item::Sibling => format!("{} %", settings.sibling_percent),
+            Item::Inertia if settings.inertia_level == 0 => "切".to_string(),
+            Item::Inertia if settings.inertia_level >= 10 => "macOS".to_string(),
+            Item::Inertia => format!("{}", settings.inertia_level),
         }
     }
 
@@ -293,6 +315,7 @@ mod tests {
             settings.sibling_percent,
             Settings::default().sibling_percent
         );
+        assert_eq!(settings.inertia_level, Settings::default().inertia_level);
     }
 
     #[test]

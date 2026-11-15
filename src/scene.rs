@@ -9,7 +9,9 @@ use bevy::sprite::Anchor;
 use bevy::sprite_render::ColorMaterial;
 
 use crate::cache::FolderImages;
-use crate::layout::{DIRS, FILES, NodeLayout, column_items, folder_body, folder_tab};
+use crate::layout::{
+    DIRS, FILES, NodeLayout, column_items, contents_area, folder_body, folder_tab,
+};
 use crate::preview;
 use crate::shapes::{Painter, over};
 use crate::tree::{FileTree, NodeId, format_size};
@@ -36,12 +38,13 @@ pub struct SceneSource<'a> {
 pub enum Rows {
     /// 入る分だけ先頭から並べ、はみ出すときは最後の行を「…ほか N 件」にする（画像用）。
     Summary,
-    /// 列ごとに、指定した行から入る分だけ並べる（スクロール中の本物の場面用）。
-    Scroll([usize; 2]),
+    /// 列ごとに、指定した位置（行単位、小数で途中の位置も）から入る分だけ並べる
+    /// （スクロール中の本物の場面用）。
+    Scroll([f32; 2]),
     /// Scroll と同じ位置に並べるが、`column` の列は `from..to` の行も描く
     /// （見えている範囲の外にある隣のフォルダを見せるため）。
     Around {
-        scroll: [usize; 2],
+        scroll: [f32; 2],
         column: usize,
         from: usize,
         to: usize,
@@ -114,6 +117,7 @@ pub fn spawn(
     let row_height = list.row_height;
     let fit = list.fit;
     let layer = painter.layer.clone();
+    let mut scrollbars = Vec::new();
 
     for column in [FILES, DIRS] {
         let items = column_items(tree, folder, column);
@@ -122,13 +126,14 @@ pub fn spawn(
             continue;
         }
 
-        // どの行を描くか（lo..hi）。スクロールしているときは、その列の行を first 行ぶん上へずらす。
+        // どの行を描くか（lo..hi）。スクロールしているときは、その列の行を first 行ぶん上へずらす
+        // （first は小数で、行の途中の位置もある）。
         let (first, lo, hi, more) = match rows {
-            Rows::Summary if count > fit => (0, 0, fit - 1, Some(count - (fit - 1))),
-            Rows::Summary => (0, 0, count, None),
+            Rows::Summary if count > fit => (0.0, 0, fit - 1, Some(count - (fit - 1))),
+            Rows::Summary => (0.0, 0, count, None),
             Rows::Scroll(scroll) => {
-                let first = scroll[column].min(count.saturating_sub(fit));
-                (first, first, count.min(first + fit), None)
+                let (first, lo, hi) = window(scroll[column], count, fit);
+                (first, lo, hi, None)
             }
             Rows::Around {
                 scroll,
@@ -136,12 +141,11 @@ pub fn spawn(
                 from,
                 to,
             } => {
-                let first = scroll[column].min(count.saturating_sub(fit));
-                let hi = count.min(first + fit);
+                let (first, lo, hi) = window(scroll[column], count, fit);
                 if around == column {
-                    (first, first.min(from), hi.max(to.min(count)), None)
+                    (first, lo.min(from), hi.max(to.min(count)), None)
                 } else {
-                    (first, first, hi, None)
+                    (first, lo, hi, None)
                 }
             }
         };
@@ -149,7 +153,11 @@ pub fn spawn(
             .commands
             .spawn((
                 ChildOf(root),
-                Transform::from_xyz(0.0, first as f32 * row_height, 0.0),
+                ColumnRows {
+                    column,
+                    drawn: lo..hi,
+                },
+                Transform::from_xyz(0.0, first * row_height, 0.0),
                 Visibility::default(),
                 layer.clone(),
             ))
@@ -198,24 +206,75 @@ pub fn spawn(
             );
         }
 
-        // スクロールできるときは、列の右端に今どこを見ているかの棒を出す。
+        // スクロールできるときは、列の右端に今どこを見ているかの棒を出す（覆いの後に描く）。
         if !matches!(rows, Rows::Summary) && count > fit {
-            painter.parent = root;
             let rect = list.columns[column];
             let width = row_height * 0.08;
             let x = rect.max.x + width;
             let track = Rect::new(x, rect.min.y, x + width, rect.max.y);
-            let top = rect.max.y - rect.height() * first as f32 / count as f32;
+            let top = rect.max.y - rect.height() * first / count as f32;
             let height = rect.height() * fit as f32 / count as f32;
-            painter.rect(track, over(background, Color::WHITE, 0.08), z + 0.3);
-            painter.rect(
+            scrollbars.push((
+                track,
                 Rect::new(track.min.x, top - height, track.max.x, top),
-                over(background, Color::WHITE, 0.35),
-                z + 0.4,
-            );
+            ));
         }
     }
+
+    // スクロールで行の途中まで来たとき、並べる場所からはみ出した行を、周りの色で覆って隠す。
+    // 重なりは作った順に描かれるので、行の後に作る。
+    painter.parent = root;
+    if !matches!(rows, Rows::Summary) {
+        let outer = node.parent.map_or(BACKGROUND, |p| folder_color(tree, p));
+        let z = node.depth as f32 + 1.9;
+        let area = contents_area(frame);
+        let body = folder_body(frame);
+        let tab = folder_tab(frame);
+        let reach = row_height * 1.2;
+        let top = area.max.y + reach;
+        let bottom = area.min.y - reach;
+        let mut cover = |rect: Rect, color: Color| {
+            if rect.width() > 0.0 && rect.height() > 0.0 {
+                painter.rect(rect, color, z);
+            }
+        };
+        // 上: 本体の余白、タブ、タブの右（外側）。
+        cover(
+            Rect::new(frame.min.x, area.max.y, frame.max.x, body.max.y),
+            background,
+        );
+        let above_body = top.min(frame.max.y);
+        cover(
+            Rect::new(frame.min.x, body.max.y, tab.max.x, above_body),
+            background,
+        );
+        cover(Rect::new(tab.max.x, body.max.y, frame.max.x, top), outer);
+        cover(Rect::new(frame.min.x, frame.max.y, tab.max.x, top), outer);
+        // 下: 本体の余白と、その外側。
+        cover(
+            Rect::new(frame.min.x, frame.min.y, frame.max.x, area.min.y),
+            background,
+        );
+        cover(
+            Rect::new(frame.min.x, bottom, frame.max.x, frame.min.y),
+            outer,
+        );
+    }
+    let z = node.depth as f32 + 1.95;
+    for (track, thumb) in scrollbars {
+        painter.rect(track, over(background, Color::WHITE, 0.08), z);
+        painter.rect(thumb, over(background, Color::WHITE, 0.35), z + 0.01);
+    }
     root
+}
+
+/// スクロール位置 `scroll`（行単位、小数あり）のとき、描く行の範囲。
+/// （ずらす量、最初の行、最後の行の次）
+pub fn window(scroll: f32, count: usize, fit: usize) -> (f32, usize, usize) {
+    let first = scroll.clamp(0.0, count.saturating_sub(fit) as f32);
+    let lo = first.floor() as usize;
+    let hi = count.min((first + fit as f32).ceil() as usize);
+    (first, lo, hi)
 }
 
 /// 行の左に名前を書く。
@@ -253,6 +312,14 @@ pub fn folder_color(tree: &FileTree, id: NodeId) -> Color {
             )
         }
     }
+}
+
+/// 列の行をまとめて持つ実体。スクロールが1行の中で動くだけなら、これを動かすだけで済む。
+#[derive(Component)]
+pub struct ColumnRows {
+    pub column: usize,
+    /// 描いてある行の範囲。
+    pub drawn: std::ops::Range<usize>,
 }
 
 /// 名前に使うフォント。

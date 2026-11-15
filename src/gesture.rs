@@ -13,7 +13,12 @@
 //!
 //! マウスとトラックパッドはスクロールの単位で見分ける（行単位がマウス、ピクセル単位が
 //! トラックパッド。Magic Mouse はピクセル単位なのでトラックパッド扱いになる）。
-//! Bevy にはピンチの始まりと終わりが来ないので、入力が少し途切れたら指を離したとみなす。
+//!
+//! 2本指のスクロールには「指を置いた・動かした・離した」が付いてくるので、指を離した瞬間に
+//! 行き先を決めて動き出す。macOS は指を離したあとも慣性のスクロールを送ってくる（また
+//! 始まり・動き・終わりの順で来る）。慣性はカメラには使わず、リストのスクロールにだけ、
+//! macOS より早く弱まるようにして使う（強さは設定で変えられる）。
+//! ピンチには始まりと終わりが来ないので、入力が少し途切れたら指を離したとみなす。
 
 use std::time::{Duration, Instant};
 
@@ -26,7 +31,7 @@ use bevy::window::PrimaryWindow;
 
 use crate::layout::{DIRS, FILES, column_items};
 use crate::menu::{BAR_PX, Popup};
-use crate::scene::Rows;
+use crate::scene::{self, ColumnRows, Rows};
 use crate::settings::Settings;
 use crate::tree::NodeId;
 use crate::view::{
@@ -59,20 +64,30 @@ const MAX_ZOOM_OUT: f32 = 4.0;
 const SIBLING_FOLLOW: f32 = 0.85;
 /// ばねで戻るのにかける時間（秒）。
 const SPRING_SECONDS: f32 = 0.3;
+/// 2本指を離したあと、これ以内に始まったスクロールは慣性とみなす。
+const MOMENTUM_GAP: Duration = Duration::from_millis(150);
+/// 慣性がここまで弱まったら（倍率）、残りの慣性は捨てる。
+const MOMENTUM_CUTOFF: f32 = 0.05;
+/// 慣性の1回の動きがこれより小さくなったら（ピクセル）、残りの慣性は捨てる。
+const MOMENTUM_MIN_PX: f32 = 0.5;
+/// 慣性で端の重さに押し込んでいるとき、1フレームの動きがこれより小さくなったら（ピクセル）、
+/// 重さが勝ったとみなしてすぐ戻す。
+const MOMENTUM_STALL_PX: f32 = 2.0;
 
 #[derive(Resource, Default)]
 pub struct Gesture {
     /// 指で動かしている最中なら、最後に入力が来た時刻。
     last_input: Option<Instant>,
-    /// 2本指のスクロールで指を離した（このあとは慣性の入力が続くことがある）。
-    lifted: bool,
     /// 制限をかける前のカメラの位置と倍率（指の動きそのまま）。
     raw_pos: Vec2,
     raw_scale: f32,
-    /// リストのスクロールの、1行に満たない端数。
-    pending_rows: f32,
-    /// 最後の入力がマウスのホイールか。
+    /// 最後の入力がマウスのホイールか、2本指のスクロールか。
     by_wheel: bool,
+    by_scroll: bool,
+    /// 指を離したあとの慣性で、リストの端からカメラを押し込んでいる。
+    momentum_rubber: bool,
+    /// 前のフレームに見せたカメラの y（慣性が重さに負けて止まったかを見る）。
+    last_shown_y: Option<f32>,
     /// 中ボタンで引っぱっているなら、前のフレームのカーソルの位置。
     middle: Option<Vec2>,
     /// 縮小して親が見えてきたときに、下に描いておく親の場面。
@@ -87,6 +102,19 @@ impl Gesture {
     pub fn active(&self) -> bool {
         self.last_input.is_some()
     }
+}
+
+/// 2本指のスクロールの指の状態と、そのあとの慣性。ジェスチャーが終わっても残す。
+#[derive(Resource, Default)]
+pub struct ScrollPhase {
+    /// 指が置かれている。
+    finger_down: bool,
+    /// 最後に指を離した時刻。
+    lifted_at: Option<Instant>,
+    /// 慣性のスクロールが続いている。
+    momentum: bool,
+    /// 今の慣性はもう使わない（弱まりきった、またはカメラが動いている）。
+    momentum_dropped: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -104,11 +132,23 @@ pub fn gesture(
     popup: Res<Popup>,
     settings: Res<Settings>,
     buttons: Res<ButtonInput<MouseButton>>,
+    mut phase: ResMut<ScrollPhase>,
+    mut column_rows: Query<(&ColumnRows, &ChildOf, &mut Transform), Without<MainCamera>>,
 ) {
     let wheel: Vec<MouseWheel> = wheel.read().cloned().collect();
     let pinch: f32 = pinch.read().map(|p| p.0).sum();
-    // 切り替えの途中やメニューの操作中は、入力を捨てる。
+    // 切り替えの途中やメニューの操作中は、入力を捨てる（慣性も、この先は使わない）。
     if animating.is_some() || !fades.is_empty() || (popup.open && !state.active()) {
+        for event in &wheel {
+            if event.unit == MouseScrollUnit::Pixel {
+                match event.phase {
+                    TouchPhase::Started => phase.finger_down = true,
+                    TouchPhase::Ended | TouchPhase::Canceled => phase.finger_down = false,
+                    TouchPhase::Moved => {}
+                }
+            }
+        }
+        phase.momentum_dropped = true;
         return;
     }
     let (camera, camera_global, mut transform, mut projection) = camera.into_inner();
@@ -124,6 +164,8 @@ pub fn gesture(
     let mut touched = false;
     let mut zoom = 0.0;
     let mut pan: Vec<Vec2> = Vec::new();
+    let mut momentum: Vec<f32> = Vec::new();
+    let mut lifted_now = false;
     for event in &wheel {
         if over_ui {
             continue;
@@ -135,18 +177,42 @@ pub fn gesture(
                 state.by_wheel = true;
             }
             MouseScrollUnit::Pixel => {
-                if event.phase == TouchPhase::Ended || event.phase == TouchPhase::Canceled {
-                    state.lifted = true;
+                match event.phase {
+                    TouchPhase::Started => {
+                        let recent = phase.lifted_at.is_some_and(|t| t.elapsed() <= MOMENTUM_GAP);
+                        if !phase.finger_down && recent {
+                            // 指を離した直後に始まるのは慣性。
+                            phase.momentum = true;
+                            phase.momentum_dropped = settings.momentum_decay().is_none();
+                        } else {
+                            phase.finger_down = true;
+                            phase.momentum = false;
+                        }
+                        // 始まりの入力にも動きが付いていることがあるので、続けて扱う。
+                    }
+                    TouchPhase::Ended | TouchPhase::Canceled => {
+                        if phase.momentum {
+                            phase.momentum = false;
+                        } else {
+                            phase.finger_down = false;
+                            phase.lifted_at = Some(Instant::now());
+                            lifted_now = true;
+                        }
+                        continue;
+                    }
+                    TouchPhase::Moved => {}
+                }
+                // 動きの無い入力（始まりの合図だけのものなど）は、ここで終わり。
+                if event.x == 0.0 && event.y == 0.0 {
                     continue;
                 }
-                if event.phase == TouchPhase::Started {
-                    state.lifted = false;
-                }
-                // 離したあとの慣性で、はみ出す方向へは動かさない（そのまま戻す）。
-                if state.lifted && overshooting(&state, top, &maker, &window, rest_scale) {
+                if phase.momentum || (!phase.finger_down && phase.lifted_at.is_some()) {
+                    // 慣性。カメラには使わず、リストだけを（早めに弱めて）動かす。
+                    momentum.push(event.y);
                     continue;
                 }
                 state.by_wheel = false;
+                state.by_scroll = true;
                 if TRACKPAD_SCROLL_ZOOMS {
                     zoom += event.y * TRACKPAD_ZOOM_PER_PX;
                     pan.push(Vec2::new(event.x, 0.0));
@@ -186,25 +252,66 @@ pub fn gesture(
             && delta.y.abs() > delta.x.abs()
             && list_can_scroll(&nav, &maker, cursor_world, -delta.y)
         {
-            state.pending_rows -= delta.y / settings.row_height_px;
-            let rows = state.pending_rows.trunc();
-            if rows != 0.0 {
-                state.pending_rows -= rows;
-                let left = scroll_list(
-                    &mut nav,
-                    &mut current,
-                    &mut maker,
-                    &window,
-                    cursor_world,
-                    rows,
-                );
-                // 端まで行って動かせなかった分は、カメラを引っぱる（重くなって戻る）。
-                state.raw_pos.y -= left * settings.row_height_px * ortho.scale;
-            }
+            // 指の動きそのままに（ピクセル単位で）リストを動かす。
+            let left = scroll_list(
+                &mut nav,
+                &mut current,
+                &mut maker,
+                &window,
+                &mut column_rows,
+                cursor_world,
+                -delta.y / settings.row_height_px,
+            );
+            // 端まで行って動かせなかった分は、カメラを引っぱる（重くなって戻る）。
+            state.raw_pos.y -= left * settings.row_height_px * ortho.scale;
             continue;
         }
         // 指についてカメラを動かす（中身が指と同じ向きに動く）。
         state.raw_pos += Vec2::new(-delta.x, delta.y) * ortho.scale;
+    }
+
+    // 慣性は、指を離したときにカメラが元の位置にあれば、リストのスクロールにだけ使う。
+    // macOS の慣性より早く弱まるように、離してからの時間で小さくしていく。
+    // リストの端まで行ったら、残りはカメラを端の重さに押し込む（止まったらすぐ戻す）。
+    let mut momentum_pushed = false;
+    if !momentum.is_empty() && !phase.momentum_dropped && (!state.active() || state.momentum_rubber)
+    {
+        let elapsed = phase.lifted_at.map_or(0.0, |t| t.elapsed().as_secs_f32());
+        let factor = settings.momentum_decay().map_or(0.0, |tau| {
+            if tau.is_infinite() {
+                1.0
+            } else {
+                (-elapsed / tau).exp()
+            }
+        });
+        let dy: f32 = momentum.iter().sum::<f32>() * factor;
+        if factor < MOMENTUM_CUTOFF || dy.abs() < MOMENTUM_MIN_PX {
+            phase.momentum_dropped = true;
+        } else if state.momentum_rubber {
+            state.raw_pos.y += dy * ortho.scale;
+            momentum_pushed = true;
+        } else {
+            let left = scroll_list(
+                &mut nav,
+                &mut current,
+                &mut maker,
+                &window,
+                &mut column_rows,
+                cursor_world,
+                -dy / settings.row_height_px,
+            );
+            if left != 0.0 {
+                begin(&mut state, transform.translation.truncate(), ortho.scale);
+                state.by_scroll = true;
+                state.momentum_rubber = true;
+                state.raw_pos.y -= left * settings.row_height_px * ortho.scale;
+                momentum_pushed = true;
+            }
+        }
+    }
+    if lifted_now || phase.finger_down {
+        // 新しく指を置いたり離したりしたら、次の慣性は新しく数える。
+        phase.momentum_dropped = false;
     }
 
     // ピンチ（指を広げると正）とホイール（上へ回すと正）は、どちらも正で拡大。
@@ -225,7 +332,7 @@ pub fn gesture(
     let Some(last_input) = state.last_input else {
         return;
     };
-    if touched {
+    if touched || momentum_pushed {
         let now = Instant::now();
         state.last_input = Some(now);
         let sample = (now, state.raw_scale.ln());
@@ -240,7 +347,12 @@ pub fn gesture(
 
     // 制限をかけた見え方にする。
     let at_root = nav.stack.len() < 2;
-    let siblings = Siblings::of(&nav, &maker);
+    // 慣性で端に押し込んでいるときは、隣のフォルダへは進まない（強い重さだけ）。
+    let siblings = if state.momentum_rubber {
+        None
+    } else {
+        Siblings::of(&nav, &maker)
+    };
     let (pos, scale) = constrain(
         &state,
         top,
@@ -252,6 +364,13 @@ pub fn gesture(
     );
     transform.translation = pos.extend(0.0);
     ortho.scale = scale;
+    // 慣性で端の重さに押し込んでいて、重さが勝って止まった（または慣性が尽きた）か。
+    let stalled = state.momentum_rubber
+        && (!momentum_pushed
+            || state
+                .last_shown_y
+                .is_some_and(|y| (pos.y - y).abs() / scale < MOMENTUM_STALL_PX));
+    state.last_shown_y = Some(pos.y);
 
     // 縮小したり上下に動かしたりして親（隣のフォルダ）が見えてきたら、親の場面を下に描いておく。
     let moved_vertically = (pos.y - rest_pos.y).abs() > rest_scale;
@@ -280,18 +399,27 @@ pub fn gesture(
     }
 
     // 指を離したら、子へ移るか、親へ戻るか、元に戻る。
+    // 2本指は「離した」が来た瞬間に決める（慣性は待たない）。指が乗っている間は、
+    // 止まっていても、はみ出していても、そのまま保つ。ピンチとホイールは入力の途切れで決める。
     let wait = if state.by_wheel {
         WHEEL_RELEASE_AFTER
     } else {
         RELEASE_AFTER
     };
-    let released = if state.middle.is_some() {
+    let holding = state.middle.is_some() || (state.by_scroll && phase.finger_down);
+    let released = if holding {
         false
     } else {
-        middle_released || (!touched && last_input.elapsed() >= wait)
+        middle_released
+            || (state.by_scroll && lifted_now)
+            || stalled
+            || (!touched && !momentum_pushed && last_input.elapsed() >= wait)
     };
-    let bounced = state.lifted && overshooting(&state, top, &maker, &window, rest_scale);
-    if released || (bounced && !touched) {
+    if stalled {
+        // 重さが勝ったら、残りの慣性は捨てる。
+        phase.momentum_dropped = true;
+    }
+    if released {
         settle(
             &mut state,
             &mut nav,
@@ -352,7 +480,7 @@ fn spawn_parent_preview(
     nav: &Nav,
     maker: &mut SceneMaker,
     window: &Window,
-    parent_scroll: [usize; 2],
+    parent_scroll: [f32; 2],
     a: NodeId,
     b: NodeId,
 ) -> Entity {
@@ -378,7 +506,6 @@ fn begin(state: &mut Gesture, pos: Vec2, scale: f32) {
         state.last_input = Some(Instant::now());
         state.raw_pos = pos;
         state.raw_scale = scale;
-        state.pending_rows = 0.0;
     }
 }
 
@@ -459,24 +586,6 @@ fn follow(d: f32, room: f32, size: f32) -> f32 {
     light * SIBLING_FOLLOW + rubber(d - light, size * RUBBER_LIMIT)
 }
 
-/// 動いてよい範囲からはみ出しているか。
-fn overshooting(
-    state: &Gesture,
-    top: Level,
-    maker: &SceneMaker,
-    window: &Window,
-    rest_scale: f32,
-) -> bool {
-    if state.last_input.is_none() {
-        return false;
-    }
-    let offset = Vec2::new(0.0, BAR_PX / 2.0 * state.raw_scale);
-    let view_center = state.raw_pos - offset;
-    let area = bounds(top.frame(&maker.layouts), window, state.raw_scale);
-    let over = view_center - view_center.clamp(area.min, area.max);
-    over.length() > rest_scale
-}
-
 /// 指を離したあと、行き先を決めてそこへ動かす。
 #[allow(clippy::too_many_arguments)]
 fn settle(
@@ -532,7 +641,7 @@ fn settle(
         nav.stack.push(Level {
             node: child,
             shift,
-            scroll: [0, 0],
+            scroll: [0.0, 0.0],
         });
         let then_show = maker.tree.nodes[child].is_dir;
         go(
@@ -600,6 +709,12 @@ fn settle(
     if let Some(parent) = parent_scene {
         maker.commands.entity(parent).despawn();
     }
+    // 動いていなければ（リストをスクロールしただけなど）、何もしない。
+    // ばねのアニメーションを挟むと、その間の慣性や入力を受け付けなくなる。
+    let moved_px = (pos - rest_pos).length() / rest_scale;
+    if moved_px < 0.5 && (scale / rest_scale - 1.0).abs() < 1e-3 {
+        return;
+    }
     maker.commands.insert_resource(Animating {
         from_pos: pos,
         from_scale: scale,
@@ -663,15 +778,15 @@ fn move_to_sibling(
     let parent = nav.stack[parent_index];
     let list = maker.layouts.0[parent.node].list;
     let items = column_items(&maker.tree, parent.node, DIRS);
-    let index = items.iter().position(|c| *c == target).unwrap_or(0);
+    let index = items.iter().position(|c| *c == target).unwrap_or(0) as f32;
     let mut scroll = parent.scroll;
     if index < scroll[DIRS] {
         scroll[DIRS] = index;
-    } else if index >= scroll[DIRS] + list.fit {
-        scroll[DIRS] = index + 1 - list.fit;
+    } else if index + 1.0 > scroll[DIRS] + list.fit as f32 {
+        scroll[DIRS] = index + 1.0 - list.fit as f32;
     }
     // スクロールが変わると、親の列の中のフォルダはまとめて上下にずれる。カメラも同じだけずらす。
-    let delta = (scroll[DIRS] as f32 - parent.scroll[DIRS] as f32) * list.row_height;
+    let delta = (scroll[DIRS] - parent.scroll[DIRS]) * list.row_height;
 
     // 今のフォルダは画像で見せる（親の場面に描いてある）。隣へ着いたら本物に切り替える。
     if let Some(preview) = parent_scene {
@@ -685,7 +800,7 @@ fn move_to_sibling(
     *nav.stack.last_mut().expect("今のフォルダ") = Level {
         node: target,
         shift,
-        scroll: [0, 0],
+        scroll: [0.0, 0.0],
     };
     go(
         maker,
@@ -769,20 +884,23 @@ fn list_can_scroll(
     let top = nav.top();
     let fit = maker.layouts.0[top.node].list.fit;
     let count = column_items(&maker.tree, top.node, column).len();
+    let max = count.saturating_sub(fit) as f32;
     let scroll = top.scroll[column];
     if direction > 0.0 {
-        scroll + fit < count
+        scroll < max - 1e-4
     } else {
-        scroll > 0
+        scroll > 1e-4
     }
 }
 
-/// カーソルのある列を `rows` 行スクロールする。端で動かせなかった行数を返す。
+/// カーソルのある列を `rows` 行（小数あり）スクロールする。端で動かせなかった行数を返す。
+/// 描いてある行の範囲の中で動くだけなら行をまとめて動かし、範囲を出たら場面を作り直す。
 fn scroll_list(
     nav: &mut Nav,
     current: &mut CurrentScene,
     maker: &mut SceneMaker,
     window: &Window,
+    column_rows: &mut Query<(&ColumnRows, &ChildOf, &mut Transform), Without<MainCamera>>,
     cursor_world: Option<Vec2>,
     rows: f32,
 ) -> f32 {
@@ -793,16 +911,28 @@ fn scroll_list(
     let list = maker.layouts.0[top.node].list;
     let count = column_items(&maker.tree, top.node, column).len();
     let max = count.saturating_sub(list.fit) as f32;
-    let before = top.scroll[column] as f32;
+    let before = top.scroll[column];
     let after = (before + rows).clamp(0.0, max);
     if after == before {
         return rows;
     }
     let level = nav.stack.last_mut().expect("Root は常にある");
-    level.scroll[column] = after as usize;
-    // 見えている行だけを作り直す。
-    let (_, scale) = fit(level.frame(&maker.layouts), window);
-    maker.commands.entity(current.0).despawn();
-    current.0 = maker.spawn(&nav.stack, scale);
-    rows - (after - before)
+    level.scroll[column] = after;
+    // 計算の誤差で、動かしきったのに端数が残ったことにならないようにする。
+    let left = rows - (after - before);
+    let left = if left.abs() < 1e-4 { 0.0 } else { left };
+
+    let (_, lo, hi) = scene::window(after, count, list.fit);
+    let moved = column_rows
+        .iter_mut()
+        .find(|(rows, parent, _)| parent.parent() == current.0 && rows.column == column)
+        .filter(|(rows, _, _)| rows.drawn.start <= lo && hi <= rows.drawn.end)
+        .map(|(_, _, mut transform)| transform.translation.y = after * list.row_height)
+        .is_some();
+    if !moved {
+        let (_, scale) = fit(level.frame(&maker.layouts), window);
+        maker.commands.entity(current.0).despawn();
+        current.0 = maker.spawn(&nav.stack, scale);
+    }
+    left
 }
