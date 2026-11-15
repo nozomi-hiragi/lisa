@@ -33,13 +33,13 @@ pub(super) fn grid_levels(maker: &SceneMaker, window: &Window, folder: NodeId) -
     if !node.is_dir {
         return Vec::new();
     }
-    let cell = maker.layouts.0[first].cell;
-    let columns = maker.layouts.0[folder].grid.columns.max(1);
+    let cell = maker.layouts[first].cell;
+    let columns = maker.layouts[folder].grid.columns.max(1);
     let gap = node
         .children
         .get(1)
         .filter(|_| columns > 1)
-        .map_or(0.0, |c| maker.layouts.0[*c].cell.min.x - cell.max.x);
+        .map_or(0.0, |c| maker.layouts[*c].cell.min.x - cell.max.x);
     let pitch = Vec2::new(cell.width() + gap, cell.height() + gap);
     let view = Vec2::new(window.width(), window.height() - BAR_PX);
     let (length, pitch_along) = if view.y <= view.x {
@@ -47,8 +47,8 @@ pub(super) fn grid_levels(maker: &SceneMaker, window: &Window, folder: NodeId) -
     } else {
         (view.x, pitch.x)
     };
-    let whole = fit(maker.layouts.0[folder].fit, window).1;
-    let one = fit(maker.layouts.0[first].fit, window).1;
+    let whole = fit(maker.layouts[folder].fit, window).1;
+    let one = fit(maker.layouts[first].fit, window).1;
     // 全体を収めたとき、短い辺の向きに並ぶ個数。
     let most = (length * whole / pitch_along).floor() as usize;
     (2..most.max(2))
@@ -67,7 +67,7 @@ pub(super) fn zoom_ladder(
 ) -> Vec<ZoomGoal> {
     let fit_goal = |node: NodeId| ZoomGoal {
         node,
-        scale: fit(maker.layouts.0[node].fit, window).1,
+        scale: fit(maker.layouts[node].fit, window).1,
         grid: false,
     };
     let grid_goals = |node: NodeId| {
@@ -86,7 +86,7 @@ pub(super) fn zoom_ladder(
         .iter()
         .copied()
         .min_by(|a, b| {
-            let d = |c: NodeId| maker.layouts.0[c].cell.center().distance_squared(point);
+            let d = |c: NodeId| maker.layouts[c].cell.center().distance_squared(point);
             d(*a).total_cmp(&d(*b))
         })
     {
@@ -148,21 +148,21 @@ pub(super) fn grid_snap(
     scale: f32,
 ) -> Vec2 {
     let children = &maker.tree.nodes[folder].children;
-    let columns = maker.layouts.0[folder].grid.columns.max(1);
+    let columns = maker.layouts[folder].grid.columns.max(1);
     let offset = Vec2::new(0.0, BAR_PX / 2.0 * scale);
     let Some(&first) = children.first() else {
         return pos;
     };
-    let cell = maker.layouts.0[first].cell;
+    let cell = maker.layouts[first].cell;
     // 隣のタイルとの隙間（2 つ目があれば、その間）。
     let gap = children
         .get(1)
         .filter(|_| columns > 1)
-        .map_or(0.0, |c| maker.layouts.0[*c].cell.min.x - cell.max.x);
+        .map_or(0.0, |c| maker.layouts[*c].cell.min.x - cell.max.x);
     let view = Vec2::new(window.width(), window.height() - BAR_PX) * scale;
     let center = pos - offset;
     // 列の左右の端と、行の上下の端（隙間の真ん中）。
-    let cells: Vec<Rect> = children.iter().map(|c| maker.layouts.0[*c].cell).collect();
+    let cells: Vec<Rect> = children.iter().map(|c| maker.layouts[*c].cell).collect();
     let lefts: Vec<f32> = cells
         .iter()
         .take(columns)

@@ -109,7 +109,7 @@ pub(super) fn targets(
     pos: Vec2,
 ) -> Vec<(Target, Vec2, f32)> {
     let top = *nav.top();
-    let fit_of = |id: NodeId| fit(maker.layouts.0[id].fit, window);
+    let fit_of = |id: NodeId| fit(maker.layouts[id].fit, window);
     // フォルダの中を拡大して見る段も、そのフォルダの行き先として候補に入れる。
     let grid_of = |id: NodeId| {
         grid_levels(maker, window, id)
@@ -189,7 +189,7 @@ pub(super) fn coast_step(
     if let Some(goal) = coast.zoom_goal {
         ln += (goal.scale.ln() - ln) * pull;
     }
-    let root_ln = fit(maker.layouts.0[FileTree::ROOT].fit, window).1.ln();
+    let root_ln = fit(maker.layouts[FileTree::ROOT].fit, window).1.ln();
     if ln > root_ln {
         ln += (root_ln - ln) * pull;
     }
@@ -205,12 +205,12 @@ pub(super) fn coast_step(
     let goal = match (grid_folder, coast.zoom_goal, coast.pan_goal) {
         (_, None, Some(PanGoal::Grid(goal))) => goal,
         (_, None, Some(PanGoal::Node(node))) => {
-            let (p, s) = fit(maker.layouts.0[node].fit, window);
+            let (p, s) = fit(maker.layouts[node].fit, window);
             p + Vec2::new(0.0, BAR_PX / 2.0 * (scale - s))
         }
         (Some(folder), _, _) => grid_snap(maker, window, folder, pos, scale),
         (None, Some(goal), _) => {
-            let (p, s) = fit(maker.layouts.0[goal.node].fit, window);
+            let (p, s) = fit(maker.layouts[goal.node].fit, window);
             p + Vec2::new(0.0, BAR_PX / 2.0 * (scale - s))
         }
         (None, None, _) => {
@@ -275,7 +275,7 @@ pub(super) fn choose_pan(
     }
     let parent = maker.tree.nodes[top].parent?;
     let siblings = &maker.tree.nodes[parent].children;
-    let center = |id: NodeId| maker.layouts.0[id].cell.center();
+    let center = |id: NodeId| maker.layouts[id].cell.center();
     let at = projected - offset;
     let nearest = siblings
         .iter()
@@ -313,7 +313,7 @@ pub(super) fn choose_pan(
 /// 今のフォルダを、画面に収める大きさより拡大して中を見ているか。
 pub(super) fn zoomed_within(nav: &Nav, maker: &SceneMaker, window: &Window, scale: f32) -> bool {
     let top = nav.top().node;
-    maker.tree.nodes[top].is_dir && scale < fit(maker.layouts.0[top].fit, window).1 * 0.9
+    maker.tree.nodes[top].is_dir && scale < fit(maker.layouts[top].fit, window).1 * 0.9
 }
 
 /// 開いている場所を `node` にする（Root からの道のりに置き換え、場面を入れ替える）。

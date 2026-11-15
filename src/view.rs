@@ -15,7 +15,7 @@ use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
 use bevy::window::{PrimaryWindow, RequestRedraw, WindowResized};
 use bevy::winit::{UpdateMode, WinitSettings};
 
-use crate::layout::{BODY_ASPECT, EarSpec, Layouts, fitted_size, layout};
+use crate::layout::{EarSpec, Layouts, anchor_body, fitted_size, layout};
 use crate::model::tree::{FileTree, NodeId};
 use crate::render::cache::{self, Bake, BakeFinished, FolderImages};
 use crate::render::ear::{EarSizes, update_ears};
@@ -35,9 +35,6 @@ pub(crate) use camera::{
 pub(crate) use fade::{Fade, fade_scenes};
 pub use title::TitleSuffix;
 pub(crate) use title::{Breadcrumb, show_breadcrumb, update_title};
-
-/// ワールド座標での Root の高さ。幅はウィンドウの縦横比に合わせる。
-const ROOT_HEIGHT: f32 = 1000.0;
 
 pub struct TreeViewPlugin;
 
@@ -71,6 +68,7 @@ impl Plugin for TreeViewPlugin {
                 cache::bake,
                 show_baked,
                 relayout,
+                reanchor,
                 show_relayout,
                 navigate,
                 crate::input::gesture::gesture,
@@ -108,7 +106,7 @@ pub(crate) struct Level {
 impl Level {
     /// 画面に収める四角（ワールド座標）。本体の上に、開いたときの耳の分を足したもの。
     pub(crate) fn frame(&self, layouts: &Layouts) -> Rect {
-        layouts.0[self.node].fit
+        layouts[self.node].fit
     }
 }
 
@@ -147,7 +145,7 @@ impl SceneMaker<'_, '_> {
         let ancestors: Vec<NodeId> = outer.iter().map(|l| l.node).collect();
         let source = SceneSource {
             tree: &self.tree,
-            layouts: &self.layouts.0,
+            layouts: &self.layouts,
             images: &self.images,
             font: &self.font.0,
             ears: &self.ears,
@@ -180,16 +178,13 @@ fn setup(
 ) {
     let font = assets.load("fonts/NotoSansJP-Light.otf");
     // 本体はどれも √2:1（A4 の横長）。耳の高さの設定は、本体を画面に収めたときのピクセル数で決める。
-    let root_rect = Rect::from_center_size(
-        Vec2::ZERO,
-        Vec2::new(ROOT_HEIGHT * BODY_ASPECT, ROOT_HEIGHT),
-    );
+    // 最初は Root を基準にして並べる。
     let (spec, ears) = ear_spec(&settings, &window);
-    let layouts = layout(&tree, root_rect, spec);
-    commands.insert_resource(Geometry { root_rect });
-    let folder_images = cache::create_images(&tree, BODY_ASPECT, &mut images);
+    let layouts = layout(&tree, FileTree::ROOT, anchor_body(), spec);
+    let mut folder_images = FolderImages::default();
+    folder_images.prepare(&tree, &layouts, &mut images);
 
-    let (pos, scale) = fit(root_rect, &window);
+    let (pos, scale) = fit(layouts[FileTree::ROOT].frame, &window);
     commands.spawn((
         MainCamera,
         IsDefaultUiCamera,
@@ -223,7 +218,7 @@ fn setup(
     );
 
     commands.insert_resource(CurrentScene(root_scene));
-    commands.insert_resource(Layouts(layouts));
+    commands.insert_resource(layouts);
     commands.insert_resource(folder_images);
     commands.insert_resource(LabelFont(font));
     commands.insert_resource(ears);
@@ -243,24 +238,22 @@ fn ear_spec(settings: &Settings, window: &Window) -> (EarSpec, EarSizes) {
     (EarSpec::new(settings, fitted.y), ears)
 }
 
-/// 木を配置したときの条件（設定が変わったら、これで配置し直す）。
+/// 配置し直したので、今の場面を作り直す。`refit` なら、カメラも開いているものに合わせ直す
+/// （基準を付け替えただけのときは、カメラはもう新しい座標に移してあるので合わせ直さない）。
 #[derive(Resource)]
-struct Geometry {
-    root_rect: Rect,
+struct Relaid {
+    refit: bool,
 }
-
-/// 配置し直したので、今の場面を作り直す。
-#[derive(Resource)]
-struct Relaid;
 
 /// 大きさの設定が変わったら、木を配置し直し、画像を焼き直す。
 #[allow(clippy::too_many_arguments)]
 fn relayout(
     mut commands: Commands,
     settings: Res<Settings>,
-    geometry: Res<Geometry>,
     tree: Res<FileTree>,
     mut layouts: ResMut<Layouts>,
+    mut folder_images: ResMut<FolderImages>,
+    mut images: ResMut<Assets<Image>>,
     mut bake: ResMut<Bake>,
     mut pending: Local<bool>,
     mut laid_out_with: Local<Option<[f32; 2]>>,
@@ -281,11 +274,66 @@ fn relayout(
     *pending = false;
 
     let (spec, ears) = ear_spec(&settings, &window);
-    layouts.0 = layout(&tree, geometry.root_rect, spec);
+    // 基準のフォルダは同じ場所に置いたまま、耳の大きさだけ変えて並べ直す。
+    let anchor = layouts.anchor;
+    *layouts = layout(&tree, anchor, layouts[anchor].frame, spec);
+    folder_images.prepare(&tree, &layouts, &mut images);
     commands.insert_resource(ears);
 
     *bake = Bake::Waiting;
-    commands.insert_resource(Relaid);
+    commands.insert_resource(Relaid { refit: true });
+}
+
+/// 開いている場面のフォルダが基準から外れたまま止まったら、そのフォルダを基準にして並べ直す。
+/// 深く潜っても座標が小さくなりすぎない（f32 の精度が尽きない）ようにするため。
+///
+/// 動いている最中（ズーム、フェード、ジェスチャー、画像を焼いている途中、親の場面を下に敷いて
+/// いるとき）は待つ。カメラは同じ見え方のまま新しい座標に移し、場面を作り直して画像を焼き直す。
+#[allow(clippy::too_many_arguments)]
+fn reanchor(
+    mut commands: Commands,
+    settings: Res<Settings>,
+    tree: Res<FileTree>,
+    nav: Res<Nav>,
+    mut layouts: ResMut<Layouts>,
+    mut folder_images: ResMut<FolderImages>,
+    mut images: ResMut<Assets<Image>>,
+    mut bake: ResMut<Bake>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
+    animating: Option<Res<Animating>>,
+    relaid: Option<Res<Relaid>>,
+    fades: Query<(), With<Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
+) {
+    let path = scene_path(&nav, &tree);
+    let folder = path[path.len() - 1].node;
+    if folder == layouts.anchor
+        || animating.is_some()
+        || relaid.is_some()
+        || !fades.is_empty()
+        || gesture.active()
+        || gesture.has_parent_scene()
+        || !matches!(*bake, Bake::Done)
+    {
+        return;
+    }
+    // 古い座標での基準の本体 `old` が、新しい座標で `new` になる。
+    let old = layouts[folder].frame;
+    let new = anchor_body();
+    let k = new.height() / old.height();
+    let (spec, _) = ear_spec(&settings, &window);
+    *layouts = layout(&tree, folder, new, spec);
+    folder_images.prepare(&tree, &layouts, &mut images);
+
+    let (mut transform, mut projection) = camera.into_inner();
+    let pos = transform.translation.truncate();
+    transform.translation = (new.center() + (pos - old.center()) * k).extend(0.0);
+    if let Projection::Orthographic(ortho) = projection.as_mut() {
+        ortho.scale *= k;
+    }
+    *bake = Bake::Waiting;
+    commands.insert_resource(Relaid { refit: false });
 }
 
 /// 配置し直したあと、カメラを合わせ直して今の場面を作り直す。
@@ -297,15 +345,17 @@ fn show_relayout(
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
 ) {
-    if relaid.is_none() {
+    let Some(relaid) = relaid else {
         return;
-    }
+    };
     maker.commands.remove_resource::<Relaid>();
-    let (pos, scale) = fit(nav.top().frame(&maker.layouts), &window);
-    let (mut transform, mut projection) = camera.into_inner();
-    transform.translation = pos.extend(0.0);
-    if let Projection::Orthographic(ortho) = projection.as_mut() {
-        ortho.scale = scale;
+    if relaid.refit {
+        let (pos, scale) = fit(nav.top().frame(&maker.layouts), &window);
+        let (mut transform, mut projection) = camera.into_inner();
+        transform.translation = pos.extend(0.0);
+        if let Projection::Orthographic(ortho) = projection.as_mut() {
+            ortho.scale = scale;
+        }
     }
     let path = scene_path(&nav, &maker.tree);
     let (_, scene_scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
@@ -431,7 +481,7 @@ fn hit_path(maker: &SceneMaker, nav: &Nav, world: Vec2) -> Vec<NodeId> {
         .children
         .iter()
         .copied()
-        .find(|c| maker.layouts.0[*c].cell.contains(world))
+        .find(|c| maker.layouts[*c].cell.contains(world))
     {
         path.push(child);
         node = child;

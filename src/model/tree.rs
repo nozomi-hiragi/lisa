@@ -166,6 +166,23 @@ impl FileTree {
         tree
     }
 
+    /// テスト用: `levels` 段の深さの木。各段にフォルダ 1 つとファイル 5 つ。
+    #[cfg(test)]
+    pub fn deep(levels: usize) -> Self {
+        let mut entry = dir("底", vec![file("a", 1)]);
+        for i in (0..levels).rev() {
+            let mut children: Vec<Entry> = (0..5).map(|j| file(format!("f{j}"), 1)).collect();
+            children.push(entry);
+            entry = dir(format!("d{i:02}"), children);
+        }
+        let mut tree = FileTree { nodes: Vec::new() };
+        let root = tree.push("Root", 0, None, 0, true);
+        tree.insert(entry, root, 0);
+        tree.sum_sizes(root);
+        tree.sort_children();
+        tree
+    }
+
     fn insert(&mut self, entry: Entry, parent: NodeId, device: usize) {
         match entry {
             Entry::File(name, size) => {
