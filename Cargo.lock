@@ -3185,6 +3185,7 @@ checksum = "413099315636c588ee8f011190b329b971a09a8fae9d157e01dcae8379468514"
 dependencies = [
  "displaydoc",
  "icu_locale_core",
+ "log",
  "serde",
  "stable_deref_trait",
  "writeable",
@@ -3587,7 +3588,11 @@ name = "lisa"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "block2 0.6.2",
  "directories",
+ "icu_provider",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
  "serde",
  "serde_json",
 ]
@@ -3955,7 +3960,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.2",
+ "block2 0.6.2",
  "objc2 0.6.5",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation 0.3.2",
 ]

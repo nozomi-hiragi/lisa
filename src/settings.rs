@@ -8,13 +8,8 @@ use bevy::prelude::*;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::menu::{PopupBody, spawn_menu};
-use crate::scene::LabelFont;
-
-/// リストの行の高さの範囲と刻み（ピクセル）。
-const ROW_HEIGHT_MIN: f32 = 24.0;
-const ROW_HEIGHT_MAX: f32 = 96.0;
-const ROW_HEIGHT_STEP: f32 = 4.0;
+use crate::render::scene::LabelFont;
+use crate::ui::menu::{PopupBody, spawn_menu};
 
 const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
 const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
@@ -22,14 +17,88 @@ const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
 #[derive(Resource, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Settings {
-    /// リストの行の高さ。そのフォルダが画面いっぱいのときのピクセル数。
-    pub row_height_px: f32,
+    /// 開いたフォルダの耳の高さ（画面上のピクセル数）。
+    pub ear_selected_px: f32,
+    /// 一覧の中のフォルダの耳の高さ（その一覧のフォルダを開いたときの、画面上のピクセル数）。
+    pub ear_preview_px: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            row_height_px: 40.0,
+            ear_selected_px: 28.0,
+            ear_preview_px: 16.0,
+        }
+    }
+}
+
+impl Settings {
+    /// 範囲の外の値を直す（手で書き換えた settings.json などのため）。
+    fn sanitized(mut self) -> Self {
+        for item in Item::ALL {
+            let value = item.get(&self);
+            item.set(&mut self, value);
+        }
+        self
+    }
+}
+
+/// ポップアップに並べる項目。どれも −/+ で変える。
+#[derive(Component, Clone, Copy, PartialEq)]
+enum Item {
+    EarSelected,
+    EarPreview,
+}
+
+impl Item {
+    const ALL: [Item; 2] = [Item::EarSelected, Item::EarPreview];
+
+    fn label(self) -> &'static str {
+        match self {
+            Item::EarSelected => "耳の高さ（開いたとき）",
+            Item::EarPreview => "耳の高さ（一覧の中）",
+        }
+    }
+
+    /// 最小、最大、刻み。
+    fn range(self) -> (f32, f32, f32) {
+        match self {
+            Item::EarSelected => (12.0, 64.0, 2.0),
+            Item::EarPreview => (6.0, 48.0, 2.0),
+        }
+    }
+
+    fn get(self, settings: &Settings) -> f32 {
+        match self {
+            Item::EarSelected => settings.ear_selected_px,
+            Item::EarPreview => settings.ear_preview_px,
+        }
+    }
+
+    fn set(self, settings: &mut Settings, value: f32) {
+        let (min, max, _) = self.range();
+        let value = value.clamp(min, max);
+        match self {
+            Item::EarSelected => settings.ear_selected_px = value,
+            Item::EarPreview => settings.ear_preview_px = value,
+        }
+    }
+
+    fn show(self, settings: &Settings) -> String {
+        match self {
+            Item::EarSelected => format!("{} px", settings.ear_selected_px),
+            Item::EarPreview => format!("{} px", settings.ear_preview_px),
+        }
+    }
+
+    /// −/+ を押したとき。値が変わるときだけ書き換える（変わらなければ保存もしない）。
+    fn step(self, settings: &mut Mut<Settings>, direction: f32) {
+        let (_, _, step) = self.range();
+        let mut next = (**settings).clone();
+        let value = self.get(&next) + step * direction;
+        self.set(&mut next, value);
+        if next != **settings {
+            **settings = next;
         }
     }
 }
@@ -48,17 +117,16 @@ fn settings_path() -> Option<PathBuf> {
     ProjectDirs::from("", "", "Lisa").map(|dirs| dirs.config_dir().join("settings.json"))
 }
 
-/// 保存した設定を読む。無いか読めなければ既定値。
+/// 保存した設定を読む。無いか読めなければ既定値。項目が足りなければその項目だけ既定値。
 fn load() -> Settings {
     let Some(path) = settings_path() else {
         return Settings::default();
     };
-    let mut settings: Settings = fs::read_to_string(&path)
+    fs::read_to_string(&path)
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
-    settings.row_height_px = settings.row_height_px.clamp(ROW_HEIGHT_MIN, ROW_HEIGHT_MAX);
-    settings
+        .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+        .unwrap_or_default()
+        .sanitized()
 }
 
 fn save_on_change(settings: Res<Settings>) {
@@ -82,7 +150,7 @@ fn save_on_change(settings: Res<Settings>) {
 
 /// 今の値を表示する文字。
 #[derive(Component)]
-struct RowHeightValue;
+struct ValueText(Item);
 
 fn spawn_settings_ui(
     mut commands: Commands,
@@ -106,62 +174,89 @@ fn spawn_settings_ui(
     };
 
     commands.entity(*body).with_children(|body| {
-        body.spawn(Node {
-            align_items: AlignItems::Center,
-            column_gap: Val::Px(8.0),
-            ..default()
-        })
-        .with_children(|row| {
-            row.spawn((
-                Text::new("リストの行の高さ"),
-                text_font.clone(),
-                TextColor(TEXT_COLOR),
-                Node {
-                    flex_grow: 1.0,
-                    ..default()
-                },
-            ));
-            row.spawn(button("−")).observe(
-                |_: On<PointerClick>, mut settings: ResMut<Settings>| {
-                    change_row_height(&mut settings, -ROW_HEIGHT_STEP);
-                },
-            );
-            row.spawn((
-                RowHeightValue,
-                Text::new(""),
-                text_font.clone(),
-                TextColor(TEXT_COLOR),
-                Node {
-                    width: Val::Px(56.0),
-                    justify_content: JustifyContent::Center,
-                    ..default()
-                },
-                TextLayout::justify(Justify::Center),
-            ));
-            row.spawn(button("+")).observe(
-                |_: On<PointerClick>, mut settings: ResMut<Settings>| {
-                    change_row_height(&mut settings, ROW_HEIGHT_STEP);
-                },
-            );
-        });
+        for item in Item::ALL {
+            body.spawn(Node {
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                ..default()
+            })
+            .with_children(|row| {
+                row.spawn((
+                    Text::new(item.label()),
+                    text_font.clone(),
+                    TextColor(TEXT_COLOR),
+                    Node {
+                        flex_grow: 1.0,
+                        margin: UiRect::right(Val::Px(16.0)),
+                        ..default()
+                    },
+                ));
+                row.spawn(button("−")).observe(
+                    move |_: On<PointerClick>, mut settings: ResMut<Settings>| {
+                        item.step(&mut settings.reborrow(), -1.0);
+                    },
+                );
+                row.spawn((
+                    ValueText(item),
+                    Text::new(""),
+                    text_font.clone(),
+                    TextColor(TEXT_COLOR),
+                    Node {
+                        width: Val::Px(56.0),
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                    TextLayout::justify(Justify::Center),
+                ));
+                row.spawn(button("+")).observe(
+                    move |_: On<PointerClick>, mut settings: ResMut<Settings>| {
+                        item.step(&mut settings.reborrow(), 1.0);
+                    },
+                );
+            });
+        }
     });
-}
-
-fn change_row_height(settings: &mut Settings, delta: f32) {
-    let value = (settings.row_height_px + delta).clamp(ROW_HEIGHT_MIN, ROW_HEIGHT_MAX);
-    if value != settings.row_height_px {
-        settings.row_height_px = value;
-    }
 }
 
 fn show_values(
     settings: Res<Settings>,
-    mut text: Single<&mut Text, With<RowHeightValue>>,
+    mut texts: Query<(&ValueText, &mut Text)>,
     mut shown: Local<bool>,
 ) {
     if !settings.is_changed() && *shown {
         return;
     }
     *shown = true;
-    text.0 = format!("{} px", settings.row_height_px);
+    for (value, mut text) in &mut texts {
+        text.0 = value.0.show(&settings);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_file_still_loads() {
+        // 今は使わない項目（行の高さ、しきい値など）が入った古い settings.json。
+        // 足りない項目は既定値になる。
+        let settings: Settings = serde_json::from_str(
+            r#"{ "row_height_px": 48.0, "snap_in_percent": 40.0, "ear_preview_px": 20.0 }"#,
+        )
+        .unwrap();
+        assert_eq!(settings.ear_preview_px, 20.0);
+        assert_eq!(
+            settings.ear_selected_px,
+            Settings::default().ear_selected_px
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped() {
+        let settings: Settings =
+            serde_json::from_str(r#"{ "ear_selected_px": 500.0, "ear_preview_px": 1.0 }"#).unwrap();
+        let settings = settings.sanitized();
+        assert_eq!(settings.ear_selected_px, 64.0);
+        assert_eq!(settings.ear_preview_px, 6.0);
+    }
 }

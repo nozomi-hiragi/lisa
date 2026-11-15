@@ -1,6 +1,6 @@
 //! 四角・三角・円・画像・文字を、ひとつの場面（シーン）の子として描く道具。
 
-use bevy::camera::visibility::RenderLayers;
+use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
@@ -26,9 +26,19 @@ pub struct Painter<'a, 'w, 's> {
     /// 1 論理ピクセルあたりのワールド座標の長さ（この倍率で見たときに合わせて描く）。
     pub scale: f32,
     pub font: Handle<Font>,
+    /// true なら、これから描くものを視錐台カリングしない（見えているのに消えてちらつくのを防ぐ）。
+    pub no_cull: bool,
 }
 
 impl Painter<'_, '_, '_> {
+    /// 部品を作る。`no_cull` なら視錐台カリングしない印を付ける。
+    pub fn spawn_part(&mut self, bundle: impl Bundle) {
+        let mut entity = self.commands.spawn(bundle);
+        if self.no_cull {
+            entity.insert(NoFrustumCulling);
+        }
+    }
+
     fn visibility(&self, min_size: f32, min_px: f32) -> Visibility {
         if min_size / self.scale >= min_px {
             Visibility::Inherited
@@ -48,7 +58,7 @@ impl Painter<'_, '_, '_> {
 
     pub fn rect(&mut self, rect: Rect, color: Color, z: f32) {
         let common = self.common(color, rect.width().min(rect.height()));
-        self.commands.spawn((
+        self.spawn_part((
             common,
             Sprite::from_color(color, rect.size()),
             Transform::from_translation(rect.center().extend(z)),
@@ -57,7 +67,7 @@ impl Painter<'_, '_, '_> {
 
     pub fn image(&mut self, rect: Rect, image: Handle<Image>, z: f32) {
         let common = self.common(Color::WHITE, rect.width().min(rect.height()));
-        self.commands.spawn((
+        self.spawn_part((
             common,
             Sprite {
                 image,
@@ -90,7 +100,7 @@ impl Painter<'_, '_, '_> {
             ..default()
         });
         let common = self.common(color, min_size);
-        self.commands.spawn((
+        self.spawn_part((
             common,
             Mesh2d(mesh),
             MeshMaterial2d(material),
@@ -116,7 +126,7 @@ impl Painter<'_, '_, '_> {
         if px < MIN_LABEL_PX {
             return;
         }
-        self.commands.spawn((
+        self.spawn_part((
             ChildOf(self.parent),
             self.layer.clone(),
             BaseAlpha(color.alpha()),
@@ -132,7 +142,7 @@ impl Painter<'_, '_, '_> {
 }
 
 /// 文字列の幅の見積もり。日本語はほぼ正方形、英数字はその半分強。
-fn em_width(text: &str) -> f32 {
+pub fn em_width(text: &str) -> f32 {
     text.chars()
         .map(|c| if c.is_ascii() { 0.6 } else { 1.0 })
         .sum()

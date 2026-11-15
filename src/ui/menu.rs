@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 
-use crate::scene::LabelFont;
+use crate::render::scene::LabelFont;
 
 /// メニューバーの高さ（論理ピクセル）。ズームの目標はこの下の領域に合わせる。
 pub const BAR_PX: f32 = 32.0;

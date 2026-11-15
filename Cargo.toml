@@ -6,8 +6,16 @@ edition = "2024"
 [dependencies]
 bevy = "0.20.1"
 directories = "6.0.0"
+# 日本語・中国語の改行位置データが無いという警告を、eprintln ではなくログとして出させて止めるため
+# （main.rs のログの絞り込みと README の「既知の課題」を参照）。
+icu_provider = { version = "2.4.0", features = ["logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-core-foundation", "NSEvent"] }
 
 [profile.dev]
 opt-level = 1
