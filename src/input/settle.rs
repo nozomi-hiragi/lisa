@@ -378,7 +378,9 @@ pub(super) fn nearest(
     scale: f32,
 ) -> ((Target, Vec2, f32), f32, f32) {
     let candidates = targets(nav, maker, window, pos);
-    let close = |(_, p, s): &(Target, Vec2, f32)| closeness(pos, scale, *p, *s, window.width());
+    let close = |(_, p, s): &(Target, Vec2, f32)| {
+        closeness(pos, scale, *p, *s, crate::view::view_width(window))
+    };
     // 今開いているものの近さ（収める大きさと、中を拡大して見る段のうち、いちばん近いもの）。
     let current = candidates
         .iter()

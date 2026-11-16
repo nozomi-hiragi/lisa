@@ -538,7 +538,7 @@ fn begin(state: &mut Gesture, pos: Vec2, scale: f32) {
 }
 /// 今の枠に対して、カメラが動いてよい範囲（メニューバーの下の領域の中心の範囲）。
 fn bounds(frame: Rect, window: &Window, scale: f32) -> Rect {
-    let half = Vec2::new(window.width(), window.height() - BAR_PX) / 2.0 * scale;
+    let half = Vec2::new(crate::view::view_width(window), window.height() - BAR_PX) / 2.0 * scale;
     let min = frame.min + half;
     let max = frame.max - half;
     // 枠より画面のほうが広ければ、真ん中に固定する。
@@ -587,7 +587,7 @@ fn constrain(
     if let Some(parent) = parent {
         area = area.union(bounds(parent.frame(&maker.layouts), window, scale));
     }
-    let size = Vec2::new(window.width(), window.height() - BAR_PX) * scale;
+    let size = Vec2::new(crate::view::view_width(window), window.height() - BAR_PX) * scale;
     // 隣があれば、その範囲へは重さなしで動ける。無い方向だけ重くなる。
     let area = siblings.map_or(area, |s| area.union(s.area));
     let clamped = view_center.clamp(area.min, area.max);

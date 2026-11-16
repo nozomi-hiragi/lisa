@@ -22,6 +22,9 @@ pub(super) struct ZoomGoal {
     pub(super) grid: bool,
 }
 
+/// 中を拡大して見る段の数の上限。
+const MAX_GRID_LEVELS: usize = 1000;
+
 /// フォルダの中を拡大して見るときに止まれる倍率（小さい順）。ウィンドウの短い辺の向きに、タイルが
 /// 見切れずにちょうど k 個（隙間込み）収まる倍率を、k = 2 から、全体を収めたときの個数より 1 少ない
 /// 数まで並べる。全体や 1 つ（子を収めた大きさ）とほとんど同じ大きさのものは除く。
@@ -41,16 +44,20 @@ pub(super) fn grid_levels(maker: &SceneMaker, window: &Window, folder: NodeId) -
         .filter(|_| columns > 1)
         .map_or(0.0, |c| maker.layouts[*c].cell.min.x - cell.max.x);
     let pitch = Vec2::new(cell.width() + gap, cell.height() + gap);
-    let view = Vec2::new(window.width(), window.height() - BAR_PX);
+    let view = Vec2::new(crate::view::view_width(window), window.height() - BAR_PX);
     let (length, pitch_along) = if view.y <= view.x {
         (view.y, pitch.y)
     } else {
         (view.x, pitch.x)
     };
+    // 子がまだ並べていない（大きさ 0）なら、段は無い（割ると個数が無限になって固まる）。
+    if !(pitch_along > 0.0 && length > 0.0) {
+        return Vec::new();
+    }
     let whole = fit(maker.layouts[folder].fit, window).1;
     let one = fit(maker.layouts[first].fit, window).1;
-    // 全体を収めたとき、短い辺の向きに並ぶ個数。
-    let most = (length * whole / pitch_along).floor() as usize;
+    // 全体を収めたとき、短い辺の向きに並ぶ個数（多すぎても段は見分けられないので上限を付ける）。
+    let most = ((length * whole / pitch_along).floor() as usize).min(MAX_GRID_LEVELS);
     (2..most.max(2))
         .map(|k| k as f32 * pitch_along / length)
         .filter(|s| *s < whole * 0.95 && *s > one * 1.1)
@@ -159,7 +166,7 @@ pub(super) fn grid_snap(
         .get(1)
         .filter(|_| columns > 1)
         .map_or(0.0, |c| maker.layouts[*c].cell.min.x - cell.max.x);
-    let view = Vec2::new(window.width(), window.height() - BAR_PX) * scale;
+    let view = Vec2::new(crate::view::view_width(window), window.height() - BAR_PX) * scale;
     let center = pos - offset;
     // 列の左右の端と、行の上下の端（隙間の真ん中）。
     let cells: Vec<Rect> = children.iter().map(|c| maker.layouts[*c].cell).collect();

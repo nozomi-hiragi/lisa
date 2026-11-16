@@ -110,18 +110,25 @@ impl Plugin for ScanPlugin {
             .add_systems(Startup, start_workers)
             .add_systems(
                 Update,
-                (receive, load_visible)
+                (receive, load_visible, resolve_jump)
                     .chain()
                     .before(crate::view::ViewSystems),
             );
     }
 }
 
-/// DB を開く（設定と同じ場所のデータのフォルダ）。開けなければ残さずに動く。
+/// DB の場所（設定と同じ、アプリのデータのフォルダ）。
+pub fn db_path() -> Option<PathBuf> {
+    Some(
+        directories::ProjectDirs::from("", "", "Lisa")?
+            .data_dir()
+            .join("lisa.db"),
+    )
+}
+
+/// DB を開く。開けなければ残さずに動く。
 fn open_db() -> Option<Db> {
-    let path = directories::ProjectDirs::from("", "", "Lisa")?
-        .data_dir()
-        .join("lisa.db");
+    let path = db_path()?;
     match Db::open(&path) {
         Ok(db) => {
             info!("DB: {}", path.display());
@@ -546,42 +553,114 @@ fn load_visible(
     }
     let mut reader = store.reader.as_ref().and_then(|r| r.lock().ok());
     for id in wanted {
-        let path = tree.nodes[id].path.clone().expect("パスのあるフォルダ");
-        if let Some(result) = scanner.recent.remove(&path) {
-            tree.add_listing(id, result);
-        } else {
-            let Some(db) = reader.as_deref_mut() else {
-                continue;
-            };
-            let Some((drive_id, mount)) = drive_of(&tree, &store, id) else {
-                continue;
-            };
-            let entry = match tree.nodes[id].entry {
-                Some(entry) => Some(entry),
-                None => db.find_folder(&drive_id, &mount, &path).unwrap_or(None),
-            };
-            let Some(entry) = entry else {
-                continue;
-            };
-            match db.children(entry) {
-                Ok(rows) => {
-                    let (recent, hashed) = (&scanner.recent, &scanner.hashed);
-                    tree.add_stored_children(
-                        id,
-                        rows,
-                        |p| recent.contains_key(p),
-                        |p| hashed.contains(p),
-                    );
-                }
-                Err(error) => {
-                    warn!("DB から読めませんでした（{}）: {error}", path.display());
-                    continue;
-                }
-            }
-        }
-        scanner.track_children(&tree, id);
+        load_children(&mut tree, &store, reader.as_deref_mut(), scanner, id);
     }
     changed.pending = true;
+}
+
+/// フォルダ `id` の子を、まだ確定していない結果か DB から 1 段出す。出せたら true。
+fn load_children(
+    tree: &mut FileTree,
+    store: &Store,
+    db: Option<&mut Db>,
+    scanner: &mut Scanner,
+    id: NodeId,
+) -> bool {
+    let Some(path) = tree.nodes[id].path.clone() else {
+        return false;
+    };
+    if let Some(result) = scanner.recent.remove(&path) {
+        tree.add_listing(id, result);
+    } else {
+        let Some(db) = db else {
+            return false;
+        };
+        let Some((drive_id, mount)) = drive_of(tree, store, id) else {
+            return false;
+        };
+        let entry = match tree.nodes[id].entry {
+            Some(entry) => Some(entry),
+            None => db.find_folder(&drive_id, &mount, &path).unwrap_or(None),
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        match db.children(entry) {
+            Ok(rows) => {
+                let (recent, hashed) = (&scanner.recent, &scanner.hashed);
+                tree.add_stored_children(
+                    id,
+                    rows,
+                    |p| recent.contains_key(p),
+                    |p| hashed.contains(p),
+                );
+            }
+            Err(error) => {
+                warn!("DB から読めませんでした（{}）: {error}", path.display());
+                return false;
+            }
+        }
+    }
+    scanner.track_children(tree, id);
+    true
+}
+
+/// 行きたい場所（DB の `entry.id` の列。ドライブの一番上から）。`resolve_jump` が木の上のノードの
+/// 道のりにする（足りない子は DB から出す）。
+#[derive(Resource)]
+pub struct JumpTo(pub Vec<i64>);
+
+/// 行きたい場所の、Root からの道のり（`view.rs` の `jump` が開く）。
+#[derive(Resource)]
+pub struct JumpPath(pub Vec<NodeId>);
+
+/// `JumpTo` を木の上の道のりにする。
+fn resolve_jump(
+    mut commands: Commands,
+    jump: Option<Res<JumpTo>>,
+    scanner: Option<ResMut<Scanner>>,
+    store: Res<Store>,
+    mut tree: ResMut<FileTree>,
+    mut changed: ResMut<TreeChanged>,
+) {
+    let (Some(jump), Some(mut scanner)) = (jump, scanner) else {
+        return;
+    };
+    commands.remove_resource::<JumpTo>();
+    let chain = &jump.0;
+    // 一番上は、ドライブのノード（`entry` が chain[0]）。
+    let Some(mut node) =
+        (0..tree.nodes.len()).find(|&i| tree.nodes[i].entry == chain.first().copied())
+    else {
+        warn!("行き先のドライブが木にありません");
+        return;
+    };
+    let mut reader = store.reader.as_ref().and_then(|r| r.lock().ok());
+    for &entry in &chain[1..] {
+        if !tree.nodes[node].loaded
+            && !load_children(&mut tree, &store, reader.as_deref_mut(), &mut scanner, node)
+        {
+            warn!("行き先の途中を DB から出せませんでした");
+            return;
+        }
+        let Some(child) = tree.nodes[node]
+            .children
+            .iter()
+            .copied()
+            .find(|&c| tree.nodes[c].entry == Some(entry))
+        else {
+            warn!("行き先が木にありません（読み直しが要るかもしれません）");
+            return;
+        };
+        node = child;
+    }
+    let mut path = vec![node];
+    while let Some(parent) = tree.nodes[path[path.len() - 1]].parent {
+        path.push(parent);
+    }
+    path.reverse();
+    changed.pending = true;
+    commands.insert_resource(JumpPath(path));
 }
 
 /// ノード `id` があるドライブの（DB の ID、つないでいる場所）。DB に残さないドライブなら None。

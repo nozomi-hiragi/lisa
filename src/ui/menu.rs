@@ -75,17 +75,37 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                 text_font.clone(),
                 TextColor(TEXT_COLOR),
             ));
-            bar.spawn((
-                Node {
-                    padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(BUTTON_COLOR),
-                children![(Text::new("設定"), text_font.clone(), TextColor(TEXT_COLOR))],
-            ))
-            .observe(|_: On<PointerClick>, mut popup: ResMut<Popup>| {
-                popup.open = !popup.open;
+            let button = || {
+                (
+                    Node {
+                        padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
+                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                        ..default()
+                    },
+                    BackgroundColor(BUTTON_COLOR),
+                )
+            };
+            bar.spawn(Node {
+                column_gap: Val::Px(8.0),
+                ..default()
+            })
+            .with_children(|buttons| {
+                buttons
+                    .spawn((
+                        button(),
+                        children![(Text::new("重複"), text_font.clone(), TextColor(TEXT_COLOR))],
+                    ))
+                    .observe(|_: On<PointerClick>, mut dups: ResMut<crate::dups::Dups>| {
+                        dups.open = !dups.open;
+                    });
+                buttons
+                    .spawn((
+                        button(),
+                        children![(Text::new("設定"), text_font.clone(), TextColor(TEXT_COLOR))],
+                    ))
+                    .observe(|_: On<PointerClick>, mut popup: ResMut<Popup>| {
+                        popup.open = !popup.open;
+                    });
             });
         });
 

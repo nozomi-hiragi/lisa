@@ -5,4 +5,5 @@ edition = "2024"
 description = "lisa-core を Bevy なしで試す CLI"
 
 [dependencies]
+directories = "6.0.0"
 lisa-core = { path = "../lisa-core" }

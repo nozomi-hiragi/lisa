@@ -30,7 +30,8 @@ mod title;
 
 pub use camera::Busy;
 pub(crate) use camera::{
-    Animating, Ease, MainCamera, ZOOM_SECONDS, animate_camera, fit, keep_redrawing, refit_on_resize,
+    Animating, Ease, MainCamera, ZOOM_SECONDS, animate_camera, fit, keep_redrawing,
+    refit_on_resize, set_side_px, side_px, view_width,
 };
 pub(crate) use fade::{Fade, fade_scenes};
 pub use title::TitleSuffix;
@@ -71,12 +72,14 @@ impl Plugin for TreeViewPlugin {
             (
                 cache::bake,
                 show_baked,
+                jump,
                 relayout,
                 reanchor,
                 show_relayout,
                 navigate,
                 crate::input::gesture::gesture,
                 refit_on_resize,
+                follow_side_panel,
                 animate_camera,
                 update_ears,
                 fade_scenes,
@@ -130,6 +133,7 @@ pub(crate) struct SceneMaker<'w, 's> {
     pub(crate) images: Res<'w, FolderImages>,
     pub(crate) font: Res<'w, LabelFont>,
     pub(crate) ears: Res<'w, EarSizes>,
+    pub(crate) highlight: Res<'w, crate::dups::DupHighlight>,
 }
 
 impl SceneMaker<'_, '_> {
@@ -154,6 +158,7 @@ impl SceneMaker<'_, '_> {
             images: &self.images,
             font: &self.font.0,
             ears: &self.ears,
+            highlight: Some(&self.highlight),
         };
         scene::spawn(
             &mut self.commands,
@@ -190,9 +195,20 @@ fn setup(
     folder_images.prepare(&tree, &layouts, &mut images);
 
     let (pos, scale) = fit(layouts[FileTree::ROOT].frame, &window);
+    // UI（メニューバーや一覧）は、木を映すカメラとは別のカメラで、ウィンドウ全体に描く
+    // （木のカメラは、右の一覧が開くと映す領域を狭めるため）。
+    commands.spawn((
+        IsDefaultUiCamera,
+        Camera2d,
+        Camera {
+            order: 10,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        RenderLayers::none(),
+    ));
     commands.spawn((
         MainCamera,
-        IsDefaultUiCamera,
         Camera2d,
         Projection::Orthographic(OrthographicProjection {
             scale,
@@ -208,6 +224,7 @@ fn setup(
         images: &folder_images,
         font: &font,
         ears: &ears,
+        highlight: None,
     };
     let root_scene = scene::spawn(
         &mut commands,
@@ -248,6 +265,93 @@ fn ear_spec(settings: &Settings, window: &Window) -> (EarSpec, EarSizes) {
 #[derive(Resource)]
 struct Relaid {
     refit: bool,
+}
+
+/// 右の一覧が開け閉めされたら、木を映す領域（カメラの viewport）を狭め、今のものを収め直す。
+fn follow_side_panel(
+    mut last: Local<(f32, UVec2)>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&mut Camera, &mut Transform, &mut Projection), With<MainCamera>>,
+    layouts: Res<Layouts>,
+    nav: Res<Nav>,
+    animating: Option<Res<Animating>>,
+    gesture: Res<crate::input::gesture::Gesture>,
+) {
+    let side = side_px();
+    let now = (side, window.physical_size());
+    if now == *last {
+        return;
+    }
+    *last = now;
+    let (mut camera, mut transform, mut projection) = camera.into_inner();
+    camera.viewport = if side > 0.0 {
+        let factor = window.scale_factor();
+        let size = UVec2::new(
+            (view_width(&window) * factor).round() as u32,
+            window.physical_height(),
+        );
+        Some(bevy::camera::Viewport {
+            physical_position: UVec2::ZERO,
+            physical_size: size.max(UVec2::ONE),
+            ..default()
+        })
+    } else {
+        None
+    };
+    // 動かしている最中は、そのまま（止まったあとの収め直しに任せる）。
+    if animating.is_some() || gesture.active() {
+        return;
+    }
+    let (pos, scale) = fit(nav.top().frame(&layouts), &window);
+    transform.translation = pos.extend(0.0);
+    if let Projection::Orthographic(ortho) = projection.as_mut() {
+        ortho.scale = scale;
+    }
+}
+
+/// 一覧から選んだ場所（`scan::JumpPath`）へ飛ぶ。その場所を含むフォルダを基準に並べ直し、
+/// カメラをその場所に合わせる（ズームの動きはしない）。動いている最中は、終わるまで待つ。
+#[allow(clippy::too_many_arguments)]
+fn jump(
+    mut commands: Commands,
+    jump: Option<Res<crate::scan::JumpPath>>,
+    settings: Res<Settings>,
+    tree: Res<FileTree>,
+    mut nav: ResMut<Nav>,
+    mut layouts: ResMut<Layouts>,
+    mut folder_images: ResMut<FolderImages>,
+    mut images: ResMut<Assets<Image>>,
+    mut bake: ResMut<Bake>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    animating: Option<Res<Animating>>,
+    fades: Query<(), With<Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
+) {
+    let Some(jump) = jump else {
+        return;
+    };
+    if animating.is_some()
+        || !fades.is_empty()
+        || gesture.active()
+        || gesture.has_parent_scene()
+        || !matches!(*bake, Bake::Done)
+    {
+        return;
+    }
+    commands.remove_resource::<crate::scan::JumpPath>();
+    let Some(&target) = jump.0.last() else {
+        return;
+    };
+    nav.stack = jump.0.iter().map(|&node| Level { node }).collect();
+    let scene = scene_path(&nav, &tree);
+    let anchor = scene[scene.len() - 1].node;
+    let (spec, ears) = ear_spec(&settings, &window);
+    *layouts = layout(&tree, anchor, anchor_body(), spec);
+    folder_images.prepare(&tree, &layouts, &mut images);
+    commands.insert_resource(ears);
+    show_breadcrumb(&mut commands, &tree, target);
+    *bake = Bake::Waiting;
+    commands.insert_resource(Relaid { refit: true });
 }
 
 /// 大きさの設定が変わったら、木を配置し直し、画像を焼き直す。
@@ -399,7 +503,10 @@ fn scene_levels<'a>(stack: &'a [Level], tree: &FileTree) -> &'a [Level] {
 
 /// メニューバーの上やポップアップを操作しているときは、下の画面は操作しない。
 pub(crate) fn ui_has_pointer(window: &Window, popup: &Popup) -> bool {
-    popup.open || window.cursor_position().is_some_and(|p| p.y < BAR_PX)
+    popup.open
+        || window
+            .cursor_position()
+            .is_some_and(|p| p.y < BAR_PX || p.x > view_width(window))
 }
 
 /// 画像が焼き上がったら、今の場面を作り直して画像を使う。
