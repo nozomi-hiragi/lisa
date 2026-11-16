@@ -1,0 +1,10 @@
+[package]
+name = "lisa-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "Lisa を MCP（Model Context Protocol）で使うためのサーバー（stdio）"
+
+[dependencies]
+directories = "6.0.0"
+lisa-core = { path = "../lisa-core" }
+serde_json = "1.0.154"

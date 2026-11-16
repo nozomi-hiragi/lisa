@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-# スキャンの中身（Bevy に依存しない）と、それを試す CLI。`cargo run` は今までどおりアプリを動かす。
-members = ["crates/lisa-core", "crates/lisa-scan"]
+# スキャンの中身（Bevy に依存しない）と、それを試す CLI、MCP のサーバー。`cargo run` は今までどおりアプリを動かす。
+members = ["crates/lisa-core", "crates/lisa-scan", "crates/lisa-mcp"]
 default-members = ["."]
 
 [dependencies]

@@ -3672,9 +3672,19 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "rusqlite",
  "serde",
+ "serde_json",
  "unicode-normalization",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "lisa-mcp"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "lisa-core",
+ "serde_json",
 ]
 
 [[package]]

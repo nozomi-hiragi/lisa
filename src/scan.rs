@@ -291,7 +291,7 @@ fn watch(
 
 impl ScanControl {
     /// 見ているフォルダを、裏の分より先に読んで（読み終えていなければ）ハッシュしてもらう。
-    fn visible(&self, path: PathBuf) {
+    pub(crate) fn visible(&self, path: PathBuf) {
         let sent = self
             .requests
             .lock()

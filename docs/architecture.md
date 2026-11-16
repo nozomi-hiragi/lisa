@@ -33,12 +33,16 @@ src/
   ui/menu.rs               メニューバーと設定のポップアップ（Bevy UI）
   settings.rs              設定（settings.json への保存と、ポップアップの項目）
   debug.rs                 デバッグビルドで FPS をタイトルに出す
+  remote.rs                外（lisa-mcp）からの頼みを受けて画面を動かす（飛ぶ、重複の一覧、読み直し、一時停止）
 crates/lisa-core/          スキャンの中身（Bevy に依存しない）
   src/listing.rs           フォルダを 1 段読む（種類、大きさ、日時、リンク先、クラウドのみ、別のボリューム）
   src/name.rs              名前（ディスク上のバイト列、NFC、フォルダのハッシュと同じ並び、OS のゴミ）
   src/cloud.rs             Mac: クラウドにだけあるファイルを読んでもダウンロードしない設定
   src/volumes.rs           つながっているドライブの一覧（ID、名前、ファイルシステム、容量、外付けか）
+  src/query.rs             DB を外から読む問い合わせ（パスから道のり、名前で探す、同じハッシュ）
+  src/remote.rs            起動中のアプリを外から動かす口（127.0.0.1 と control.json、1 行の JSON）
 crates/lisa-scan/          lisa-core を Bevy なしで試す CLI
+crates/lisa-mcp/           MCP のサーバー（標準入出力。DB を読む道具と、アプリを動かす道具）
 docs/                      このドキュメント
 assets/fonts/              Noto Sans JP と、そのライセンス
 ```
