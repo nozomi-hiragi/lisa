@@ -30,11 +30,29 @@ pub(crate) struct Animating {
     pub(crate) ease: Ease,
 }
 
+/// 右に開いている一覧の幅（論理ピクセル、`f32` のビット列）。その分だけ、木を映す領域が狭くなる。
+static SIDE_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 右に開いている一覧の幅（論理ピクセル）。
+pub(crate) fn side_px() -> f32 {
+    f32::from_bits(SIDE_PX.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// 右に開いている一覧の幅を変える（`ui/dups.rs` が開け閉めの動きに合わせて呼ぶ）。
+pub(crate) fn set_side_px(px: f32) {
+    SIDE_PX.store(px.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 木を映す領域の幅（ウィンドウから右の一覧を除いたもの）。
+pub(crate) fn view_width(window: &Window) -> f32 {
+    (window.width() - side_px()).max(1.0)
+}
+
 /// `rect` がメニューバーの下の領域いっぱいに収まるカメラの位置と倍率。
 pub(crate) fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
     let view_height = window.height() - BAR_PX;
     // 周りに少し余白を残す（外側のフォルダの色が見え、耳も端に貼りつかない）。
-    let scale = (rect.width() / window.width()).max(rect.height() / view_height)
+    let scale = (rect.width() / view_width(window)).max(rect.height() / view_height)
         * crate::layout::FIT_MARGIN;
     // 画面の中心より、バーの高さの半分だけ下に枠の中心が来るようにする。
     (rect.center() + Vec2::new(0.0, BAR_PX / 2.0 * scale), scale)

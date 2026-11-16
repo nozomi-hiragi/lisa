@@ -41,7 +41,7 @@ pub(super) fn grid_levels(maker: &SceneMaker, window: &Window, folder: NodeId) -
         .filter(|_| columns > 1)
         .map_or(0.0, |c| maker.layouts[*c].cell.min.x - cell.max.x);
     let pitch = Vec2::new(cell.width() + gap, cell.height() + gap);
-    let view = Vec2::new(window.width(), window.height() - BAR_PX);
+    let view = Vec2::new(crate::view::view_width(window), window.height() - BAR_PX);
     let (length, pitch_along) = if view.y <= view.x {
         (view.y, pitch.y)
     } else {
@@ -159,7 +159,7 @@ pub(super) fn grid_snap(
         .get(1)
         .filter(|_| columns > 1)
         .map_or(0.0, |c| maker.layouts[*c].cell.min.x - cell.max.x);
-    let view = Vec2::new(window.width(), window.height() - BAR_PX) * scale;
+    let view = Vec2::new(crate::view::view_width(window), window.height() - BAR_PX) * scale;
     let center = pos - offset;
     // 列の左右の端と、行の上下の端（隙間の真ん中）。
     let cells: Vec<Rect> = children.iter().map(|c| maker.layouts[*c].cell).collect();

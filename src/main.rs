@@ -1,5 +1,6 @@
 #[cfg(debug_assertions)]
 mod debug;
+mod dups;
 mod input;
 mod layout;
 mod model;
@@ -38,6 +39,8 @@ fn main() {
         view::TreeViewPlugin,
         ui::menu::MenuPlugin,
         ui::progress::ProgressPlugin,
+        ui::dups::DupsPanelPlugin,
+        dups::DupsPlugin,
     ));
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);

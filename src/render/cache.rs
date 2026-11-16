@@ -475,6 +475,8 @@ fn start_baking(
         images,
         font: &font.0,
         ears,
+        // 重複の印は画像に焼かない（選ぶたびに変わるので、本物の場面にだけ描く）。
+        highlight: None,
     };
     let mut entities = Vec::new();
     for (i, (id, image)) in handles.into_iter().enumerate() {

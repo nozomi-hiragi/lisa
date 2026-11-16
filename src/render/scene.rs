@@ -29,6 +29,8 @@ pub struct SceneSource<'a> {
     pub images: &'a FolderImages,
     pub font: &'a Handle<Font>,
     pub ears: &'a EarSizes,
+    /// 重複の一覧で選んだ組の印（本物の場面だけ）。
+    pub highlight: Option<&'a crate::dups::DupHighlight>,
 }
 
 /// フォルダ `folder` の場面を作る。`scale` はこの倍率で見たときにくっきり見えるように作る。
@@ -168,6 +170,7 @@ fn draw_children(
                 );
             });
             ear::draw_ear(painter, slot, size, &child_node.name, color, z);
+            mark_duplicate(painter, source, child, slot, size, z);
         } else {
             in_group(painter, slot, size, |painter| {
                 status::draw_file(
@@ -183,9 +186,48 @@ fn draw_children(
             // 名前はプレビューの下に、同じフォルダの中のフォルダの耳の名前と同じ大きさで書く。
             let color = over(background, Color::WHITE, 0.9);
             ear::draw_name(painter, slot, size, &child_node.name, color, z);
+            mark_duplicate(painter, source, child, slot, size, z);
         }
     }
     painter.no_cull = true;
+}
+
+/// 重複の印の色（暖かい黄色。読み込み中の青い光とは別の色）。
+const DUPLICATE: Color = Color::srgb(0.949, 0.784, 0.443);
+
+/// 重複の一覧で選んだ組のコピーなら太い枠と薄い色、コピーを中に含むなら細い枠を描く。
+fn mark_duplicate(
+    painter: &mut Painter,
+    source: &SceneSource,
+    id: NodeId,
+    slot: ear::Slot,
+    size: ear::Size,
+    z: f32,
+) {
+    let Some(highlight) = source.highlight else {
+        return;
+    };
+    let copy = highlight.copies.contains(&id);
+    if !copy && !highlight.around.contains(&id) {
+        return;
+    }
+    let frame = source.layouts[id].frame;
+    in_group(painter, slot, size, |painter| {
+        if copy {
+            painter.rect(frame, DUPLICATE.with_alpha(0.18), z + 0.4);
+        }
+        let k = if copy { 0.05 } else { 0.02 };
+        let w = (frame.height() * k).max(painter.scale * if copy { 3.0 } else { 1.5 });
+        let (min, max) = (frame.min, frame.max);
+        for rect in [
+            Rect::new(min.x, min.y, max.x, min.y + w),
+            Rect::new(min.x, max.y - w, max.x, max.y),
+            Rect::new(min.x, min.y + w, min.x + w, max.y - w),
+            Rect::new(max.x - w, min.y + w, max.x, max.y - w),
+        ] {
+            painter.rect(rect, DUPLICATE, z + 0.45);
+        }
+    });
 }
 
 /// 耳に譲って縮む入れ物の中に描く。
