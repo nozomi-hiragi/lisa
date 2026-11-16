@@ -125,7 +125,8 @@ pub fn bake(
             };
             let mut entities = Vec::new();
             for (i, (&id, image)) in images.images.iter().enumerate() {
-                let layer = RenderLayers::layer(i + 1);
+                // `layer` は const で 64 個までしか作れないので、`from_layers` を使う。
+                let layer = RenderLayers::from_layers(&[i + 1]);
                 let frame = layouts[id].frame;
                 let scale = frame.width() / IMAGE_WIDTH as f32;
                 entities.push(scene::spawn(
