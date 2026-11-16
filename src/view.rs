@@ -56,6 +56,7 @@ impl Plugin for TreeViewPlugin {
             }],
         })
         .insert_resource(Bake::Waiting)
+        .insert_resource(cache::ImageCache::new())
         .insert_resource(Breadcrumb("Root".into()))
         .init_resource::<Busy>()
         .init_resource::<crate::render::status::PulseClock>()
@@ -297,10 +298,6 @@ fn relayout(
     let anchor = layouts.anchor;
     *layouts = layout(&tree, anchor, layouts[anchor].frame, spec);
     folder_images.prepare(&tree, &layouts, &mut images);
-    if refit {
-        // 耳の高さが変わると、画像の中の子の大きさも変わる。
-        folder_images.mark_all();
-    }
     commands.insert_resource(ears);
 
     *bake = Bake::Waiting;

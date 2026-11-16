@@ -27,7 +27,6 @@ use lisa_core::listing::{self, Kind, Listing};
 
 use crate::layout::Layouts;
 use crate::model::tree::{FileTree, NodeId};
-use crate::render::cache::FolderImages;
 
 /// 1 フレームで木に足す結果の数の上限（一度にたくさん届いても固まらないように）。
 const APPLY_PER_FRAME: usize = 256;
@@ -380,7 +379,6 @@ fn receive(
     scanner: Option<ResMut<Scanner>>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
-    mut images: ResMut<FolderImages>,
 ) {
     let Some(mut scanner) = scanner else {
         return;
@@ -399,7 +397,6 @@ fn receive(
                 if let Some(id) = scanner.pending.remove(&path) {
                     tree.add_listing(id, result);
                     track_children(&tree, id, &mut scanner.pending);
-                    images.mark_changed(&tree, id);
                     any = true;
                 }
             }
@@ -410,7 +407,6 @@ fn receive(
             } => {
                 if let Some(id) = scanner.pending.remove(&path) {
                     tree.mark_listed(id);
-                    images.mark_changed(&tree, id);
                     any = true;
                 }
                 scanner.recent.insert(path, result);
@@ -430,7 +426,6 @@ fn load_visible(
     layouts: Res<Layouts>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
-    mut images: ResMut<FolderImages>,
 ) {
     let Some(mut scanner) = scanner else {
         return;
@@ -481,7 +476,6 @@ fn load_visible(
             }
         }
         track_children(&tree, id, &mut scanner.pending);
-        images.mark_changed(&tree, id);
     }
     changed.pending = true;
 }
