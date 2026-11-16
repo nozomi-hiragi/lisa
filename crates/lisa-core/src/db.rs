@@ -222,6 +222,14 @@ impl Db {
             .optional()
     }
 
+    /// 1 行（子は入れない）。無ければ None。
+    pub fn entry(&self, id: i64) -> Result<Option<Stored>> {
+        self.conn
+            .prepare_cached(&format!("SELECT {COLUMNS} FROM entry WHERE id = ?1"))?
+            .query_row([id], row_to_stored)
+            .optional()
+    }
+
     /// フォルダ `id` の子（読んだときの並び。子の子は入れない）。
     pub fn children(&self, id: i64) -> Result<Vec<Stored>> {
         let mut statement = self.conn.prepare_cached(&format!(

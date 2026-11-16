@@ -9,4 +9,5 @@ pub mod dups;
 pub mod hash;
 pub mod listing;
 pub mod name;
+pub mod pace;
 pub mod volumes;

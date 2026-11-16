@@ -21,6 +21,12 @@ pub struct Settings {
     pub ear_selected_px: f32,
     /// 一覧の中のフォルダの耳の高さ（その一覧のフォルダを開いたときの、画面上のピクセル数）。
     pub ear_preview_px: f32,
+    /// 裏で読む・ハッシュする速さの上限（MB 毎秒、0 なら上限なし）。見ているところは除く。
+    pub background_mb_per_sec: f32,
+    /// 電池で動いているときは、裏の分を休む（1 なら休む、0 なら休まない）。
+    pub rest_on_battery: f32,
+    /// CPU の混み具合（%）がこれを超えたら、裏の分を休む（100 なら休まない）。
+    pub rest_cpu_percent: f32,
 }
 
 impl Default for Settings {
@@ -28,6 +34,9 @@ impl Default for Settings {
         Self {
             ear_selected_px: 28.0,
             ear_preview_px: 16.0,
+            background_mb_per_sec: 200.0,
+            rest_on_battery: 1.0,
+            rest_cpu_percent: 80.0,
         }
     }
 }
@@ -48,15 +57,27 @@ impl Settings {
 enum Item {
     EarSelected,
     EarPreview,
+    BackgroundSpeed,
+    RestOnBattery,
+    RestCpu,
 }
 
 impl Item {
-    const ALL: [Item; 2] = [Item::EarSelected, Item::EarPreview];
+    const ALL: [Item; 5] = [
+        Item::EarSelected,
+        Item::EarPreview,
+        Item::BackgroundSpeed,
+        Item::RestOnBattery,
+        Item::RestCpu,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Item::EarSelected => "耳の高さ（開いたとき）",
             Item::EarPreview => "耳の高さ（一覧の中）",
+            Item::BackgroundSpeed => "裏で読む速さの上限",
+            Item::RestOnBattery => "電池のときは裏で読まない",
+            Item::RestCpu => "CPU が混んだら裏で読まない",
         }
     }
 
@@ -65,6 +86,9 @@ impl Item {
         match self {
             Item::EarSelected => (12.0, 64.0, 2.0),
             Item::EarPreview => (6.0, 48.0, 2.0),
+            Item::BackgroundSpeed => (0.0, 2000.0, 50.0),
+            Item::RestOnBattery => (0.0, 1.0, 1.0),
+            Item::RestCpu => (20.0, 100.0, 10.0),
         }
     }
 
@@ -72,6 +96,9 @@ impl Item {
         match self {
             Item::EarSelected => settings.ear_selected_px,
             Item::EarPreview => settings.ear_preview_px,
+            Item::BackgroundSpeed => settings.background_mb_per_sec,
+            Item::RestOnBattery => settings.rest_on_battery,
+            Item::RestCpu => settings.rest_cpu_percent,
         }
     }
 
@@ -81,6 +108,9 @@ impl Item {
         match self {
             Item::EarSelected => settings.ear_selected_px = value,
             Item::EarPreview => settings.ear_preview_px = value,
+            Item::BackgroundSpeed => settings.background_mb_per_sec = value,
+            Item::RestOnBattery => settings.rest_on_battery = value.round(),
+            Item::RestCpu => settings.rest_cpu_percent = value,
         }
     }
 
@@ -88,6 +118,12 @@ impl Item {
         match self {
             Item::EarSelected => format!("{} px", settings.ear_selected_px),
             Item::EarPreview => format!("{} px", settings.ear_preview_px),
+            Item::BackgroundSpeed if settings.background_mb_per_sec <= 0.0 => "上限なし".into(),
+            Item::BackgroundSpeed => format!("{} MB/秒", settings.background_mb_per_sec),
+            Item::RestOnBattery if settings.rest_on_battery >= 0.5 => "休む".into(),
+            Item::RestOnBattery => "休まない".into(),
+            Item::RestCpu if settings.rest_cpu_percent >= 100.0 => "休まない".into(),
+            Item::RestCpu => format!("{} % 超", settings.rest_cpu_percent),
         }
     }
 
@@ -202,7 +238,7 @@ fn spawn_settings_ui(
                     text_font.clone(),
                     TextColor(TEXT_COLOR),
                     Node {
-                        width: Val::Px(56.0),
+                        width: Val::Px(88.0),
                         justify_content: JustifyContent::Center,
                         ..default()
                     },
