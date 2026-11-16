@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
@@ -80,6 +80,31 @@ impl TreeChanged {
     }
 }
 
+/// このあと読むフォルダを、読み込み中のリストにいくつ出すか。
+const SHOWN_NEXT: usize = 5;
+
+/// 読む係の進み具合（読み込み中のリストに出す）。読む係が書き、UI が読む。
+#[derive(Default)]
+pub struct Progress {
+    /// 今読んでいるフォルダ。
+    pub current: Option<PathBuf>,
+    /// このあと読むフォルダ（先に読むものから、`SHOWN_NEXT` 個まで）。
+    pub next: Vec<PathBuf>,
+    /// まだ読んでいないフォルダの数（今わかっている分）。
+    pub queued: usize,
+    /// 読んだフォルダの数。
+    pub done: u64,
+    /// そのうち読めなかったものの数。
+    pub failed: u64,
+    /// 読み始めた時刻と、全部読み終えた時刻。
+    pub started: Option<Instant>,
+    pub finished: Option<Instant>,
+}
+
+/// 読む係の進み具合を UI から覗く。
+#[derive(Resource, Clone)]
+pub struct ScanProgress(pub Arc<Mutex<Progress>>);
+
 /// 読む係から届く結果を受け取る。
 #[derive(Resource)]
 struct Scanner {
@@ -111,17 +136,37 @@ fn start_workers(mut commands: Commands, proxy: Res<EventLoopProxyWrapper>, tree
     let (sender, receiver) = channel();
     let proxy = (**proxy).clone();
     let mut stack: Vec<PathBuf> = roots.iter().rev().map(|(_, p)| p.clone()).collect();
+    let progress = ScanProgress(Arc::new(Mutex::new(Progress {
+        started: Some(Instant::now()),
+        ..default()
+    })));
+    let shared = progress.0.clone();
     std::thread::Builder::new()
         .name("lisa-scan".into())
         .spawn(move || {
             // 深さ優先: 取り出したフォルダの子を、名前順の逆に積む（上の子から先に取り出される）。
             while let Some(path) = stack.pop() {
+                report(&shared, |p| {
+                    p.current = Some(path.clone());
+                    p.queued = stack.len();
+                });
                 let result = listing::read_dir(&path).map_err(|e| e.to_string());
                 if let Ok(listing) = &result {
                     for entry in listing.entries.iter().rev().filter(|e| readable(e)) {
                         stack.push(path.join(&entry.name));
                     }
                 }
+                let failed = result.is_err();
+                report(&shared, |p| {
+                    p.done += 1;
+                    p.failed += failed as u64;
+                    p.queued = stack.len();
+                    p.next = stack.iter().rev().take(SHOWN_NEXT).cloned().collect();
+                    if stack.is_empty() {
+                        p.current = None;
+                        p.finished = Some(Instant::now());
+                    }
+                });
                 if sender.send(Listed { path, result }).is_err() {
                     return;
                 }
@@ -130,10 +175,17 @@ fn start_workers(mut commands: Commands, proxy: Res<EventLoopProxyWrapper>, tree
             }
         })
         .expect("読む係を作る");
+    commands.insert_resource(progress);
     commands.insert_resource(Scanner {
         results: Mutex::new(receiver),
         pending: roots.into_iter().map(|(id, p)| (p, id)).collect(),
     });
+}
+
+fn report(shared: &Mutex<Progress>, update: impl FnOnce(&mut Progress)) {
+    if let Ok(mut progress) = shared.lock() {
+        update(&mut progress);
+    }
 }
 
 /// 届いた結果を木に足す。読めたフォルダの子のフォルダは、このあと届くので覚えておく。
