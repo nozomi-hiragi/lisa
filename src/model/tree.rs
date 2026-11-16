@@ -223,6 +223,39 @@ impl FileTree {
         self.nodes[id].listed = true;
     }
 
+    /// フォルダ `id` の子を外す（読み直したら変わっていたので、出し直す）。外した子は木の中に
+    /// 残るが、どこからも指されない。
+    pub fn reset_children(&mut self, id: NodeId) {
+        let children = std::mem::take(&mut self.nodes[id].children);
+        let removed: u64 = children.iter().map(|&c| self.nodes[c].size).sum();
+        for child in children {
+            self.nodes[child].parent = None;
+        }
+        self.nodes[id].loaded = false;
+        let mut cur = Some(id);
+        while let Some(i) = cur {
+            self.nodes[i].size = self.nodes[i].size.saturating_sub(removed);
+            cur = self.nodes[i].parent;
+        }
+    }
+
+    /// フォルダ `id` は読み直したら変わっていた（ハッシュし直すまで古い）。中のハッシュの無いファイルも
+    /// 古いにする。
+    pub fn mark_stale(&mut self, id: NodeId) {
+        if self.nodes[id].state == LoadState::Failed {
+            return;
+        }
+        let children = self.nodes[id].children.clone();
+        for child in children {
+            let node = &mut self.nodes[child];
+            if !node.is_dir && node.state == LoadState::Unloaded {
+                node.state = LoadState::Stale;
+            }
+        }
+        self.nodes[id].state = LoadState::Stale;
+        self.update_ancestor_states(id);
+    }
+
     /// フォルダ `id` のハッシュができた（中のファイルもハッシュした）。
     pub fn mark_hashed(&mut self, id: NodeId) {
         if self.nodes[id].state == LoadState::Failed {
@@ -231,7 +264,7 @@ impl FileTree {
         let children = self.nodes[id].children.clone();
         for child in children {
             let node = &mut self.nodes[child];
-            if !node.is_dir && node.state == LoadState::Unloaded {
+            if !node.is_dir && matches!(node.state, LoadState::Unloaded | LoadState::Stale) {
                 node.state = LoadState::Loaded;
             }
         }
@@ -655,6 +688,32 @@ mod tests {
             tree.nodes[child("unread")].path.as_deref(),
             Some(dir.join("unread").as_path())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_children_and_stale_until_hashed() {
+        let dir = temp_dir("reset");
+        std::fs::write(dir.join("a.txt"), b"12345").unwrap();
+        let mut tree = one_drive(&dir);
+        let drive = tree.nodes[tree.nodes[FileTree::ROOT].children[0]].children[0];
+        let read = || lisa_core::listing::read_dir(&dir).map_err(|e| e.to_string());
+        tree.add_listing(drive, read());
+        tree.mark_hashed(drive);
+        assert_eq!(tree.nodes[drive].state, LoadState::Loaded);
+        // 読み直したら変わっていた: 子を外して出し直し、ハッシュし直すまで古い。
+        tree.reset_children(drive);
+        assert!(tree.nodes[drive].children.is_empty() && !tree.nodes[drive].loaded);
+        assert_eq!(tree.nodes[drive].size, 0);
+        std::fs::write(dir.join("b.txt"), b"xy").unwrap();
+        tree.add_listing(drive, read());
+        tree.mark_stale(drive);
+        assert_eq!(tree.nodes[drive].children.len(), 2);
+        assert_eq!(tree.nodes[drive].size, 7);
+        assert_eq!(tree.nodes[drive].state, LoadState::Stale);
+        assert_eq!(tree.nodes[FileTree::ROOT].state, LoadState::Stale);
+        tree.mark_hashed(drive);
+        assert_eq!(tree.nodes[drive].state, LoadState::Loaded);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

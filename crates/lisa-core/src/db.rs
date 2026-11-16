@@ -353,28 +353,41 @@ impl Db {
         mount: &Path,
         path: &Path,
         result: &std::result::Result<Listing, String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(folder) = self.folder_id(drive_id, mount, path)? else {
-            return Ok(());
+            return Ok(false);
         };
         self.folders.remove(path);
+        // 前に読んだことがあれば、読み直し（変わっていたら、このフォルダと祖先のハッシュを消す）。
+        let (was_listed, old_error): (bool, Option<String>) = self.conn.query_row(
+            "SELECT listed, error FROM entry WHERE id = ?1",
+            [folder],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut changed = false;
         match result {
             Err(error) => {
+                changed = old_error.as_deref() != Some(error.as_str());
                 self.conn.execute(
                     "UPDATE entry SET listed = 1, status = 'failed', error = ?2 WHERE id = ?1",
                     params![folder, error],
                 )?;
             }
             Ok(listing) => {
-                let mut old: HashMap<Vec<u8>, i64> = HashMap::new();
+                changed |= old_error.is_some();
+                // 名前 → (id, 種類, 大きさ, 更新日時)。
+                type Old = (i64, String, i64, Option<i64>);
+                let mut old: HashMap<Vec<u8>, Old> = HashMap::new();
                 {
-                    let mut statement = self
-                        .conn
-                        .prepare_cached("SELECT name, id FROM entry WHERE parent_id = ?1")?;
-                    let rows = statement.query_map([folder], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    let mut statement = self.conn.prepare_cached(
+                        "SELECT name, id, kind, size, mtime FROM entry WHERE parent_id = ?1",
+                    )?;
+                    let rows = statement.query_map([folder], |r| {
+                        Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                    })?;
                     for row in rows {
-                        let (name, id) = row?;
-                        old.insert(name, id);
+                        let (name, old_row) = row?;
+                        old.insert(name, old_row);
                     }
                 }
                 let mut upsert = self.conn.prepare_cached(
@@ -382,17 +395,30 @@ impl Db {
                                         file_id, nlink, cloud_only, other_volume, status, listed)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'unloaded', 0)
                      ON CONFLICT(parent_id, name) DO UPDATE SET pos = ?3, name_nfc = ?5,
+                         -- 種類・大きさ・日時が変わったものは、ハッシュを消す（古い）。
+                         hash = CASE WHEN kind = ?6 AND size = ?7 AND mtime IS ?8
+                                     THEN hash ELSE NULL END,
+                         error = CASE WHEN kind = ?6 AND size = ?7 AND mtime IS ?8
+                                      THEN error ELSE NULL END,
+                         listed = CASE WHEN kind = ?6 THEN listed ELSE 0 END,
                          kind = ?6, size = ?7, mtime = ?8, file_id = ?9, nlink = ?10,
                          cloud_only = ?11, other_volume = ?12
                      RETURNING id",
                 )?;
                 for (pos, entry) in listing.entries.iter().enumerate() {
-                    old.remove(&entry.name_raw);
                     let size = if entry.kind == Kind::Dir {
                         0
                     } else {
                         entry.size
                     };
+                    match old.remove(&entry.name_raw) {
+                        Some((_, kind, old_size, mtime)) => {
+                            changed |= kind != kind_name(entry.kind)
+                                || old_size != size as i64
+                                || mtime != entry.mtime_ms;
+                        }
+                        None => changed = true,
+                    }
                     let id: i64 = upsert.query_row(
                         params![
                             drive_id,
@@ -418,7 +444,8 @@ impl Db {
                 let mut delete = self
                     .conn
                     .prepare_cached("DELETE FROM entry WHERE id = ?1")?;
-                for id in old.into_values() {
+                changed |= !old.is_empty();
+                for (id, ..) in old.into_values() {
                     delete.execute([id])?;
                 }
                 drop(delete);
@@ -427,6 +454,25 @@ impl Db {
                     [folder],
                 )?;
             }
+        }
+        // 初めて読んだときは、まだハッシュが無いので消すものも無い。
+        let changed = was_listed && changed;
+        if changed {
+            self.clear_hash_up(folder)?;
+        }
+        Ok(changed)
+    }
+
+    /// `id` とその祖先のハッシュを消す（中が変わったので、作り直しが要る）。
+    pub fn clear_hash_up(&mut self, id: i64) -> Result<()> {
+        let mut cur = Some(id);
+        while let Some(i) = cur {
+            cur = self
+                .conn
+                .prepare_cached("UPDATE entry SET hash = NULL WHERE id = ?1 RETURNING parent_id")?
+                .query_row([i], |r| r.get(0))
+                .optional()?
+                .flatten();
         }
         Ok(())
     }
@@ -661,6 +707,55 @@ mod tests {
         let root = load_tree(&db, "test:1");
         let names: Vec<&str> = root.children.iter().map(|c| c.name_nfc.as_str()).collect();
         assert_eq!(names, ["new.txt"]);
+    }
+
+    #[test]
+    fn reading_again_marks_changed_files_and_ancestors() {
+        let tmp = TempDir::new("reread");
+        fs::create_dir(tmp.0.join("sub")).unwrap();
+        fs::write(tmp.0.join("sub/a.txt"), b"one").unwrap();
+        fs::write(tmp.0.join("sub/b.txt"), b"two").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let device = db.this_device("mac", "mac.local", "macos").unwrap();
+        db.upsert_drive(&device, &volume(&tmp.0)).unwrap();
+        let read = |p: &Path| read_dir(p).map_err(|e| e.to_string());
+        let sub = tmp.0.join("sub");
+        assert!(
+            !db.save_listing("test:1", &tmp.0, &tmp.0, &read(&tmp.0))
+                .unwrap()
+        );
+        assert!(
+            !db.save_listing("test:1", &tmp.0, &sub, &read(&sub))
+                .unwrap()
+        );
+        crate::hash::hash_drive(
+            &mut db,
+            "test:1",
+            &tmp.0,
+            1,
+            &mut |_| {},
+            &crate::hash::Pace::FREE,
+        )
+        .unwrap();
+        // 変わっていなければ、何も消さない。
+        assert!(
+            !db.save_listing("test:1", &tmp.0, &sub, &read(&sub))
+                .unwrap()
+        );
+        assert!(db.drive_root("test:1").unwrap().unwrap().hash.is_some());
+        // a.txt の大きさを変えると、a.txt と sub と一番上のハッシュが消え、b.txt は残る。
+        fs::write(tmp.0.join("sub/a.txt"), b"longer").unwrap();
+        assert!(
+            db.save_listing("test:1", &tmp.0, &sub, &read(&sub))
+                .unwrap()
+        );
+        let root = db.drive_root("test:1").unwrap().unwrap();
+        assert!(root.hash.is_none());
+        let sub_row = &db.children(root.id).unwrap()[0];
+        assert!(sub_row.hash.is_none());
+        let files = db.children(sub_row.id).unwrap();
+        assert!(files[0].hash.is_none());
+        assert!(files[1].hash.is_some());
     }
 
     #[test]
