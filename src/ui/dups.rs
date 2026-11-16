@@ -129,8 +129,19 @@ fn fill_panel(
     let big = TextFont::from_font_size(13.0).with_font(font.0.clone());
     let small = TextFont::from_font_size(11.0).with_font(font.0.clone());
     let header = match &dups.state {
-        DupsState::NotYet | DupsState::Computing(_) => {
+        DupsState::NotYet | DupsState::Computing { previous: None, .. } => {
             "重複を探しています…（数十秒かかります）".to_string()
+        }
+        DupsState::Computing {
+            previous: Some(groups),
+            ..
+        } => {
+            let wasted: u64 = groups.iter().map(Group::wasted).sum();
+            format!(
+                "重複  {} 組・空く {}（前の一覧。作り直しています…）",
+                groups.len(),
+                human(wasted)
+            )
         }
         DupsState::Failed(error) => format!("重複の一覧を作れませんでした: {error}"),
         DupsState::Ready(groups) => {
