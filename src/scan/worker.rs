@@ -5,7 +5,8 @@
 //!   （ハッシュは 1 MiB ごとに合図を見る）、先にそれを 1 段読み直す。DB と違えば DB を直し、変わった
 //!   ものとそのフォルダ・祖先のハッシュを消して（古い）、ハッシュし直す。これは決まりにかからない。
 //! - 裏の分は I/O を後回しにし（`pace::set_thread_background`）、速さの上限（設定）を守る。
-//! - 一時停止、電池で動いているとき、CPU が混んでいるとき（設定のしきい値）は休む。
+//! - 一時停止、電池で動いているとき、CPU が混んでいるとき、ほかのアプリがディスクをたくさん読み書き
+//!   しているとき（設定のしきい値）は休む。
 //! - 監視（`Request::Hint`、FSEvents など）で変わったと知らされたフォルダは、裏の分として（上の
 //!   決まりに従って）読み直す。
 
@@ -48,6 +49,7 @@ pub enum Rest {
     Paused = 1,
     Battery = 2,
     Cpu = 3,
+    Disk = 4,
 }
 
 /// UI と読む係で分け合う、裏で読むときの決まり。
@@ -62,6 +64,8 @@ pub struct Control {
     pub rest_on_battery: AtomicBool,
     /// CPU の混み具合（%）がこれを超えたら休む（100 なら休まない）。
     pub cpu_limit: AtomicU32,
+    /// ほかのアプリのディスクの読み書き（バイト毎秒）がこれを超えたら休む（0 なら休まない）。
+    pub disk_limit: AtomicU64,
     /// 今休んでいる理由（`Rest`）。
     pub resting: AtomicU8,
 }
@@ -74,6 +78,7 @@ impl Default for Control {
             limit: AtomicU64::new(0),
             rest_on_battery: AtomicBool::new(true),
             cpu_limit: AtomicU32::new(100),
+            disk_limit: AtomicU64::new(0),
             resting: AtomicU8::new(Rest::No as u8),
         }
     }
@@ -85,6 +90,7 @@ impl Control {
             1 => Rest::Paused,
             2 => Rest::Battery,
             3 => Rest::Cpu,
+            4 => Rest::Disk,
             _ => Rest::No,
         }
     }
@@ -95,8 +101,11 @@ struct Background {
     control: Arc<Control>,
     /// 速さの上限を守るための、この秒の始まりと、その秒に読んだ量。
     window: Mutex<(Instant, u64)>,
-    /// 最後に電池と CPU を見た時刻と、そのときの答え。
+    /// 最後に電池と CPU とディスクを見た時刻と、そのときの答え。
     checked: Mutex<(Option<Instant>, Rest)>,
+    /// 前に見たディスクの読み書きの累計と、それから自分で読んだ量（ほかのアプリの分を出すため）。
+    disk: Mutex<Option<u64>>,
+    ours: AtomicU64,
 }
 
 impl Background {
@@ -105,6 +114,8 @@ impl Background {
             control,
             window: Mutex::new((Instant::now(), 0)),
             checked: Mutex::new((None, Rest::No)),
+            disk: Mutex::new(None),
+            ours: AtomicU64::new(0),
         }
     }
 
@@ -116,17 +127,33 @@ impl Background {
         } else {
             let mut checked = self.checked.lock().expect("休むかどうか");
             if checked.0.is_none_or(|t| t.elapsed() >= CHECK_EVERY) {
+                let seconds = checked.0.map(|t| t.elapsed().as_secs_f64());
                 let battery =
                     c.rest_on_battery.load(Ordering::Relaxed) && lisa_core::pace::on_battery();
                 let limit = c.cpu_limit.load(Ordering::Relaxed);
                 let cpu = limit < 100
                     && lisa_core::pace::cpu_load_percent().is_some_and(|p| p > limit as f32);
+                // ほかのアプリのディスクの読み書き = 全体の増えた分 − 自分で読んだ分。
+                let disk_limit = c.disk_limit.load(Ordering::Relaxed);
+                let total = lisa_core::pace::disk_bytes();
+                let ours = self.ours.swap(0, Ordering::Relaxed);
+                let mut last = self.disk.lock().expect("ディスク");
+                let disk = match (disk_limit, *last, total, seconds) {
+                    (1.., Some(before), Some(now), Some(seconds)) if seconds > 0.0 => {
+                        let others = now.saturating_sub(before).saturating_sub(ours);
+                        others as f64 / seconds > disk_limit as f64
+                    }
+                    _ => false,
+                };
+                *last = total;
                 *checked = (
                     Some(Instant::now()),
                     if battery {
                         Rest::Battery
                     } else if cpu {
                         Rest::Cpu
+                    } else if disk {
+                        Rest::Disk
                     } else {
                         Rest::No
                     },
@@ -145,6 +172,7 @@ impl Background {
 
     /// 裏の分を続けてよいか。`bytes` だけ読んだので、速さの上限を超えていれば待つ。
     fn step(&self, bytes: u64) -> bool {
+        self.ours.fetch_add(bytes, Ordering::Relaxed);
         if self.urgent() || self.rest() != Rest::No {
             return false;
         }
