@@ -14,7 +14,7 @@
 //!
 //! `LISA_DUMMY=1` で起動すると、今までのダミーの木を使い、何も読まない。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -204,6 +204,19 @@ pub struct Progress {
     /// 読み始めた時刻と、全部読み終えた時刻。
     pub started: Option<Instant>,
     pub finished: Option<Instant>,
+    /// ハッシュの進み具合（読み終えたあとに始める）。
+    pub hash: HashProgress,
+}
+
+#[derive(Default)]
+pub struct HashProgress {
+    /// 今ファイルをハッシュしているフォルダ。
+    pub folder: Option<PathBuf>,
+    /// ハッシュしたファイルの数と大きさ。
+    pub files: u64,
+    pub bytes: u64,
+    pub started: Option<Instant>,
+    pub finished: Option<Instant>,
 }
 
 /// 読む係の進み具合を UI から覗く。
@@ -218,6 +231,10 @@ struct Scanner {
     pending: HashMap<PathBuf, NodeId>,
     /// 読み終えて DB に書いたが、まだ確定していないもの（確定したら DB から読めるので捨てる）。
     recent: HashMap<PathBuf, Result<Listing, String>>,
+    /// 木にあるフォルダ（パスからノードを引く。ハッシュができたら状態を直すため）。
+    folders: HashMap<PathBuf, NodeId>,
+    /// ハッシュができて DB に書いたが、まだ確定していないフォルダ。
+    hashed: HashSet<PathBuf>,
 }
 
 enum Message {
@@ -227,9 +244,14 @@ enum Message {
         result: Result<Listing, String>,
         stored: bool,
     },
+    /// フォルダのハッシュができた（中のファイルもハッシュした）。
+    Hashed { path: PathBuf },
     /// ここまでに書いたものを確定した。
     Committed,
 }
+
+/// ファイルを同時にハッシュする数。
+const HASH_THREADS: usize = 4;
 
 /// 中に入って読むもの（フォルダで、クラウドのみでも別のボリュームでもない）。
 /// `FileTree::add_listing` がパスを付けるものと同じ。
@@ -339,22 +361,73 @@ fn start_workers(
             if let Some(store) = db.as_mut() {
                 let _ = store.commit();
             }
+            if sender.send(Message::Committed).is_err() {
+                return;
+            }
+            // 読み終えたら、ハッシュの無いものを下からハッシュする。
+            let Some(store) = db.as_mut() else {
+                return;
+            };
+            report(&shared, |p| p.hash.started = Some(Instant::now()));
+            let closed = std::sync::atomic::AtomicBool::new(false);
+            for root in &roots {
+                let Some(drive_id) = &root.drive_id else {
+                    continue;
+                };
+                let mut on = |event: lisa_core::hash::Event| {
+                    let message = match event {
+                        lisa_core::hash::Event::Folder(path) => {
+                            report(&shared, |p| p.hash.folder = Some(path.to_path_buf()));
+                            return;
+                        }
+                        lisa_core::hash::Event::File { bytes } => {
+                            report(&shared, |p| {
+                                p.hash.files += 1;
+                                p.hash.bytes += bytes;
+                            });
+                            return;
+                        }
+                        lisa_core::hash::Event::FolderDone(path) => Message::Hashed {
+                            path: path.to_path_buf(),
+                        },
+                        lisa_core::hash::Event::Committed => Message::Committed,
+                    };
+                    if sender.send(message).is_err() {
+                        closed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let _ = proxy.send_event(WinitUserEvent::WakeUp);
+                };
+                let stop = || closed.load(std::sync::atomic::Ordering::Relaxed);
+                if let Err(error) = lisa_core::hash::hash_drive(
+                    store,
+                    drive_id,
+                    &root.mount,
+                    HASH_THREADS,
+                    &mut on,
+                    &stop,
+                ) {
+                    warn!("ハッシュを DB に書けませんでした: {error}");
+                }
+            }
+            report(&shared, |p| {
+                p.hash.folder = None;
+                p.hash.finished = Some(Instant::now());
+            });
+            let _ = proxy.send_event(WinitUserEvent::WakeUp);
         })
         .expect("読む係を作る");
     commands.insert_resource(progress);
-    let pending = (0..tree.nodes.len())
-        .filter_map(|id| {
-            let node = &tree.nodes[id];
-            (node.is_dir && !node.listed)
-                .then(|| node.path.clone().map(|p| (p, id)))
-                .flatten()
-        })
-        .collect();
-    commands.insert_resource(Scanner {
+    let mut scanner = Scanner {
         results: Mutex::new(receiver),
-        pending,
+        pending: HashMap::new(),
         recent: HashMap::new(),
-    });
+        folders: HashMap::new(),
+        hashed: HashSet::new(),
+    };
+    for id in 0..tree.nodes.len() {
+        scanner.track(&tree, id);
+    }
+    commands.insert_resource(scanner);
 }
 
 fn report(shared: &Mutex<Progress>, update: impl FnOnce(&mut Progress)) {
@@ -363,12 +436,22 @@ fn report(shared: &Mutex<Progress>, update: impl FnOnce(&mut Progress)) {
     }
 }
 
-/// 木に出したフォルダ `id` の子のうち、まだ読み終えていないフォルダを覚えておく。
-fn track_children(tree: &FileTree, id: NodeId, pending: &mut HashMap<PathBuf, NodeId>) {
-    for &child in &tree.nodes[id].children {
-        let node = &tree.nodes[child];
-        if let (Some(path), false) = (&node.path, node.listed) {
-            pending.insert(path.clone(), child);
+impl Scanner {
+    /// 木にあるフォルダ `id` をパスで引けるようにする（まだ読み終えていなければ `pending` にも）。
+    fn track(&mut self, tree: &FileTree, id: NodeId) {
+        let node = &tree.nodes[id];
+        if let (true, Some(path)) = (node.is_dir, &node.path) {
+            self.folders.insert(path.clone(), id);
+            if !node.listed {
+                self.pending.insert(path.clone(), id);
+            }
+        }
+    }
+
+    /// 木に出したフォルダ `id` の子を覚えておく。
+    fn track_children(&mut self, tree: &FileTree, id: NodeId) {
+        for &child in &tree.nodes[id].children {
+            self.track(tree, child);
         }
     }
 }
@@ -384,11 +467,27 @@ fn receive(
         return;
     };
     let scanner = &mut *scanner;
-    let results = scanner.results.get_mut().expect("結果");
+    let messages: Vec<Message> = scanner
+        .results
+        .get_mut()
+        .expect("結果")
+        .try_iter()
+        .take(APPLY_PER_FRAME)
+        .collect();
     let mut any = false;
-    for message in results.try_iter().take(APPLY_PER_FRAME) {
+    for message in messages {
         match message {
-            Message::Committed => scanner.recent.clear(),
+            Message::Committed => {
+                scanner.recent.clear();
+                scanner.hashed.clear();
+            }
+            Message::Hashed { path } => {
+                if let Some(&id) = scanner.folders.get(&path) {
+                    tree.mark_hashed(id);
+                    any = true;
+                }
+                scanner.hashed.insert(path);
+            }
             Message::Listed {
                 path,
                 result,
@@ -396,7 +495,7 @@ fn receive(
             } => {
                 if let Some(id) = scanner.pending.remove(&path) {
                     tree.add_listing(id, result);
-                    track_children(&tree, id, &mut scanner.pending);
+                    scanner.track_children(&tree, id);
                     any = true;
                 }
             }
@@ -466,8 +565,13 @@ fn load_visible(
             };
             match db.children(entry) {
                 Ok(rows) => {
-                    let recent = &scanner.recent;
-                    tree.add_stored_children(id, rows, |p| recent.contains_key(p));
+                    let (recent, hashed) = (&scanner.recent, &scanner.hashed);
+                    tree.add_stored_children(
+                        id,
+                        rows,
+                        |p| recent.contains_key(p),
+                        |p| hashed.contains(p),
+                    );
                 }
                 Err(error) => {
                     warn!("DB から読めませんでした（{}）: {error}", path.display());
@@ -475,7 +579,7 @@ fn load_visible(
                 }
             }
         }
-        track_children(&tree, id, &mut scanner.pending);
+        scanner.track_children(&tree, id);
     }
     changed.pending = true;
 }

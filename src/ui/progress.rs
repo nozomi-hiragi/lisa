@@ -1,5 +1,6 @@
 //! 読み込み中のリスト（画面の左下に固定）。今読んでいるフォルダと、このあと読むフォルダ、
-//! 読んだ数と速さを出す。読み終えたら少しして消す。
+//! 読んだ数と速さを出す。読み終えたらハッシュの進み具合（今のフォルダ、数、大きさ、速さ）を出し、
+//! それも終えたら少しして消す。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -98,8 +99,11 @@ fn show_progress(
     } else {
         String::new()
     };
-    let (head, body) = match p.finished {
-        Some(at) => {
+    let hash = &p.hash;
+    let (head, body) = match (p.finished, hash.started, hash.finished) {
+        // 読み終えて、ハッシュも終えた（か、ハッシュしない）。
+        (Some(at), started, finished) if started.is_none() || finished.is_some() => {
+            let at = finished.unwrap_or(at);
             if let Ok(mut v) = panel.single_mut() {
                 *v = if at.elapsed() >= HIDE_AFTER {
                     Visibility::Hidden
@@ -107,15 +111,42 @@ fn show_progress(
                     Visibility::Inherited
                 };
             }
-            (
-                format!(
+            let head = match started {
+                Some(_) => format!(
+                    "読み終えました  {} フォルダ{failed}・ハッシュ {} ファイル（{}）",
+                    p.done,
+                    hash.files,
+                    bytes(hash.bytes)
+                ),
+                None => format!(
                     "読み終えました  {} フォルダ{failed}・{elapsed:.1} 秒",
                     p.done
                 ),
-                String::new(),
+            };
+            (head, String::new())
+        }
+        // ハッシュしている。
+        (Some(_), Some(started), None) => {
+            if let Ok(mut v) = panel.single_mut() {
+                *v = Visibility::Inherited;
+            }
+            let seconds = started.elapsed().as_secs_f64().max(1e-3);
+            let speed = hash.bytes as f64 / seconds;
+            let mut body = String::new();
+            if let Some(folder) = &hash.folder {
+                body = format!("▶ {}", shorten(folder));
+            }
+            (
+                format!(
+                    "ハッシュ中  {} ファイル・{}・1 秒に {}",
+                    hash.files,
+                    bytes(hash.bytes),
+                    bytes(speed as u64)
+                ),
+                body,
             )
         }
-        None => {
+        _ => {
             let mut body = Vec::new();
             if let Some(current) = &p.current {
                 body.push(format!("▶ {}", shorten(current)));
@@ -139,6 +170,22 @@ fn show_progress(
         && text.0 != body
     {
         text.0 = body;
+    }
+}
+
+/// 読みやすい大きさ（1024 区切り）。
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

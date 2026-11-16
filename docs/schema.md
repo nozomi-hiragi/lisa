@@ -3,7 +3,8 @@
 > `device`、`drive`、`entry` の一部は実装しました（`crates/lisa-core/src/db.rs`）。ほかはまだです。
 > 考え方は [design.md](design.md) を見てください。
 
-実装した `entry` は、この表のうちハッシュ以外です。加えて、親の中での並び（`pos`）、子を読み終えたか
+実装した `entry` は、この表のうち `status` 以外です（ハッシュは `hash`、`algo`、`hashed_size`、
+`hashed_mtime`。状態はハッシュとエラーから決めます）。`tree`、`content`、`hash_queue` はまだです。加えて、親の中での並び（`pos`）、子を読み終えたか
 （`listed`）、ハードリンクの数（`nlink`）、別のボリュームか（`other_volume`）を持ちます。名前は
 ディスク上のバイト列（BLOB）です。フォルダの大きさは残さず、読み出すときに子から足します。
 端末の ID は `meta` の表（`this_device`）に覚えます。

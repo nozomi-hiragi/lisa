@@ -65,7 +65,8 @@ CREATE INDEX IF NOT EXISTS entry_drive ON entry(drive_id);
 ";
 
 /// `Stored` に読む列（`row_to_stored` と同じ順）。
-const COLUMNS: &str = "id, name, name_nfc, kind, size, cloud_only, other_volume, error, listed";
+const COLUMNS: &str =
+    "id, name, name_nfc, kind, size, cloud_only, other_volume, error, listed, mtime, hash";
 
 fn row_to_stored(r: &rusqlite::Row) -> Result<Stored> {
     let kind: String = r.get(3)?;
@@ -79,11 +80,15 @@ fn row_to_stored(r: &rusqlite::Row) -> Result<Stored> {
         other_volume: r.get(6)?,
         error: r.get(7)?,
         listed: r.get(8)?,
+        mtime: r.get(9)?,
+        hash: r
+            .get::<_, Option<Vec<u8>>>(10)?
+            .and_then(|h| h.try_into().ok()),
         children: Vec::new(),
     })
 }
 
-/// DB から読み出したフォルダかファイル（`load_drive` は子も入れた木の形、ほかは子を入れない）。
+/// DB から読み出したフォルダかファイル（子は入れない。`children` はテストで木を組むときだけ使う）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stored {
     /// `entry.id`。
@@ -97,8 +102,12 @@ pub struct Stored {
     pub other_volume: bool,
     /// 子を読み終えた（読めなかったときも含む）。
     pub listed: bool,
-    /// 読めなかった理由。
+    /// 読めなかった理由（フォルダは一覧、ファイルはハッシュ）。
     pub error: Option<String>,
+    /// 更新日時（UTC の Unix 時刻、ミリ秒）。
+    pub mtime: Option<i64>,
+    /// 中身のハッシュ（blake3）。フォルダは子から作る Merkle。まだなら None。
+    pub hash: Option<crate::hash::Hash>,
     /// 子（読んだときの並び = `name::hash_order`）。
     pub children: Vec<Stored>,
 }
@@ -129,6 +138,7 @@ impl Db {
              PRAGMA cache_size = -65536; PRAGMA temp_store = MEMORY;",
         )?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn,
             folders: HashMap::new(),
@@ -197,48 +207,6 @@ impl Db {
         Ok(())
     }
 
-    /// ドライブの木を読み出す。ドライブが無ければ None。
-    pub fn load_drive(&self, drive_id: &str) -> Result<Option<Stored>> {
-        let mut statement = self.conn.prepare(
-            "SELECT id, parent_id, name, name_nfc, kind, size, cloud_only, other_volume, error,
-                    listed
-             FROM entry WHERE drive_id = ?1 ORDER BY parent_id, pos",
-        )?;
-        let mut root: Option<(i64, Stored)> = None;
-        let mut children: HashMap<i64, Vec<(i64, Stored)>> = HashMap::new();
-        let rows = statement.query_map([drive_id], |r| {
-            let kind: String = r.get(4)?;
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<i64>>(1)?,
-                Stored {
-                    id: r.get(0)?,
-                    name_raw: r.get(2)?,
-                    name_nfc: r.get(3)?,
-                    kind: kind_from(&kind),
-                    size: r.get::<_, i64>(5)? as u64,
-                    cloud_only: r.get(6)?,
-                    other_volume: r.get(7)?,
-                    error: r.get(8)?,
-                    listed: r.get(9)?,
-                    children: Vec::new(),
-                },
-            ))
-        })?;
-        for row in rows {
-            let (id, parent, stored) = row?;
-            match parent {
-                None => root = Some((id, stored)),
-                Some(parent) => children.entry(parent).or_default().push((id, stored)),
-            }
-        }
-        let Some((id, mut root)) = root else {
-            return Ok(None);
-        };
-        attach(&mut root, id, &mut children);
-        Ok(Some(root))
-    }
-
     /// ドライブの一番上の行（子は入れない）。ドライブが無ければ None。
     pub fn drive_root(&self, drive_id: &str) -> Result<Option<Stored>> {
         self.conn
@@ -256,6 +224,37 @@ impl Db {
         ))?;
         let rows = statement.query_map([id], row_to_stored)?;
         rows.collect()
+    }
+
+    /// ファイルかフォルダのハッシュを書く（`size` と `mtime` はハッシュしたときの値）。
+    pub fn set_hash(
+        &mut self,
+        id: i64,
+        hash: &crate::hash::Hash,
+        size: u64,
+        mtime: Option<i64>,
+    ) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = ?4, hashed_mtime = ?5,
+                     error = NULL WHERE id = ?1",
+            )?
+            .execute(params![
+                id,
+                &hash[..],
+                crate::hash::ALGO,
+                size as i64,
+                mtime
+            ])?;
+        Ok(())
+    }
+
+    /// ファイルをハッシュできなかった理由を書く。
+    pub fn set_hash_error(&mut self, id: i64, error: &str) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE entry SET error = ?2 WHERE id = ?1")?
+            .execute(params![id, error])?;
+        Ok(())
     }
 
     /// フォルダ `path`（ドライブ `drive_id` の `mount` の下）の `entry.id`。無ければ None。
@@ -450,17 +449,23 @@ impl Db {
     }
 }
 
-fn attach(node: &mut Stored, id: i64, children: &mut HashMap<i64, Vec<(i64, Stored)>>) {
-    let Some(list) = children.remove(&id) else {
-        return;
-    };
-    node.children = list
-        .into_iter()
-        .map(|(child_id, mut child)| {
-            attach(&mut child, child_id, children);
-            child
-        })
-        .collect();
+/// 前の版の DB に、あとから足した列を足す（中身は空のまま）。
+fn migrate(conn: &Connection) -> Result<()> {
+    let mut statement = conn.prepare("SELECT name FROM pragma_table_info('entry')")?;
+    let columns: Vec<String> = statement
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    for (name, kind) in [
+        ("hash", "BLOB"),
+        ("algo", "TEXT"),
+        ("hashed_size", "INTEGER"),
+        ("hashed_mtime", "INTEGER"),
+    ] {
+        if !columns.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE entry ADD COLUMN {name} {kind}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn kind_name(kind: Kind) -> &'static str {
@@ -508,6 +513,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// ドライブの木を全部組む（テスト用）。
+    fn load_tree(db: &Db, drive_id: &str) -> Stored {
+        fn fill(db: &Db, node: &mut Stored) {
+            node.children = db.children(node.id).unwrap();
+            for child in &mut node.children {
+                fill(db, child);
+            }
+        }
+        let mut root = db.drive_root(drive_id).unwrap().unwrap();
+        fill(db, &mut root);
+        root
     }
 
     fn volume(mount: &Path) -> Volume {
@@ -563,7 +581,7 @@ mod tests {
         .unwrap();
         db.commit().unwrap();
 
-        let root = db.load_drive("test:1").unwrap().unwrap();
+        let root = load_tree(&db, "test:1");
         assert!(root.listed);
         let names: Vec<&str> = root.children.iter().map(|c| c.name_nfc.as_str()).collect();
         assert_eq!(names, ["a.txt", "sub", "unread"]);
@@ -627,7 +645,7 @@ mod tests {
         fs::remove_file(tmp.0.join("old.txt")).unwrap();
         fs::write(tmp.0.join("new.txt"), b"22").unwrap();
         save(&mut db);
-        let root = db.load_drive("test:1").unwrap().unwrap();
+        let root = load_tree(&db, "test:1");
         let names: Vec<&str> = root.children.iter().map(|c| c.name_nfc.as_str()).collect();
         assert_eq!(names, ["new.txt"]);
     }
@@ -640,7 +658,7 @@ mod tests {
         db.upsert_drive(&device, &volume(&tmp.0)).unwrap();
         db.save_listing("test:1", &tmp.0, &tmp.0, &Err("Permission".into()))
             .unwrap();
-        let root = db.load_drive("test:1").unwrap().unwrap();
+        let root = load_tree(&db, "test:1");
         assert!(root.listed);
         assert_eq!(root.error.as_deref(), Some("Permission"));
     }

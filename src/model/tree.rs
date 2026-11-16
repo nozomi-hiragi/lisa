@@ -212,28 +212,42 @@ impl FileTree {
         if row.error.is_some() {
             node.state = LoadState::Failed;
             node.loaded = true;
-        } else if row.listed {
+        } else if row.hash.is_some() {
             node.state = LoadState::Loaded;
         }
         self.update_ancestor_states(id);
     }
 
-    /// 読み終えた（DB にはある）が、子をまだ出していない。
+    /// 読み終えた（DB にはある）が、子をまだ出していない。ハッシュができるまでは未読み込みのまま。
     pub fn mark_listed(&mut self, id: NodeId) {
         self.nodes[id].listed = true;
-        if !self.nodes[id].loaded {
-            self.nodes[id].state = LoadState::Loaded;
-            self.update_ancestor_states(id);
-        }
     }
 
-    /// DB にあるフォルダ `id` の子（`rows`、子の子は入れない）を足す。`scanned` は、DB にはまだ
-    /// 書かれていないが読み終えたフォルダか（読む係が書く前に結果が届いていることがある）。
+    /// フォルダ `id` のハッシュができた（中のファイルもハッシュした）。
+    pub fn mark_hashed(&mut self, id: NodeId) {
+        if self.nodes[id].state == LoadState::Failed {
+            return;
+        }
+        let children = self.nodes[id].children.clone();
+        for child in children {
+            let node = &mut self.nodes[child];
+            if !node.is_dir && node.state == LoadState::Unloaded {
+                node.state = LoadState::Loaded;
+            }
+        }
+        self.nodes[id].state = LoadState::Loaded;
+        self.update_ancestor_states(id);
+    }
+
+    /// DB にあるフォルダ `id` の子（`rows`、子の子は入れない）を足す。`scanned` と `hashed` は、
+    /// DB にはまだ確定していないが、読み終えた／ハッシュができたフォルダか（読む係が確定する前に
+    /// 知らせが届いていることがある）。
     pub fn add_stored_children(
         &mut self,
         id: NodeId,
         rows: Vec<lisa_core::db::Stored>,
         scanned: impl Fn(&std::path::Path) -> bool,
+        hashed: impl Fn(&std::path::Path) -> bool,
     ) {
         if self.nodes[id].loaded {
             return;
@@ -242,25 +256,34 @@ impl FileTree {
         self.nodes[id].loaded = true;
         let device = self.nodes[id].device;
         let base = self.nodes[id].path.clone().unwrap_or_default();
+        let parent_hashed = hashed(&base);
         let mut added = 0;
         for row in rows {
             let is_dir = row.kind == Kind::Dir;
             let readable = is_dir && !row.cloud_only && !row.other_volume;
             let child = self.push(&row.name_nfc, row.size, Some(id), device, is_dir);
-            // 中に入って読まないもの（ファイル、クラウドのみ、別のボリューム）は、一覧に載った時点で
-            // 読み込み済み（ハッシュはまだしないので）。
-            self.nodes[child].state = LoadState::Loaded;
+            // ファイルはハッシュができたら読み込み済み。ハッシュしないもの（クラウドのみ、リンク、
+            // 中に入らないフォルダ）は、一覧に載った時点で読み込み済み。
+            let skip = row.kind != Kind::File || row.cloud_only;
+            self.nodes[child].state = if skip || row.hash.is_some() || parent_hashed {
+                LoadState::Loaded
+            } else if row.error.is_some() {
+                LoadState::Failed
+            } else {
+                LoadState::Unloaded
+            };
             if readable {
                 let path = base.join(lisa_core::name::from_raw_bytes(&row.name_raw));
                 let node = &mut self.nodes[child];
                 node.listed = row.listed || scanned(&path);
                 node.loaded = false;
                 node.entry = Some(row.id);
-                // 読み終えて DB にあるフォルダは、子を出していなくても読み込み済みとする。
+                // ハッシュができたフォルダは、子を出していなくても読み込み済み。
+                let done = row.hash.is_some() || hashed(&path);
                 node.state = if row.error.is_some() {
                     node.loaded = true;
                     LoadState::Failed
-                } else if node.listed {
+                } else if done {
                     LoadState::Loaded
                 } else {
                     LoadState::Unloaded
@@ -291,9 +314,13 @@ impl FileTree {
                     let is_dir = entry.kind == Kind::Dir;
                     let size = if is_dir { 0 } else { entry.size };
                     let child = self.push(&entry.name_nfc, size, Some(id), device, is_dir);
-                    // ハッシュはまだしないので、一覧に載ったら読み込み済み。中に入って読むフォルダだけ、
-                    // 中を読むまで未読み込み。
-                    self.nodes[child].state = LoadState::Loaded;
+                    // ファイルはハッシュができるまで未読み込み。ハッシュしないもの（クラウドのみ、リンク、
+                    // 中に入らないフォルダ）は読み込み済み。中に入って読むフォルダは、中を読むまで未読み込み。
+                    self.nodes[child].state = if entry.kind == Kind::File && !entry.cloud_only {
+                        LoadState::Unloaded
+                    } else {
+                        LoadState::Loaded
+                    };
                     if readable {
                         self.nodes[child].state = LoadState::Unloaded;
                         self.nodes[child].path = Some(base.join(&entry.name));
@@ -602,7 +629,7 @@ mod tests {
         let root = db.drive_root("test:1").unwrap().unwrap();
         tree.set_drive_row(drive, &root);
         assert!(tree.nodes[drive].listed && !tree.nodes[drive].loaded);
-        tree.add_stored_children(drive, db.children(root.id).unwrap(), |_| false);
+        tree.add_stored_children(drive, db.children(root.id).unwrap(), |_| false, |_| false);
         let node = &tree.nodes[drive];
         assert!(node.loaded);
         assert_eq!(node.children.len(), 3);
@@ -619,7 +646,7 @@ mod tests {
         let sub = child(&tree, "sub");
         assert!(tree.nodes[sub].listed && !tree.nodes[sub].loaded);
         let sub_entry = tree.nodes[sub].entry.unwrap();
-        tree.add_stored_children(sub, db.children(sub_entry).unwrap(), |_| false);
+        tree.add_stored_children(sub, db.children(sub_entry).unwrap(), |_| false, |_| false);
         assert_eq!(tree.nodes[sub].size, 2);
         assert_eq!(tree.nodes[drive].size, 7);
         assert!(!tree.nodes[child(&tree, "unread")].listed);
