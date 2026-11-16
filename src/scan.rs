@@ -322,6 +322,10 @@ fn apply_settings(settings: Res<crate::settings::Settings>, control: Option<Res<
         .store(settings.rest_on_battery >= 0.5, Ordering::Relaxed);
     c.cpu_limit
         .store(settings.rest_cpu_percent as u32, Ordering::Relaxed);
+    c.disk_limit.store(
+        (settings.rest_disk_mb_per_sec * 1_000_000.0) as u64,
+        Ordering::Relaxed,
+    );
 }
 
 /// 開いている場面のフォルダが変わったら、そこを先に読んで（ハッシュして）もらう。
