@@ -206,6 +206,25 @@ impl Db {
         Ok(id)
     }
 
+    /// 覚えておく値（`meta` の表）。無ければ None。
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .prepare_cached("SELECT value FROM meta WHERE key = ?1")?
+            .query_row([key], |r| r.get(0))
+            .optional()
+    }
+
+    /// 値を覚えておく（`meta` の表）。
+    pub fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+            )?
+            .execute([key, value])?;
+        Ok(())
+    }
+
     /// ドライブを書く（無ければ作り、一番上の `entry` も作る）。ID の無いドライブは何もしない。
     pub fn upsert_drive(&mut self, device_id: &str, volume: &Volume) -> Result<()> {
         let Some(id) = &volume.id else {
