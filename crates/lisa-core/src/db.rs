@@ -270,6 +270,38 @@ impl Db {
         Ok(())
     }
 
+    /// `find_folder` と同じだが、覚えている番号を使わず、書き換えもしない（`&self` で引ける）。
+    pub fn find_folder_ref(
+        &self,
+        drive_id: &str,
+        mount: &Path,
+        path: &Path,
+    ) -> Result<Option<i64>> {
+        let Ok(relative) = path.strip_prefix(mount) else {
+            return Ok(None);
+        };
+        let mut id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM entry WHERE drive_id = ?1 AND parent_id IS NULL",
+                [drive_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        for part in relative.components() {
+            let Some(parent) = id else {
+                return Ok(None);
+            };
+            let name = crate::name::raw_bytes(part.as_os_str());
+            id = self
+                .conn
+                .prepare_cached("SELECT id FROM entry WHERE parent_id = ?1 AND name = ?2")?
+                .query_row(params![parent, name], |r| r.get(0))
+                .optional()?;
+        }
+        Ok(id)
+    }
+
     /// フォルダ `path`（ドライブ `drive_id` の `mount` の下）の `entry.id`。無ければ None。
     pub fn find_folder(
         &mut self,
