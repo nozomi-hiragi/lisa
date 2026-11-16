@@ -1,3 +1,6 @@
+// Windows のリリースビルドでは、起動したときに黒いコンソールの窓を出さない。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 #[cfg(debug_assertions)]
 mod debug;
 mod dups;

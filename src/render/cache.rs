@@ -354,7 +354,7 @@ pub fn bake(
     mut images: ResMut<FolderImages>,
     cache: Res<ImageCache>,
     mut assets: ResMut<Assets<Image>>,
-    asset_server: Res<AssetServer>,
+    fonts: Res<Assets<Font>>,
     font: Res<LabelFont>,
     tree: Res<FileTree>,
     layouts: Res<Layouts>,
@@ -366,7 +366,7 @@ pub fn bake(
     match bake.as_mut() {
         Bake::Waiting => {
             redraw.write(RequestRedraw);
-            if !asset_server.is_loaded_with_dependencies(&font.0) {
+            if !fonts.contains(&font.0) {
                 return;
             }
             // 鍵が変わったものだけを作り直す。

@@ -1,0 +1,4 @@
+# Mac（や Linux）から Windows 用にクロスビルドするときのリンカー（scripts/share-windows.sh）。
+# Mac では `brew install mingw-w64` で入る。
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
