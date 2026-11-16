@@ -297,6 +297,10 @@ fn relayout(
     let anchor = layouts.anchor;
     *layouts = layout(&tree, anchor, layouts[anchor].frame, spec);
     folder_images.prepare(&tree, &layouts, &mut images);
+    if refit {
+        // 耳の高さが変わると、画像の中の子の大きさも変わる。
+        folder_images.mark_all();
+    }
     commands.insert_resource(ears);
 
     *bake = Bake::Waiting;

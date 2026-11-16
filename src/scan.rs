@@ -19,6 +19,7 @@ use lisa_core::listing::{self, Listing};
 
 use crate::layout::Layouts;
 use crate::model::tree::{FileTree, NodeId};
+use crate::render::cache::FolderImages;
 use crate::view::{Nav, scene_path};
 
 /// 読む係の数。
@@ -212,6 +213,7 @@ fn apply_listings(
     scanner: Option<Res<Scanner>>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
+    mut images: ResMut<FolderImages>,
 ) {
     let Some(scanner) = scanner else {
         return;
@@ -220,6 +222,7 @@ fn apply_listings(
     let mut any = false;
     for listed in results.try_iter().take(APPLY_PER_FRAME) {
         tree.add_listing(listed.node, listed.result);
+        images.mark_changed(&tree, listed.node);
         any = true;
     }
     if any {

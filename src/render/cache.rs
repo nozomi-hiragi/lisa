@@ -5,6 +5,11 @@
 //! 焼くのは、並べてあるもの（基準のフォルダの周り、`layout.rs`）だけ。基準が変わったら、
 //! 新しく並んだものの入れ物を足し、並ばなくなったものは捨てて、まとめて焼き直す。
 //! 焼き直している間は、前に焼いた画像をそのまま見せる（同じ画像に上書きする）。
+//!
+//! 焼き直すのは、中身が変わったもの（`stale`）だけ。フォルダの画像は、そのフォルダより下の木
+//! だけで決まる（並べ方は子の数と名前順だけで決まり、画像は本体に対する相対の位置で描く）ので、
+//! フォルダが読めたら、そのフォルダと祖先だけを焼き直せばよい。基準を付け替えても中身は同じ。
+//! 耳の高さの設定が変わったときだけ、全部を焼き直す。
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,6 +38,8 @@ pub struct FolderImages {
     images: HashMap<NodeId, Handle<Image>>,
     /// 一度でも焼き上がったもの。
     baked: HashSet<NodeId>,
+    /// 次に焼くときに焼き直すもの（入れ物を作ったばかりのものと、中身が変わったもの）。
+    stale: HashSet<NodeId>,
 }
 
 impl FolderImages {
@@ -43,6 +50,20 @@ impl FolderImages {
         } else {
             None
         }
+    }
+
+    /// フォルダの中身が変わった（読めた、状態が変わった）。そのフォルダと祖先を焼き直す。
+    pub fn mark_changed(&mut self, tree: &FileTree, id: NodeId) {
+        let mut cur = Some(id);
+        while let Some(i) = cur {
+            self.stale.insert(i);
+            cur = tree.nodes[i].parent;
+        }
+    }
+
+    /// 全部を焼き直す（見た目の設定が変わったとき）。
+    pub fn mark_all(&mut self) {
+        self.stale.extend(self.images.keys().copied());
     }
 
     /// 並べてあるフォルダ（Root 以外）のうち、基準から 2 段下までの画像の入れ物をそろえる
@@ -64,7 +85,9 @@ impl FolderImages {
         self.baked.retain(|id| wanted.contains(id));
         let height = (IMAGE_WIDTH as f32 / BODY_ASPECT).round() as u32;
         for id in wanted {
+            let stale = &mut self.stale;
             self.images.entry(id).or_insert_with(|| {
+                stale.insert(id);
                 assets.add(Image::new_target_texture(
                     IMAGE_WIDTH,
                     height,
@@ -113,9 +136,20 @@ pub fn bake(
             if !asset_server.is_loaded_with_dependencies(&font.0) {
                 return;
             }
+            // 焼き直すのは、中身が変わったものだけ。
+            let stale = std::mem::take(&mut images.stale);
+            let targets: Vec<(NodeId, Handle<Image>)> = images
+                .images
+                .iter()
+                .filter(|(id, _)| stale.contains(id))
+                .map(|(&id, image)| (id, image.clone()))
+                .collect();
+            if targets.is_empty() {
+                *bake = Bake::Done;
+                return;
+            }
             // 親の場面には子の画像を貼る。子は同じフレームの先に焼かれる。
-            let all: Vec<NodeId> = images.images.keys().copied().collect();
-            images.baked.extend(all);
+            images.baked.extend(targets.iter().map(|(id, _)| *id));
             let source = SceneSource {
                 tree: &tree,
                 layouts: &layouts,
@@ -124,7 +158,7 @@ pub fn bake(
                 ears: &ears,
             };
             let mut entities = Vec::new();
-            for (i, (&id, image)) in images.images.iter().enumerate() {
+            for (i, (id, image)) in targets.into_iter().enumerate() {
                 // `layer` は const で 64 個までしか作れないので、`from_layers` を使う。
                 let layer = RenderLayers::from_layers(&[i + 1]);
                 let frame = layouts[id].frame;
