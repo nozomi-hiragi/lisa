@@ -171,6 +171,7 @@ fn show_progress(
         crate::scan::Rest::Paused => format!("{head}（一時停止中）"),
         crate::scan::Rest::Battery => format!("{head}（電池なので休み中）"),
         crate::scan::Rest::Cpu => format!("{head}（CPU が混んでいるので休み中）"),
+        crate::scan::Rest::Disk => format!("{head}（ディスクが混んでいるので休み中）"),
     };
     if let Ok(mut text) = summary.single_mut()
         && text.0 != head

@@ -27,6 +27,8 @@ pub struct Settings {
     pub rest_on_battery: f32,
     /// CPU の混み具合（%）がこれを超えたら、裏の分を休む（100 なら休まない）。
     pub rest_cpu_percent: f32,
+    /// ほかのアプリのディスクの読み書き（MB 毎秒）がこれを超えたら、裏の分を休む（0 なら休まない）。
+    pub rest_disk_mb_per_sec: f32,
 }
 
 impl Default for Settings {
@@ -37,6 +39,7 @@ impl Default for Settings {
             background_mb_per_sec: 200.0,
             rest_on_battery: 1.0,
             rest_cpu_percent: 80.0,
+            rest_disk_mb_per_sec: 100.0,
         }
     }
 }
@@ -60,15 +63,17 @@ enum Item {
     BackgroundSpeed,
     RestOnBattery,
     RestCpu,
+    RestDisk,
 }
 
 impl Item {
-    const ALL: [Item; 5] = [
+    const ALL: [Item; 6] = [
         Item::EarSelected,
         Item::EarPreview,
         Item::BackgroundSpeed,
         Item::RestOnBattery,
         Item::RestCpu,
+        Item::RestDisk,
     ];
 
     fn label(self) -> &'static str {
@@ -78,6 +83,7 @@ impl Item {
             Item::BackgroundSpeed => "裏で読む速さの上限",
             Item::RestOnBattery => "電池のときは裏で読まない",
             Item::RestCpu => "CPU が混んだら裏で読まない",
+            Item::RestDisk => "ディスクが混んだら裏で読まない",
         }
     }
 
@@ -89,6 +95,7 @@ impl Item {
             Item::BackgroundSpeed => (0.0, 2000.0, 50.0),
             Item::RestOnBattery => (0.0, 1.0, 1.0),
             Item::RestCpu => (20.0, 100.0, 10.0),
+            Item::RestDisk => (0.0, 1000.0, 25.0),
         }
     }
 
@@ -99,6 +106,7 @@ impl Item {
             Item::BackgroundSpeed => settings.background_mb_per_sec,
             Item::RestOnBattery => settings.rest_on_battery,
             Item::RestCpu => settings.rest_cpu_percent,
+            Item::RestDisk => settings.rest_disk_mb_per_sec,
         }
     }
 
@@ -111,6 +119,7 @@ impl Item {
             Item::BackgroundSpeed => settings.background_mb_per_sec = value,
             Item::RestOnBattery => settings.rest_on_battery = value.round(),
             Item::RestCpu => settings.rest_cpu_percent = value,
+            Item::RestDisk => settings.rest_disk_mb_per_sec = value,
         }
     }
 
@@ -124,6 +133,8 @@ impl Item {
             Item::RestOnBattery => "休まない".into(),
             Item::RestCpu if settings.rest_cpu_percent >= 100.0 => "休まない".into(),
             Item::RestCpu => format!("{} % 超", settings.rest_cpu_percent),
+            Item::RestDisk if settings.rest_disk_mb_per_sec <= 0.0 => "休まない".into(),
+            Item::RestDisk => format!("{} MB/秒超", settings.rest_disk_mb_per_sec),
         }
     }
 

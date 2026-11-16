@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 use crate::name;
 
 /// 種類。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     File,
     Dir,

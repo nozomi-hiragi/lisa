@@ -5,7 +5,8 @@
 //!   （ハッシュは 1 MiB ごとに合図を見る）、先にそれを 1 段読み直す。DB と違えば DB を直し、変わった
 //!   ものとそのフォルダ・祖先のハッシュを消して（古い）、ハッシュし直す。これは決まりにかからない。
 //! - 裏の分は I/O を後回しにし（`pace::set_thread_background`）、速さの上限（設定）を守る。
-//! - 一時停止、電池で動いているとき、CPU が混んでいるとき（設定のしきい値）は休む。
+//! - 一時停止、電池で動いているとき、CPU が混んでいるとき、ほかのアプリがディスクをたくさん読み書き
+//!   しているとき（設定のしきい値）は休む。
 //! - 監視（`Request::Hint`、FSEvents など）で変わったと知らされたフォルダは、裏の分として（上の
 //!   決まりに従って）読み直す。
 
@@ -30,6 +31,9 @@ const COMMIT_EVERY: Duration = Duration::from_millis(300);
 const HASH_THREADS: usize = 4;
 /// 休む・止めるかを見直す間隔。
 const CHECK_EVERY: Duration = Duration::from_secs(2);
+/// 前回のイベント番号を覚えておく `meta` の鍵。
+#[cfg(target_os = "macos")]
+const EVENT_ID_KEY: &str = "fsevents_event_id";
 /// 休んでいるあいだ、合図を見に行く間隔。
 const NAP: Duration = Duration::from_millis(250);
 
@@ -48,6 +52,7 @@ pub enum Rest {
     Paused = 1,
     Battery = 2,
     Cpu = 3,
+    Disk = 4,
 }
 
 /// UI と読む係で分け合う、裏で読むときの決まり。
@@ -62,6 +67,8 @@ pub struct Control {
     pub rest_on_battery: AtomicBool,
     /// CPU の混み具合（%）がこれを超えたら休む（100 なら休まない）。
     pub cpu_limit: AtomicU32,
+    /// ほかのアプリのディスクの読み書き（バイト毎秒）がこれを超えたら休む（0 なら休まない）。
+    pub disk_limit: AtomicU64,
     /// 今休んでいる理由（`Rest`）。
     pub resting: AtomicU8,
 }
@@ -74,6 +81,7 @@ impl Default for Control {
             limit: AtomicU64::new(0),
             rest_on_battery: AtomicBool::new(true),
             cpu_limit: AtomicU32::new(100),
+            disk_limit: AtomicU64::new(0),
             resting: AtomicU8::new(Rest::No as u8),
         }
     }
@@ -85,6 +93,7 @@ impl Control {
             1 => Rest::Paused,
             2 => Rest::Battery,
             3 => Rest::Cpu,
+            4 => Rest::Disk,
             _ => Rest::No,
         }
     }
@@ -95,8 +104,11 @@ struct Background {
     control: Arc<Control>,
     /// 速さの上限を守るための、この秒の始まりと、その秒に読んだ量。
     window: Mutex<(Instant, u64)>,
-    /// 最後に電池と CPU を見た時刻と、そのときの答え。
+    /// 最後に電池と CPU とディスクを見た時刻と、そのときの答え。
     checked: Mutex<(Option<Instant>, Rest)>,
+    /// 前に見たディスクの読み書きの累計と、それから自分で読んだ量（ほかのアプリの分を出すため）。
+    disk: Mutex<Option<u64>>,
+    ours: AtomicU64,
 }
 
 impl Background {
@@ -105,6 +117,8 @@ impl Background {
             control,
             window: Mutex::new((Instant::now(), 0)),
             checked: Mutex::new((None, Rest::No)),
+            disk: Mutex::new(None),
+            ours: AtomicU64::new(0),
         }
     }
 
@@ -116,17 +130,33 @@ impl Background {
         } else {
             let mut checked = self.checked.lock().expect("休むかどうか");
             if checked.0.is_none_or(|t| t.elapsed() >= CHECK_EVERY) {
+                let seconds = checked.0.map(|t| t.elapsed().as_secs_f64());
                 let battery =
                     c.rest_on_battery.load(Ordering::Relaxed) && lisa_core::pace::on_battery();
                 let limit = c.cpu_limit.load(Ordering::Relaxed);
                 let cpu = limit < 100
                     && lisa_core::pace::cpu_load_percent().is_some_and(|p| p > limit as f32);
+                // ほかのアプリのディスクの読み書き = 全体の増えた分 − 自分で読んだ分。
+                let disk_limit = c.disk_limit.load(Ordering::Relaxed);
+                let total = lisa_core::pace::disk_bytes();
+                let ours = self.ours.swap(0, Ordering::Relaxed);
+                let mut last = self.disk.lock().expect("ディスク");
+                let disk = match (disk_limit, *last, total, seconds) {
+                    (1.., Some(before), Some(now), Some(seconds)) if seconds > 0.0 => {
+                        let others = now.saturating_sub(before).saturating_sub(ours);
+                        others as f64 / seconds > disk_limit as f64
+                    }
+                    _ => false,
+                };
+                *last = total;
                 *checked = (
                     Some(Instant::now()),
                     if battery {
                         Rest::Battery
                     } else if cpu {
                         Rest::Cpu
+                    } else if disk {
+                        Rest::Disk
                     } else {
                         Rest::No
                     },
@@ -145,6 +175,7 @@ impl Background {
 
     /// 裏の分を続けてよいか。`bytes` だけ読んだので、速さの上限を超えていれば待つ。
     fn step(&self, bytes: u64) -> bool {
+        self.ours.fetch_add(bytes, Ordering::Relaxed);
         if self.urgent() || self.rest() != Rest::No {
             return false;
         }
@@ -187,6 +218,8 @@ pub(super) struct Worker {
 impl Worker {
     pub fn run(mut self) {
         let background = Background::new(self.control.clone());
+        // 前回終わってから変わったところ（Mac の FSEvents の履歴）を、読み直しの知らせにする。
+        self.changes_since_last_run();
         let mut stack = self.initial_stack();
         if stack.is_empty() {
             report(&self.progress, |p| p.finished = Some(Instant::now()));
@@ -287,8 +320,63 @@ impl Worker {
                         return;
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                // 暇なときに、ここまでの変化は見たという印を付け直す（次の起動の「前回」）。
+                Err(RecvTimeoutError::Timeout) => self.remember_event_id(),
                 Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// 前回覚えたイベント番号から今までに変わったフォルダを、読み直しの知らせにする（Mac のみ）。
+    fn changes_since_last_run(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(db) = self.db.as_ref() else {
+                return;
+            };
+            let since = db
+                .meta(EVENT_ID_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok());
+            let now = lisa_core::fsevents::current_event_id();
+            if let Some(since) = since.filter(|&s| s < now) {
+                let roots: Vec<&Path> = self
+                    .roots
+                    .iter()
+                    .filter(|r| r.drive_id.is_some())
+                    .map(|r| r.mount.as_path())
+                    .collect();
+                match lisa_core::fsevents::since(&roots, since, Duration::from_secs(30)) {
+                    Some(history) => {
+                        if history.dropped {
+                            warn!("前回からの変化の一部が FSEvents で捨てられていました");
+                        }
+                        let before = self.hints.len();
+                        for folder in history.folders {
+                            if let Some(path) = self.locate(&folder) {
+                                self.hints.insert(path);
+                            }
+                        }
+                        bevy::log::info!(
+                            "前回から変わったフォルダ: {} 個",
+                            self.hints.len() - before
+                        );
+                    }
+                    None => warn!("前回からの変化（FSEvents の履歴）をもらえませんでした"),
+                }
+            }
+            self.remember_event_id();
+        }
+    }
+
+    /// 今のイベント番号を覚える（ここまでの変化は、もう知らせとして受け取った）。
+    fn remember_event_id(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(db) = self.db.as_mut() {
+            let now = lisa_core::fsevents::current_event_id();
+            if let Err(error) = db.set_meta(EVENT_ID_KEY, &now.to_string()) {
+                warn!("イベント番号を覚えられませんでした: {error}");
             }
         }
     }
@@ -406,7 +494,9 @@ impl Worker {
                 alive
             }
             Request::Hint(path) => {
-                self.hints.insert(path);
+                if let Some(path) = self.locate(&path) {
+                    self.hints.insert(path);
+                }
                 true
             }
         }
@@ -579,6 +669,21 @@ impl Worker {
             && (!committed || self.send(Message::Committed));
         self.wake();
         (alive, changed)
+    }
+
+    /// 知らせのパスを、読むドライブの下のパスにする。Mac の FSEvents は起動ディスクの Data のボリュームの
+    /// 中を `/Users/…` のように firmlink の側で知らせるので、`/System/Volumes/Data` を前に付けて探す。
+    /// どのドライブの下でもなければ None。
+    fn locate(&self, path: &Path) -> Option<PathBuf> {
+        if self.root_of(path).is_some() {
+            return Some(path.to_path_buf());
+        }
+        let relative = path.strip_prefix("/").ok()?;
+        self.roots
+            .iter()
+            .filter(|r| r.drive_id.is_some())
+            .map(|r| r.mount.join(relative))
+            .find(|p| self.root_of(p).is_some() && p.exists())
     }
 
     /// `path` があるドライブ（つないでいる場所がいちばん長く合うもの）。

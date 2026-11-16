@@ -16,7 +16,7 @@ use crate::hash::Hash;
 use crate::listing::Kind;
 
 /// 組の中の 1 か所。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Copy {
     pub drive_id: String,
     /// 場所（ドライブを最後につないでいた場所と、その下のパス）。
@@ -28,7 +28,7 @@ pub struct Copy {
 }
 
 /// 同じ中身のファイルかフォルダの組。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Group {
     pub kind: Kind,
     /// 最初のものの名前（表示用）。
@@ -49,6 +49,35 @@ impl Group {
     pub fn total(&self) -> u64 {
         self.size * self.copies.len() as u64
     }
+}
+
+/// 一覧を作ったときの DB の状態（ドライブごとの一番上のハッシュ）。これが同じなら、一覧も同じ。
+pub type Signature = Vec<(String, Option<Hash>)>;
+
+/// 今の DB の状態。どれかのドライブの一番上のハッシュが無ければ（ハッシュの途中なら）、一覧が同じとは
+/// 言えないので None。
+pub fn signature(db: &Db) -> Result<Option<Signature>> {
+    let ids: Vec<String> = db
+        .conn()
+        .prepare("SELECT id FROM drive ORDER BY id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    let mut signature = Vec::new();
+    for id in ids {
+        let hash = db.drive_root(&id)?.and_then(|root| root.hash);
+        if hash.is_none() {
+            return Ok(None);
+        }
+        signature.push((id, hash));
+    }
+    Ok(Some(signature))
+}
+
+/// キャッシュに残す一覧と、そのときの DB の状態。
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Cached {
+    pub signature: Signature,
+    pub groups: Vec<Group>,
 }
 
 /// 木の形（全部の行の親と、フォルダの中の合計）。`entry.id` で引く。

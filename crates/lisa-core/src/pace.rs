@@ -5,6 +5,7 @@
 //! - 電池で動いているか（Mac は IOKit の `IOPSGetTimeRemainingEstimate`、Windows は
 //!   `GetSystemPowerStatus`）。
 //! - CPU の混み具合（Unix は 1 分の load average をコアの数で割ったもの）。
+//! - ディスクの読み書きの累計（Mac は IOKit の `IOBlockStorageDriver` の統計）。
 
 /// このスレッドの I/O を、裏で読む分として後回しにする（`false` で元に戻す）。
 pub fn set_thread_background(on: bool) {
@@ -71,6 +72,122 @@ pub fn on_battery() -> bool {
     false
 }
 
+/// これまでにディスク（全部のブロックデバイス）で読み書きしたバイト数の合計。起動してからの累計なので、
+/// 2 回の差を時間で割ると速さになる。分からなければ None。
+///
+/// Mac: IOKit の `IOBlockStorageDriver` の `Statistics`（`Bytes (Read)` と `Bytes (Write)`）。
+pub fn disk_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        mac_disk::bytes()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+#[cfg(target_os = "macos")]
+mod mac_disk {
+    use std::ffi::{c_char, c_void};
+
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type IoObject = u32;
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT64_TYPE: isize = 4;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: *const c_void,
+            text: *const c_char,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+        fn CFNumberGetValue(number: *const c_void, kind: isize, out: *mut c_void) -> bool;
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFDictionaryGetTypeID() -> usize;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingServices(
+            main_port: u32,
+            matching: *mut c_void,
+            iterator: *mut IoObject,
+        ) -> i32;
+        fn IOIteratorNext(iterator: IoObject) -> IoObject;
+        fn IORegistryEntryCreateCFProperty(
+            entry: IoObject,
+            key: CFStringRef,
+            allocator: *const c_void,
+            options: u32,
+        ) -> CFTypeRef;
+        fn IOObjectRelease(object: IoObject) -> i32;
+    }
+
+    /// C の文字列から CFString を作る（呼んだ側が CFRelease する）。
+    fn cf_string(text: &std::ffi::CStr) -> CFStringRef {
+        // SAFETY: NUL 終端の文字列を渡す。
+        unsafe {
+            CFStringCreateWithCString(std::ptr::null(), text.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+        }
+    }
+
+    pub fn bytes() -> Option<u64> {
+        let statistics = cf_string(c"Statistics");
+        let read = cf_string(c"Bytes (Read)");
+        let write = cf_string(c"Bytes (Write)");
+        let mut total: Option<u64> = None;
+        // SAFETY: IOKit と CoreFoundation の決まりどおりに作って放す。辞書と数は、型を確かめてから読む。
+        unsafe {
+            let matching = IOServiceMatching(c"IOBlockStorageDriver".as_ptr());
+            let mut iterator: IoObject = 0;
+            // IOServiceGetMatchingServices は matching を受け取って放す。
+            if !matching.is_null() && IOServiceGetMatchingServices(0, matching, &mut iterator) == 0
+            {
+                loop {
+                    let service = IOIteratorNext(iterator);
+                    if service == 0 {
+                        break;
+                    }
+                    let dict =
+                        IORegistryEntryCreateCFProperty(service, statistics, std::ptr::null(), 0);
+                    if !dict.is_null() {
+                        if CFGetTypeID(dict) == CFDictionaryGetTypeID() {
+                            for key in [read, write] {
+                                let number = CFDictionaryGetValue(dict, key);
+                                let mut value: i64 = 0;
+                                if !number.is_null()
+                                    && CFNumberGetValue(
+                                        number,
+                                        K_CF_NUMBER_SINT64_TYPE,
+                                        (&mut value as *mut i64).cast(),
+                                    )
+                                {
+                                    *total.get_or_insert(0) += value.max(0) as u64;
+                                }
+                            }
+                        }
+                        CFRelease(dict);
+                    }
+                    IOObjectRelease(service);
+                }
+                IOObjectRelease(iterator);
+            }
+            for s in [statistics, read, write] {
+                if !s.is_null() {
+                    CFRelease(s);
+                }
+            }
+        }
+        total
+    }
+}
+
 /// CPU の混み具合（%、コア全部を使い切って 100）。分からなければ None。
 pub fn cpu_load_percent() -> Option<f32> {
     #[cfg(unix)]
@@ -102,5 +219,12 @@ mod tests {
         let _ = on_battery();
         #[cfg(unix)]
         assert!(cpu_load_percent().is_some());
+        #[cfg(target_os = "macos")]
+        {
+            // 読み書きの累計は、減らない。
+            let a = disk_bytes().expect("ディスクの統計");
+            let b = disk_bytes().expect("ディスクの統計");
+            assert!(b >= a);
+        }
     }
 }
