@@ -78,6 +78,37 @@ cargo run -p lisa-scan -- drives             # つながっているドライブ
   （ラバーバンド）。
 - 詳しい決まりは [docs/input.md](docs/input.md) にあります。
 
+## MCP で使う
+
+`lisa-mcp` は、Claude などの MCP クライアントから Lisa を使うためのサーバーです（標準入出力）。
+ファイルは何も動かしません。
+
+```sh
+cargo build --release -p lisa-mcp
+claude mcp add lisa -- "$PWD/target/release/lisa-mcp"   # Claude Code に足す
+```
+
+| 道具 | 内容 | アプリ |
+| --- | --- | --- |
+| `lisa_drives` | 読んだドライブの一覧 | 要らない |
+| `lisa_list` | フォルダの中身（1 段、名前順か大きさ順） | 要らない |
+| `lisa_info` | 1 つの情報（ハッシュ、同じ中身の数、フォルダの中の合計） | 要らない |
+| `lisa_search` | 名前で探す | 要らない |
+| `lisa_duplicates` | 重複の一覧（大きさや場所で絞れる） | 要らない |
+| `lisa_copies` | 同じ中身の場所を全部 | 要らない |
+| `lisa_snapshots` | ドライブごとのスナップショット | 要らない |
+| `lisa_app_state` | 開いているフォルダ、重複の一覧、読み込みの進み具合 | 起動中 |
+| `lisa_app_show` | その場所へ画面を飛ばす | 起動中 |
+| `lisa_app_duplicates` | 重複の一覧を開け閉めし、組を選んで光らせる | 起動中 |
+| `lisa_app_rescan` | フォルダを先に読み直してもらう | 起動中 |
+| `lisa_app_pause` | 裏の読み込みの一時停止・再開 | 起動中 |
+
+- DB を読む道具は、アプリの DB（`~/Library/Application Support/Lisa/lisa.db`）を読むだけです。
+  アプリが起動していなくても使えます。パスは Mac の `/Users/…` のままで引けます。
+- `lisa_app_*` は、起動中のアプリに頼みます。アプリは起動すると `127.0.0.1` の空いている番号で待ち、
+  番号と合言葉（起動ごとに作る）を DB と同じフォルダの `control.json` に書きます（自分だけ読める）。
+  合言葉の合わない頼みは断ります。
+
 ## 設定
 
 メニューバーの「設定」で変えられます。値は次のファイルに保存され、起動時に読み込みます。

@@ -4,6 +4,7 @@ mod dups;
 mod input;
 mod layout;
 mod model;
+mod remote;
 mod render;
 mod scan;
 mod settings;
@@ -41,6 +42,7 @@ fn main() {
         ui::progress::ProgressPlugin,
         ui::dups::DupsPanelPlugin,
         dups::DupsPlugin,
+        remote::RemotePlugin,
     ));
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);
