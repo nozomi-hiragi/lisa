@@ -31,6 +31,9 @@ const COMMIT_EVERY: Duration = Duration::from_millis(300);
 const HASH_THREADS: usize = 4;
 /// 休む・止めるかを見直す間隔。
 const CHECK_EVERY: Duration = Duration::from_secs(2);
+/// 前回のイベント番号を覚えておく `meta` の鍵。
+#[cfg(target_os = "macos")]
+const EVENT_ID_KEY: &str = "fsevents_event_id";
 /// 休んでいるあいだ、合図を見に行く間隔。
 const NAP: Duration = Duration::from_millis(250);
 
@@ -215,6 +218,8 @@ pub(super) struct Worker {
 impl Worker {
     pub fn run(mut self) {
         let background = Background::new(self.control.clone());
+        // 前回終わってから変わったところ（Mac の FSEvents の履歴）を、読み直しの知らせにする。
+        self.changes_since_last_run();
         let mut stack = self.initial_stack();
         if stack.is_empty() {
             report(&self.progress, |p| p.finished = Some(Instant::now()));
@@ -315,8 +320,63 @@ impl Worker {
                         return;
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                // 暇なときに、ここまでの変化は見たという印を付け直す（次の起動の「前回」）。
+                Err(RecvTimeoutError::Timeout) => self.remember_event_id(),
                 Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// 前回覚えたイベント番号から今までに変わったフォルダを、読み直しの知らせにする（Mac のみ）。
+    fn changes_since_last_run(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(db) = self.db.as_ref() else {
+                return;
+            };
+            let since = db
+                .meta(EVENT_ID_KEY)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u64>().ok());
+            let now = lisa_core::fsevents::current_event_id();
+            if let Some(since) = since.filter(|&s| s < now) {
+                let roots: Vec<&Path> = self
+                    .roots
+                    .iter()
+                    .filter(|r| r.drive_id.is_some())
+                    .map(|r| r.mount.as_path())
+                    .collect();
+                match lisa_core::fsevents::since(&roots, since, Duration::from_secs(30)) {
+                    Some(history) => {
+                        if history.dropped {
+                            warn!("前回からの変化の一部が FSEvents で捨てられていました");
+                        }
+                        let before = self.hints.len();
+                        for folder in history.folders {
+                            if let Some(path) = self.locate(&folder) {
+                                self.hints.insert(path);
+                            }
+                        }
+                        bevy::log::info!(
+                            "前回から変わったフォルダ: {} 個",
+                            self.hints.len() - before
+                        );
+                    }
+                    None => warn!("前回からの変化（FSEvents の履歴）をもらえませんでした"),
+                }
+            }
+            self.remember_event_id();
+        }
+    }
+
+    /// 今のイベント番号を覚える（ここまでの変化は、もう知らせとして受け取った）。
+    fn remember_event_id(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(db) = self.db.as_mut() {
+            let now = lisa_core::fsevents::current_event_id();
+            if let Err(error) = db.set_meta(EVENT_ID_KEY, &now.to_string()) {
+                warn!("イベント番号を覚えられませんでした: {error}");
             }
         }
     }
@@ -434,7 +494,9 @@ impl Worker {
                 alive
             }
             Request::Hint(path) => {
-                self.hints.insert(path);
+                if let Some(path) = self.locate(&path) {
+                    self.hints.insert(path);
+                }
                 true
             }
         }
@@ -607,6 +669,21 @@ impl Worker {
             && (!committed || self.send(Message::Committed));
         self.wake();
         (alive, changed)
+    }
+
+    /// 知らせのパスを、読むドライブの下のパスにする。Mac の FSEvents は起動ディスクの Data のボリュームの
+    /// 中を `/Users/…` のように firmlink の側で知らせるので、`/System/Volumes/Data` を前に付けて探す。
+    /// どのドライブの下でもなければ None。
+    fn locate(&self, path: &Path) -> Option<PathBuf> {
+        if self.root_of(path).is_some() {
+            return Some(path.to_path_buf());
+        }
+        let relative = path.strip_prefix("/").ok()?;
+        self.roots
+            .iter()
+            .filter(|r| r.drive_id.is_some())
+            .map(|r| r.mount.join(relative))
+            .find(|p| self.root_of(p).is_some() && p.exists())
     }
 
     /// `path` があるドライブ（つないでいる場所がいちばん長く合うもの）。
