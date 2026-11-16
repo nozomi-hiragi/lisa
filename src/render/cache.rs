@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, SystemTime};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -38,6 +39,10 @@ const MAX_IMAGES: usize = 300;
 const BAKE_FRAMES: u32 = 3;
 /// 描き方の版。描き方を変えたら上げる（ディスクの古い画像を使わなくなる）。
 const DRAW_VERSION: u32 = 1;
+/// 使わないまま、これより経った画像は消す。
+const KEEP_UNUSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// 画像のキャッシュの大きさの上限（超えた分は、使っていない古いものから消す）。
+const KEEP_BYTES: u64 = 1 << 30;
 /// WebP の品質（0〜100）。
 const WEBP_QUALITY: f32 = 85.0;
 
@@ -144,6 +149,19 @@ impl ImageCache {
             .map(|dirs| dirs.cache_dir().join("folder-images"));
         if let Some(dir) = &dir {
             let _ = std::fs::create_dir_all(dir);
+            // 使われなくなった画像を、裏で消す。
+            let sweep_dir = dir.clone();
+            std::thread::Builder::new()
+                .name("lisa-image-sweeper".into())
+                .spawn(move || {
+                    lisa_core::pace::set_thread_background(true);
+                    let (files, bytes) =
+                        sweep(&sweep_dir, SystemTime::now(), KEEP_UNUSED, KEEP_BYTES);
+                    if files > 0 {
+                        info!("使われなくなった画像を {files} 枚（{bytes} バイト）消しました");
+                    }
+                })
+                .expect("画像を掃除する係を作る");
         }
         let (save, receiver) = channel::<(Key, Vec<u8>)>();
         let writer_dir = dir.clone();
@@ -192,6 +210,11 @@ fn write_webp(dir: &std::path::Path, key: &Key, rgba: &[u8]) {
 
 fn read_webp(path: &std::path::Path) -> Option<Vec<u8>> {
     let bytes = std::fs::read(path).ok()?;
+    // 使った印（掃除のときの、最後に使った日時）。
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(SystemTime::now()));
     let image = webp::Decoder::new(&bytes).decode()?;
     if image.width() != IMAGE_WIDTH || image.height() != image_height() {
         return None;
@@ -209,6 +232,44 @@ fn read_webp(path: &std::path::Path) -> Option<Vec<u8>> {
                 .collect(),
         )
     }
+}
+
+/// 使われなくなった画像を消す。最後に使ってから（ファイルの更新日時。読むたびに付け直す）`keep` より
+/// 経ったものと、全部で `max_bytes` を超える分の古いものから。途中で残った書きかけ（`.webp.tmp`）も
+/// 消す。消すのはキャッシュのフォルダの中の画像だけ。（消した数、消した大きさ）を返す。
+fn sweep(dir: &std::path::Path, now: SystemTime, keep: Duration, max_bytes: u64) -> (u64, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !(name.ends_with(".webp") || name.ends_with(".webp.tmp")) {
+                return None;
+            }
+            let meta = entry.metadata().ok().filter(|m| m.is_file())?;
+            Some((meta.modified().ok()?, meta.len(), path))
+        })
+        .collect();
+    // 新しいものから並べて、残す分を決める。
+    files.sort_by_key(|(time, ..)| std::cmp::Reverse(*time));
+    let mut kept = 0u64;
+    let (mut removed, mut removed_bytes) = (0, 0);
+    for (time, size, path) in files {
+        let old = now.duration_since(time).unwrap_or_default() > keep;
+        let tmp = path.extension().is_some_and(|e| e == "tmp");
+        if old || tmp || kept + size > max_bytes {
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+                removed_bytes += size;
+            }
+        } else {
+            kept += size;
+        }
+    }
+    (removed, removed_bytes)
 }
 
 /// 見た目の設定のハッシュ（鍵の元のひとつ）。
@@ -527,6 +588,41 @@ fn start_baking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_removes_old_and_over_budget_images_only() {
+        let dir = std::env::temp_dir().join(format!("lisa-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let day = Duration::from_secs(24 * 60 * 60);
+        let make = |name: &str, bytes: usize, age: Duration| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0u8; bytes]).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        };
+        make("new.webp", 100, Duration::ZERO);
+        make("mid.webp", 100, day);
+        make("older.webp", 100, 2 * day);
+        make("ancient.webp", 10, 60 * day);
+        make("half.webp.tmp", 10, Duration::ZERO);
+        make("other.txt", 10, 60 * day);
+        // 30 日より古いもの、書きかけ、250 バイトを超える分（古いほう）を消す。
+        let (files, bytes) = sweep(&dir, now, 30 * day, 250);
+        assert_eq!((files, bytes), (3, 120));
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["mid.webp", "new.webp", "other.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn webp_round_trip_keeps_the_size() {
