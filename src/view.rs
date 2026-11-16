@@ -38,6 +38,10 @@ pub(crate) use title::{Breadcrumb, show_breadcrumb, update_title};
 
 pub struct TreeViewPlugin;
 
+/// 画面の処理（木を読む処理 `scan.rs` は、この前に動く）。
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ViewSystems;
+
 impl Plugin for TreeViewPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(WinitSettings {
@@ -46,7 +50,6 @@ impl Plugin for TreeViewPlugin {
             unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs(1)),
         })
         .insert_resource(ClearColor(BACKGROUND))
-        .insert_resource(FileTree::dummy())
         .insert_resource(Nav {
             stack: vec![Level {
                 node: FileTree::ROOT,
@@ -81,6 +84,7 @@ impl Plugin for TreeViewPlugin {
                 update_title,
             )
                 .chain()
+                .in_set(ViewSystems)
                 .after(MenuSystems),
         );
     }
@@ -260,18 +264,33 @@ fn relayout(
     window: Single<&Window, With<PrimaryWindow>>,
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
+    tree_changed: Option<ResMut<crate::scan::TreeChanged>>,
 ) {
-    // 耳の高さが変わったときだけ（ほかの設定では配置は変わらない）。
+    // 耳の高さが変わったとき（ほかの設定では配置は変わらない）か、木が変わったとき。
     let ears = [settings.ear_selected_px, settings.ear_preview_px];
     if laid_out_with.is_some_and(|h| h != ears) {
         *pending = true;
     }
     *laid_out_with = Some(ears);
-    // ズームや画像を焼いている途中なら、終わってからやる。
-    if !*pending || animating.is_some() || !fades.is_empty() || !matches!(*bake, Bake::Done) {
+    let mut tree_changed = tree_changed;
+    let tree_due = tree_changed.as_ref().is_some_and(|c| c.due());
+    // ズームや画像を焼いている途中、指で動かしている途中なら、終わってからやる。
+    let busy = animating.is_some()
+        || !fades.is_empty()
+        || gesture.active()
+        || gesture.has_parent_scene()
+        || !matches!(*bake, Bake::Done);
+    if !(*pending || tree_due) || busy {
         return;
     }
+    // 耳の高さを変えたときは、開いているものに合わせ直す。木が変わっただけなら、見え方はそのまま。
+    let refit = *pending;
     *pending = false;
+    if let Some(changed) = tree_changed.as_mut() {
+        changed.pending = false;
+        changed.last = Some(Instant::now());
+    }
 
     let (spec, ears) = ear_spec(&settings, &window);
     // 基準のフォルダは同じ場所に置いたまま、耳の大きさだけ変えて並べ直す。
@@ -281,7 +300,7 @@ fn relayout(
     commands.insert_resource(ears);
 
     *bake = Bake::Waiting;
-    commands.insert_resource(Relaid { refit: true });
+    commands.insert_resource(Relaid { refit });
 }
 
 /// 開いている場面のフォルダが基準から外れたまま止まったら、そのフォルダを基準にして並べ直す。

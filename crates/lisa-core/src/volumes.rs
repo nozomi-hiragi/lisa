@@ -34,6 +34,34 @@ pub struct Volume {
     pub hidden: bool,
 }
 
+/// この端末の名前（最初の表示名に使う）。取れなければ「この端末」。
+pub fn device_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buffer = [0u8; 256];
+        unsafe extern "C" {
+            fn gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: 長さを渡したバッファに書いてもらう。
+        if unsafe { gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0 {
+            let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+            let name = String::from_utf8_lossy(&buffer[..end]);
+            // Mac は「simura.local」のように付くので、最初の部分だけ。
+            let name = name.split('.').next().unwrap_or_default();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    #[cfg(windows)]
+    if let Ok(name) = std::env::var("COMPUTERNAME")
+        && !name.is_empty()
+    {
+        return name;
+    }
+    "この端末".to_string()
+}
+
 /// つながっているボリュームの一覧。
 pub fn list() -> io::Result<Vec<Volume>> {
     imp::list()

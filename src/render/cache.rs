@@ -22,6 +22,8 @@ use crate::render::scene::{self, LabelFont, SceneSource};
 
 /// 画像の幅（ピクセル）。高さは本体の縦横比（√2:1）に合わせる。
 const IMAGE_WIDTH: u32 = 1024;
+/// 一度に持つ画像の数の上限。
+const MAX_IMAGES: usize = 300;
 /// 焼くカメラを何フレーム残すか（描き終わるまでの余裕）。
 const BAKE_FRAMES: u32 = 3;
 
@@ -43,12 +45,21 @@ impl FolderImages {
         }
     }
 
-    /// 並べてあるフォルダ（Root 以外）の画像の入れ物をそろえる。並ばなくなったものは捨てる。
+    /// 並べてあるフォルダ（Root 以外）のうち、基準から 2 段下までの画像の入れ物をそろえる
+    /// （それより下は、画像の中でも見分けられないほど小さい）。浅いものから `MAX_IMAGES` まで。
+    /// 並ばなくなったものは捨てる。
     pub fn prepare(&mut self, tree: &FileTree, layouts: &Layouts, assets: &mut Assets<Image>) {
-        let wanted: HashSet<NodeId> = layouts
+        let until = tree.nodes[layouts.anchor].depth + 2;
+        let mut candidates: Vec<NodeId> = layouts
             .ids()
-            .filter(|&id| id != FileTree::ROOT && tree.nodes[id].is_dir)
+            .filter(|&id| {
+                let node = &tree.nodes[id];
+                id != FileTree::ROOT && node.is_dir && node.depth <= until
+            })
             .collect();
+        candidates.sort_by_key(|&id| (tree.nodes[id].depth, id));
+        candidates.truncate(MAX_IMAGES);
+        let wanted: HashSet<NodeId> = candidates.into_iter().collect();
         self.images.retain(|id, _| wanted.contains(id));
         self.baked.retain(|id| wanted.contains(id));
         let height = (IMAGE_WIDTH as f32 / BODY_ASPECT).round() as u32;

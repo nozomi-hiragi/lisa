@@ -17,9 +17,11 @@
 
 ## いまの状態
 
-v0.1.0 の実験段階です。実際のファイルはまだ読まず、ダミーの木（端末 3 台、数階層、
-500 ファイルのフォルダを含む）を表示しています。ハッシュによる管理は計画中です
-（[docs/design.md](docs/design.md)）。
+v0.1.0 の実験段階です。この端末のドライブを出し、開いた場所の近くのフォルダから裏で 1 段ずつ
+読んで出します（名前、大きさ、日時だけで、中身は読みません）。読んだ結果はまだ保存しないので、
+起動するたびに読み直します。ハッシュによる管理は計画中です（[docs/design.md](docs/design.md)、
+[docs/scan.md](docs/scan.md)）。`LISA_DUMMY=1` で起動すると、ダミーの木（端末 3 台、数階層、
+500 ファイルのフォルダを含む）を出します。
 
 ## 必要なもの
 
@@ -32,7 +34,8 @@ v0.1.0 の実験段階です。実際のファイルはまだ読まず、ダミ�
 git clone git@github.com:nozomi-hiragi/lisa.git
 cd lisa
 
-cargo run              # ビルドして起動
+cargo run              # ビルドして起動（この端末のドライブを読む）
+LISA_DUMMY=1 cargo run # ダミーの木で起動（何も読まない）
 cargo build            # ビルドのみ
 cargo build --release  # リリースビルド（target/release/lisa）
 cargo test --workspace # テスト（スキャンの crate も）

@@ -10,6 +10,7 @@ default-members = ["."]
 
 [dependencies]
 bevy = "0.20.1"
+lisa-core = { path = "crates/lisa-core" }
 directories = "6.0.0"
 # 日本語・中国語の改行位置データが無いという警告を、eprintln ではなくログとして出させて止めるため
 # （main.rs のログの絞り込みと README の「既知の課題」を参照）。
