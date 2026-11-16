@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS entry (
     error        TEXT,
     listed       INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tree (
+    hash    BLOB PRIMARY KEY,
+    algo    TEXT NOT NULL,
+    entries BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot (
+    id        INTEGER PRIMARY KEY,
+    drive_id  TEXT NOT NULL REFERENCES drive(id),
+    root_hash BLOB NOT NULL,
+    algo      TEXT NOT NULL,
+    prev_id   INTEGER REFERENCES snapshot(id),
+    taken_at  INTEGER NOT NULL,
+    device_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshot_drive ON snapshot(drive_id, id);
 CREATE UNIQUE INDEX IF NOT EXISTS entry_child ON entry(parent_id, name);
 CREATE UNIQUE INDEX IF NOT EXISTS entry_root ON entry(drive_id) WHERE parent_id IS NULL;
 CREATE INDEX IF NOT EXISTS entry_drive ON entry(drive_id);
@@ -110,6 +125,17 @@ pub struct Stored {
     pub hash: Option<crate::hash::Hash>,
     /// 子（読んだときの並び = `name::hash_order`）。
     pub children: Vec<Stored>,
+}
+
+/// ドライブのスナップショット。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub id: i64,
+    pub root_hash: crate::hash::Hash,
+    /// 前のスナップショット（鎖のようにつなぐ）。
+    pub prev_id: Option<i64>,
+    /// 撮った日時（UTC の Unix 時刻、ミリ秒）。
+    pub taken_at: i64,
 }
 
 pub struct Db {
@@ -260,6 +286,130 @@ impl Db {
                 mtime
             ])?;
         Ok(())
+    }
+
+    /// フォルダの中身（`hash::tree_bytes`）を、そのハッシュをキーにして残す（同じ中身は 1 回だけ）。
+    pub fn save_tree(&mut self, hash: &crate::hash::Hash, entries: &[u8]) -> Result<()> {
+        self.conn
+            .prepare_cached("INSERT OR IGNORE INTO tree (hash, algo, entries) VALUES (?1, ?2, ?3)")?
+            .execute(params![&hash[..], crate::hash::ALGO, entries])?;
+        Ok(())
+    }
+
+    /// フォルダの中身（`tree` の表）。無ければ None。
+    pub fn tree(&self, hash: &crate::hash::Hash) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .prepare_cached("SELECT entries FROM tree WHERE hash = ?1")?
+            .query_row([&hash[..]], |r| r.get(0))
+            .optional()
+    }
+
+    /// ハッシュはあるが `tree` の表に中身が無いフォルダ（前の版で作ったもの）の中身を、子の行から
+    /// 作って残す。`step` が false を返したらやめる。（残した数）を返す。
+    pub fn fill_trees(&mut self, step: &dyn Fn() -> bool) -> Result<u64> {
+        let ids: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT id FROM entry WHERE kind = 'dir' AND hash IS NOT NULL
+                   AND hash NOT IN (SELECT hash FROM tree)",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_>>()?;
+        let mut done = 0;
+        self.begin()?;
+        for (i, id) in ids.into_iter().enumerate() {
+            if !step() {
+                break;
+            }
+            let Some(folder) = self.entry(id)? else {
+                continue;
+            };
+            let Some(hash) = folder.hash else { continue };
+            let children = self.children(id)?;
+            let parts: Vec<crate::hash::Child> = children
+                .iter()
+                .map(|c| crate::hash::Child {
+                    kind: c.kind,
+                    name_nfc: &c.name_nfc,
+                    hash: c.hash.as_ref(),
+                    size: c.size,
+                })
+                .collect();
+            let entries = crate::hash::tree_bytes(&parts);
+            // 子が変わってハッシュが合わなくなっていたら、残さない（あとでハッシュし直す）。
+            if *blake3::hash(&entries).as_bytes() == hash {
+                self.save_tree(&hash, &entries)?;
+                done += 1;
+            }
+            if i % 2000 == 1999 {
+                self.commit()?;
+                self.begin()?;
+            }
+        }
+        self.commit()?;
+        Ok(done)
+    }
+
+    /// ドライブのスナップショットを撮る（一番上のハッシュを、前のスナップショットにつないで残す）。
+    /// 一番上のハッシュがまだ無いか、前と同じなら撮らない。撮ったら番号を返す。
+    pub fn take_snapshot(&mut self, drive_id: &str) -> Result<Option<i64>> {
+        let Some(root) = self.drive_root(drive_id)? else {
+            return Ok(None);
+        };
+        let Some(hash) = root.hash else {
+            return Ok(None);
+        };
+        let last: Option<(i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT id, root_hash FROM snapshot WHERE drive_id = ?1 ORDER BY id DESC LIMIT 1",
+                [drive_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if last.as_ref().is_some_and(|(_, h)| h[..] == hash[..]) {
+            return Ok(None);
+        }
+        let device: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'this_device'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = self.conn.query_row(
+            "INSERT INTO snapshot (drive_id, root_hash, algo, prev_id, taken_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
+            params![
+                drive_id,
+                &hash[..],
+                crate::hash::ALGO,
+                last.map(|(id, _)| id),
+                now_ms(),
+                device.unwrap_or_default()
+            ],
+            |r| r.get(0),
+        )?;
+        Ok(Some(id))
+    }
+
+    /// ドライブのスナップショット（新しい順）: (番号, 一番上のハッシュ, 前の番号, 撮った日時)。
+    pub fn snapshots(&self, drive_id: &str) -> Result<Vec<Snapshot>> {
+        self.conn
+            .prepare(
+                "SELECT id, root_hash, prev_id, taken_at FROM snapshot WHERE drive_id = ?1
+                 ORDER BY id DESC",
+            )?
+            .query_map([drive_id], |r| {
+                Ok(Snapshot {
+                    id: r.get(0)?,
+                    root_hash: r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32]),
+                    prev_id: r.get(2)?,
+                    taken_at: r.get(3)?,
+                })
+            })?
+            .collect()
     }
 
     /// ファイルをハッシュできなかった理由を書く。
@@ -788,6 +938,55 @@ mod tests {
         let files = db.children(sub_row.id).unwrap();
         assert!(files[0].hash.is_none());
         assert!(files[1].hash.is_some());
+    }
+
+    #[test]
+    fn snapshots_chain_and_trees_are_kept() {
+        let tmp = TempDir::new("snap");
+        fs::write(tmp.0.join("a.txt"), b"one").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let device = db.this_device("mac", "mac.local", "macos").unwrap();
+        db.upsert_drive(&device, &volume(&tmp.0)).unwrap();
+        let read = |p: &Path| read_dir(p).map_err(|e| e.to_string());
+        let hash = |db: &mut Db| {
+            crate::hash::hash_drive(
+                db,
+                "test:1",
+                &tmp.0,
+                1,
+                &mut |_| {},
+                &crate::hash::Pace::FREE,
+            )
+            .unwrap()
+        };
+        // ハッシュの前は撮れない。
+        db.save_listing("test:1", &tmp.0, &tmp.0, &read(&tmp.0))
+            .unwrap();
+        assert_eq!(db.take_snapshot("test:1").unwrap(), None);
+        hash(&mut db);
+        let first = db.take_snapshot("test:1").unwrap().unwrap();
+        // 変わっていなければ撮らない。
+        assert_eq!(db.take_snapshot("test:1").unwrap(), None);
+        let root = db.drive_root("test:1").unwrap().unwrap().hash.unwrap();
+        let entries = db.tree(&root).unwrap().unwrap();
+        assert_eq!(*blake3::hash(&entries).as_bytes(), root);
+        // 変えてハッシュし直すと、前につないで撮る。
+        fs::write(tmp.0.join("b.txt"), b"two").unwrap();
+        assert!(
+            db.save_listing("test:1", &tmp.0, &tmp.0, &read(&tmp.0))
+                .unwrap()
+        );
+        hash(&mut db);
+        let second = db.take_snapshot("test:1").unwrap().unwrap();
+        let list = db.snapshots("test:1").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, second);
+        assert_eq!(list[0].prev_id, Some(first));
+        assert!(db.tree(&list[1].root_hash).unwrap().is_some());
+        // tree の表が空でも、子の行から作り直せる。
+        db.conn.execute_batch("DELETE FROM tree").unwrap();
+        assert!(db.fill_trees(&|| true).unwrap() >= 1);
+        assert!(db.tree(&list[0].root_hash).unwrap().is_some());
     }
 
     #[test]
