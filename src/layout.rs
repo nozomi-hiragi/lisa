@@ -15,7 +15,7 @@
 //! 並べ方は相似なので（大きさに比例するだけ）、子の位置から親の位置を逆に求められる。
 //! 開く場所が変わって止まったら、基準を付け替える（`view.rs` の `reanchor`）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Index;
 
 use bevy::math::{Rect, Vec2};
@@ -113,6 +113,9 @@ pub fn anchor_body() -> Rect {
 /// 基準より何段下まで並べるか。これより下は、画像の中でも見分けられないほど小さい。
 pub const DEPTH_BELOW: usize = 4;
 
+/// 並べる数の上限（祖先とその子は、これを超えても並べる）。
+pub const MAX_LAID_OUT: usize = 4000;
+
 /// フォルダの本体（耳を除いた四角）の縦横比（幅 / 高さ）。A4 の横長。
 pub const BODY_ASPECT: f32 = std::f32::consts::SQRT_2;
 
@@ -160,7 +163,7 @@ impl EarSpec {
 /// `anchor` の本体を `body` に置いて、その周りを並べる。
 ///
 /// 並べるのは、Root から `anchor` までの祖先とその子（隣）と、`anchor` の祖父母（無ければ一番上の
-/// 祖先）から下で、`anchor` より `DEPTH_BELOW` 段下までのもの。
+/// 祖先）から下で、`anchor` より `DEPTH_BELOW` 段下までのもの（近い順に `MAX_LAID_OUT` まで）。
 pub fn layout(tree: &FileTree, anchor: NodeId, body: Rect, ears: EarSpec) -> Layouts {
     // 祖先の本体を、子の位置から逆に求める（並べ方は大きさに比例するだけ）。
     let mut chain = vec![(anchor, body)];
@@ -193,16 +196,30 @@ pub fn layout(tree: &FileTree, anchor: NodeId, body: Rect, ears: EarSpec) -> Lay
             grid: GridLayout::default(),
         },
     );
-    // 祖父母（から上）は、子を 1 段だけ並べる。祖父母から下は数段まとめて並べる。
-    let base = chain.len().saturating_sub(3);
+    // 祖先は、子を 1 段ずつ並べる（隣が見える）。
+    for &(id, _) in &chain {
+        place_into(tree, id, ears, &precise, &mut map);
+    }
+    // そこから下を、基準の子、隣（親の子）、親の隣（祖父母の子）の順に、近いものから数段並べる。
+    // 中身の多いフォルダが並んでいても重くならないよう、並べる数に上限を付ける。
     let until = tree.nodes[anchor].depth + DEPTH_BELOW;
-    for (i, &(id, _)) in chain.iter().enumerate() {
-        if i < base {
-            place_into(tree, id, ears, &precise, &mut map);
-        } else {
-            expand(tree, id, until, ears, &precise, &mut map);
+    let mut done: HashSet<NodeId> = chain.iter().map(|&(id, _)| id).collect();
+    let mut queue: VecDeque<NodeId> = chain
+        .iter()
+        .rev()
+        .take(3)
+        .flat_map(|&(id, _)| tree.nodes[id].children.iter().copied())
+        .collect();
+    while let Some(id) = queue.pop_front() {
+        let node = &tree.nodes[id];
+        if !node.is_dir || node.depth >= until || !done.insert(id) {
+            continue;
+        }
+        if map.len() >= MAX_LAID_OUT {
             break;
         }
+        place_into(tree, id, ears, &precise, &mut map);
+        queue.extend(tree.nodes[id].children.iter().copied());
     }
     Layouts { anchor, map }
 }
@@ -235,26 +252,6 @@ fn place_into(
 
 fn shifted(r: Rect, by: Vec2) -> Rect {
     Rect::from_corners(r.min + by, r.max + by)
-}
-
-/// `id` から下を、深さ `until` まで並べる。
-fn expand(
-    tree: &FileTree,
-    id: NodeId,
-    until: usize,
-    ears: EarSpec,
-    precise: &HashMap<NodeId, Rect>,
-    map: &mut HashMap<NodeId, NodeLayout>,
-) {
-    if tree.nodes[id].depth >= until {
-        return;
-    }
-    place_into(tree, id, ears, precise, map);
-    for &child in &tree.nodes[id].children {
-        if tree.nodes[child].is_dir {
-            expand(tree, child, until, ears, precise, map);
-        }
-    }
 }
 
 /// Root の枠: 本体の上に、開いたときの耳の分を足した四角。
@@ -429,6 +426,15 @@ mod tests {
         // Root まで並んでいて、大きさは有限。
         assert!(near.contains(FileTree::ROOT));
         assert!(near[FileTree::ROOT].frame.width().is_finite());
+    }
+
+    #[test]
+    fn many_children_stay_within_the_budget() {
+        let tree = FileTree::wide(20, 400);
+        let laid = layout(&tree, FileTree::ROOT, anchor_body(), EARS);
+        // Root とその子は必ず並べ、そこから下は上限まで。
+        assert!(laid.ids().count() <= MAX_LAID_OUT + 400);
+        assert!(laid.ids().count() >= 20);
     }
 
     #[test]

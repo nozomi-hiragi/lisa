@@ -4,6 +4,7 @@ mod input;
 mod layout;
 mod model;
 mod render;
+mod scan;
 mod settings;
 mod ui;
 mod view;
@@ -33,8 +34,10 @@ fn main() {
     )
     .add_plugins((
         settings::SettingsPlugin,
+        scan::ScanPlugin,
         view::TreeViewPlugin,
         ui::menu::MenuPlugin,
+        ui::progress::ProgressPlugin,
     ));
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);
