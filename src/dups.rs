@@ -1,7 +1,9 @@
 //! 重複の一覧（`lisa_core::dups`）を裏で作り、選んだ組のコピーを木の上で光らせる。
 //! 表示だけで、ファイルは何も動かさない。
 //!
-//! 一覧は、画面の横の一覧（`ui/dups.rs`）を初めて開いたときに、裏のスレッドで DB から作る。
+//! 一覧は、画面の横の一覧（`ui/dups.rs`）を開くたびに、裏のスレッドで確かめる。作った一覧は、DB の状態
+//! （ドライブごとの一番上のハッシュ、`dups::signature`）と一緒にキャッシュ（`duplicates.json`）に残し、
+//! 状態が同じならそれをすぐ出す。違えば、前の一覧を出したまま作り直し、できたら差し替える。
 //! 選んだ組のコピーは、木にあれば太い枠（`DupHighlight::copies`）、まだ木に出していなければ、
 //! 出してある一番深い祖先に細い枠（`around`）を付ける（`render/scene.rs` の `mark_duplicate`）。
 
@@ -44,8 +46,11 @@ pub enum DupsState {
     /// まだ作っていない。
     #[default]
     NotYet,
-    /// 裏で作っている。
-    Computing(Mutex<Receiver<Result<Vec<Group>, String>>>),
+    /// 裏で確かめている・作っている（`previous` はそのあいだ見せておく前の一覧）。
+    Computing {
+        previous: Option<Vec<Group>>,
+        receiver: Mutex<Receiver<Found>>,
+    },
     Ready(Vec<Group>),
     Failed(String),
 }
@@ -54,9 +59,67 @@ impl Dups {
     pub fn groups(&self) -> &[Group] {
         match &self.state {
             DupsState::Ready(groups) => groups,
+            DupsState::Computing {
+                previous: Some(groups),
+                ..
+            } => groups,
             _ => &[],
         }
     }
+}
+
+/// 裏のスレッドから届くもの。
+pub enum Found {
+    /// キャッシュにあった前の一覧（このあと作り直したものが届く）。
+    Previous(Vec<Group>),
+    Done(Result<Vec<Group>, String>),
+}
+
+/// キャッシュの場所。
+fn cache_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "Lisa").map(|d| d.cache_dir().join("duplicates.json"))
+}
+
+/// DB の状態を確かめ、キャッシュが使えればそれを、使えなければ作り直したものを送る。
+fn find(sender: std::sync::mpsc::Sender<Found>) {
+    let Some(path) = crate::scan::db_path() else {
+        let _ = sender.send(Found::Done(Err("DB の場所が分かりません".into())));
+        return;
+    };
+    let db = match lisa_core::db::Db::open(&path) {
+        Ok(db) => db,
+        Err(error) => {
+            let _ = sender.send(Found::Done(Err(error.to_string())));
+            return;
+        }
+    };
+    let signature = lisa_core::dups::signature(&db).ok().flatten();
+    let cache = cache_path();
+    let cached: Option<lisa_core::dups::Cached> = cache
+        .as_ref()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if let Some(cached) = cached {
+        if signature.as_ref() == Some(&cached.signature) {
+            let _ = sender.send(Found::Done(Ok(cached.groups)));
+            return;
+        }
+        let _ = sender.send(Found::Previous(cached.groups));
+    }
+    let result = lisa_core::dups::groups(&db, MAX_GROUPS).map_err(|e| e.to_string());
+    if let (Ok(groups), Some(signature), Some(cache)) = (&result, signature, cache) {
+        let cached = lisa_core::dups::Cached {
+            signature,
+            groups: groups.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&cached) {
+            let tmp = cache.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &cache);
+            }
+        }
+    }
+    let _ = sender.send(Found::Done(result));
 }
 
 /// 選んだ組の印。
@@ -68,38 +131,57 @@ pub struct DupHighlight {
     pub around: HashSet<NodeId>,
 }
 
-/// 一覧を開いたら、裏のスレッドで作る。できたら受け取る。
-fn compute(mut dups: ResMut<Dups>, mut redraw: MessageWriter<RequestRedraw>) {
-    match &dups.state {
-        DupsState::NotYet if dups.open => {
-            let Some(path) = crate::scan::db_path() else {
-                dups.state = DupsState::Failed("DB の場所が分かりません".into());
-                return;
-            };
-            let (sender, receiver) = channel();
-            std::thread::Builder::new()
-                .name("lisa-dups".into())
-                .spawn(move || {
-                    let result = lisa_core::db::Db::open(&path)
-                        .and_then(|db| lisa_core::dups::groups(&db, MAX_GROUPS))
-                        .map_err(|e| e.to_string());
-                    let _ = sender.send(result);
-                })
-                .expect("重複の一覧を作る係を作る");
-            dups.state = DupsState::Computing(Mutex::new(receiver));
-        }
-        DupsState::Computing(receiver) => {
-            // 止まっている間も、できたかを見に来られるようにする。
-            redraw.write(RequestRedraw);
-            let result = receiver.lock().ok().and_then(|r| r.try_recv().ok());
-            if let Some(result) = result {
-                dups.state = match result {
-                    Ok(groups) => DupsState::Ready(groups),
-                    Err(error) => DupsState::Failed(error),
-                };
+/// 一覧を開いたら、裏のスレッドで確かめる（キャッシュか、作り直し）。届いたら受け取る。
+fn compute(
+    mut dups: ResMut<Dups>,
+    mut was_open: Local<bool>,
+    mut redraw: MessageWriter<RequestRedraw>,
+) {
+    let opened = dups.open && !*was_open;
+    *was_open = dups.open;
+    if opened && !matches!(dups.state, DupsState::Computing { .. }) {
+        let previous = match std::mem::take(&mut dups.state) {
+            DupsState::Ready(groups) => Some(groups),
+            _ => None,
+        };
+        let (sender, receiver) = channel();
+        std::thread::Builder::new()
+            .name("lisa-dups".into())
+            .spawn(move || find(sender))
+            .expect("重複の一覧を作る係を作る");
+        dups.state = DupsState::Computing {
+            previous,
+            receiver: Mutex::new(receiver),
+        };
+        return;
+    }
+    let DupsState::Computing { receiver, .. } = &dups.state else {
+        return;
+    };
+    // 止まっている間も、できたかを見に来られるようにする。
+    redraw.write(RequestRedraw);
+    let found = receiver.lock().ok().and_then(|r| r.try_recv().ok());
+    match found {
+        Some(Found::Previous(groups)) => {
+            if let DupsState::Computing { previous, .. } = &mut dups.state {
+                *previous = Some(groups);
             }
         }
-        _ => {}
+        Some(Found::Done(Ok(groups))) => {
+            // 前の一覧で選んでいた組は、作り直すと番号が変わるので外す。
+            let same = dups.groups().len() == groups.len()
+                && dups
+                    .groups()
+                    .iter()
+                    .zip(&groups)
+                    .all(|(a, b)| a.hash == b.hash);
+            if !same {
+                dups.selected = None;
+            }
+            dups.state = DupsState::Ready(groups);
+        }
+        Some(Found::Done(Err(error))) => dups.state = DupsState::Failed(error),
+        None => {}
     }
 }
 
