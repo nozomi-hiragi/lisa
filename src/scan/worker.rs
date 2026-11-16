@@ -246,6 +246,7 @@ impl Worker {
             if !self.hash_all(&background) {
                 return;
             }
+            self.snapshot_all(&background);
             report(&self.progress, |p| {
                 p.hash.folder = None;
                 p.hash.finished = Some(Instant::now());
@@ -271,6 +272,7 @@ impl Worker {
                 if !self.hash_all(&background) {
                     return;
                 }
+                self.snapshot_all(&background);
                 self.wake();
             }
             // 知らせが続くあいだは、少しまとめてから読み直す。
@@ -287,6 +289,34 @@ impl Worker {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// ハッシュがそろったドライブのスナップショットを撮る（一番上のハッシュが前と違えば）。その前に、
+    /// 前の版で作ったフォルダの中身（`tree` の表）を、裏の分として埋める。
+    fn snapshot_all(&mut self, background: &Background) {
+        lisa_core::pace::set_thread_background(true);
+        let Some(db) = self.db.as_mut() else {
+            return;
+        };
+        let step = || background.step(0);
+        match db.fill_trees(&step) {
+            Ok(n) if n > 0 => bevy::log::info!("フォルダの中身を {n} 個残しました"),
+            Ok(_) => {}
+            Err(error) => warn!("フォルダの中身を残せませんでした: {error}"),
+        }
+        for root in &self.roots {
+            let Some(drive_id) = &root.drive_id else {
+                continue;
+            };
+            match db.take_snapshot(drive_id) {
+                Ok(Some(id)) => bevy::log::info!(
+                    "{} のスナップショットを撮りました（{id}）",
+                    root.mount.display()
+                ),
+                Ok(None) => {}
+                Err(error) => warn!("スナップショットを撮れませんでした: {error}"),
             }
         }
     }

@@ -75,7 +75,13 @@ pub struct Child<'a> {
 
 /// フォルダのハッシュ。子は名前順（`name::hash_order`）で渡す。
 pub fn folder_hash(children: &[Child]) -> Hash {
-    let mut hasher = blake3::Hasher::new();
+    *blake3::hash(&tree_bytes(children)).as_bytes()
+}
+
+/// フォルダの中身（`tree` の表の `entries`）。フォルダのハッシュは、これの blake3。子ごとに: 種類（1 バイト）、
+/// NFC の名前の長さ（u64 LE）と名前、ハッシュがあれば 1 とハッシュ（32 バイト）、無ければ 0 と大きさ（u64 LE）。
+pub fn tree_bytes(children: &[Child]) -> Vec<u8> {
+    let mut bytes = Vec::new();
     for child in children {
         let kind = match child.kind {
             Kind::File => b'f',
@@ -83,21 +89,21 @@ pub fn folder_hash(children: &[Child]) -> Hash {
             Kind::Symlink => b'l',
             Kind::Other => b'o',
         };
-        hasher.update(&[kind]);
-        hasher.update(&(child.name_nfc.len() as u64).to_le_bytes());
-        hasher.update(child.name_nfc.as_bytes());
+        bytes.push(kind);
+        bytes.extend_from_slice(&(child.name_nfc.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(child.name_nfc.as_bytes());
         match child.hash {
             Some(hash) => {
-                hasher.update(&[1]);
-                hasher.update(hash);
+                bytes.push(1);
+                bytes.extend_from_slice(hash);
             }
             None => {
-                hasher.update(&[0]);
-                hasher.update(&child.size.to_le_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(&child.size.to_le_bytes());
             }
         }
     }
-    *hasher.finalize().as_bytes()
+    bytes
 }
 
 /// ハッシュの進み具合。
@@ -252,8 +258,10 @@ impl Walker<'_> {
                 size: c.size,
             })
             .collect();
-        let hash = folder_hash(&parts);
+        let entries = tree_bytes(&parts);
+        let hash = *blake3::hash(&entries).as_bytes();
         self.db.set_hash(folder.id, &hash, 0, folder.mtime)?;
+        self.db.save_tree(&hash, &entries)?;
         (self.on)(Event::FolderDone(&path));
         self.maybe_commit()?;
         Ok(Some(hash))
