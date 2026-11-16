@@ -239,6 +239,54 @@ pub struct HashProgress {
 pub struct ScanControl {
     pub control: Arc<worker::Control>,
     requests: Mutex<std::sync::mpsc::Sender<worker::Request>>,
+    /// 監視（持っているあいだだけ知らせが来る）。
+    _watcher: Option<Mutex<notify::RecommendedWatcher>>,
+}
+
+/// ドライブ `roots` を監視する（Mac は FSEvents、Windows は ReadDirectoryChangesW、`notify`）。変わった
+/// ものの親のフォルダを、読み直しの知らせ（`Request::Hint`）として送る。知らせは取りこぼすことが
+/// あるので、ヒントとして扱う（開いたときの読み直しもある）。アプリ自身の DB と画像の置き場は見ない。
+fn watch(
+    roots: &[PathBuf],
+    requests: std::sync::mpsc::Sender<worker::Request>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::Watcher;
+    if roots.is_empty() {
+        return None;
+    }
+    let own: Vec<PathBuf> = directories::ProjectDirs::from("", "", "Lisa")
+        .map(|d| vec![d.data_dir().to_path_buf(), d.cache_dir().to_path_buf()])
+        .unwrap_or_default();
+    let handler = move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else {
+            return;
+        };
+        if event.kind.is_access() {
+            return;
+        }
+        for path in event.paths {
+            let Some(folder) = path.parent() else {
+                continue;
+            };
+            if own.iter().any(|o| path.starts_with(o)) {
+                continue;
+            }
+            let _ = requests.send(worker::Request::Hint(folder.to_path_buf()));
+        }
+    };
+    let mut watcher = match notify::recommended_watcher(handler) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            warn!("監視を始められませんでした: {error}");
+            return None;
+        }
+    };
+    for root in roots {
+        if let Err(error) = watcher.watch(root, notify::RecursiveMode::Recursive) {
+            warn!("{} を監視できませんでした: {error}", root.display());
+        }
+    }
+    Some(watcher)
 }
 
 impl ScanControl {
@@ -295,11 +343,8 @@ fn request_visible(
         return;
     }
     *last = Some(folder);
-    let node = &tree.nodes[folder];
-    if node.state == crate::model::tree::LoadState::Loaded {
-        return;
-    }
-    if let Some(path) = &node.path {
+    // 開いたら、読み直してもらう（変わっていなければ何もしない）。
+    if let Some(path) = &tree.nodes[folder].path {
         control.visible(path.clone());
     }
 }
@@ -320,6 +365,8 @@ struct Scanner {
     folders: HashMap<PathBuf, NodeId>,
     /// ハッシュができて DB に書いたが、まだ確定していないフォルダ。
     hashed: HashSet<PathBuf>,
+    /// 読み直したら変わっていて、まだハッシュし直していないフォルダ（子を出し直しても古いにする）。
+    stale: HashSet<PathBuf>,
 }
 
 enum Message {
@@ -331,6 +378,8 @@ enum Message {
     },
     /// フォルダのハッシュができた（中のファイルもハッシュした）。
     Hashed { path: PathBuf },
+    /// 読み直したら DB と違っていた（このあと `Listed` が来る）。
+    Changed { path: PathBuf },
     /// ここまでに書いたものを確定した。
     Committed,
 }
@@ -366,14 +415,25 @@ fn start_workers(
         proxy: (**proxy).clone(),
         progress: progress.0.clone(),
         control: control.clone(),
+        dirty: false,
+        hints: Default::default(),
     };
+    let watched: Vec<PathBuf> = worker
+        .roots
+        .iter()
+        .filter(|r| r.drive_id.is_some() && worker.db.is_some())
+        .map(|r| r.mount.clone())
+        .collect();
     std::thread::Builder::new()
         .name("lisa-scan".into())
         .spawn(move || worker.run())
         .expect("読む係を作る");
+    // 監視: 変わったところを、読み直しの知らせとして読む係に送る。
+    let watcher = watch(&watched, requests.clone());
     commands.insert_resource(ScanControl {
         control,
         requests: Mutex::new(requests),
+        _watcher: watcher.map(Mutex::new),
     });
     commands.insert_resource(progress);
     let mut scanner = Scanner {
@@ -382,6 +442,7 @@ fn start_workers(
         recent: HashMap::new(),
         folders: HashMap::new(),
         hashed: HashSet::new(),
+        stale: HashSet::new(),
     };
     for id in 0..tree.nodes.len() {
         scanner.track(&tree, id);
@@ -421,6 +482,7 @@ fn receive(
     scanner: Option<ResMut<Scanner>>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
+    mut nav: ResMut<crate::view::Nav>,
 ) {
     let Some(mut scanner) = scanner else {
         return;
@@ -441,11 +503,28 @@ fn receive(
                 scanner.hashed.clear();
             }
             Message::Hashed { path } => {
+                scanner.stale.remove(&path);
                 if let Some(&id) = scanner.folders.get(&path) {
                     tree.mark_hashed(id);
                     any = true;
                 }
                 scanner.hashed.insert(path);
+            }
+            Message::Changed { path } => {
+                // 木にあれば、子を出し直す（このあと届く `Listed` から）。ハッシュができるまで古い。
+                if let Some(&id) = scanner.folders.get(&path) {
+                    tree.reset_children(id);
+                    tree.mark_stale(id);
+                    // 外した子を開いていたら、そのフォルダまで戻る（子は出し直すと別のノードになる）。
+                    if let Some(at) = nav.stack.iter().position(|l| l.node == id)
+                        && at + 1 < nav.stack.len()
+                    {
+                        nav.stack.truncate(at + 1);
+                    }
+                    any = true;
+                }
+                scanner.hashed.remove(&path);
+                scanner.stale.insert(path);
             }
             Message::Listed {
                 path,
@@ -554,6 +633,9 @@ fn load_children(
         }
     }
     scanner.track_children(tree, id);
+    if scanner.stale.contains(&path) {
+        tree.mark_stale(id);
+    }
     true
 }
 

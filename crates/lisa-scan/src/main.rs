@@ -5,6 +5,7 @@
 //! cargo run -p lisa-scan -- tree <フォルダ> [深さ]   下までたどって数と速さを出す
 //! cargo run -p lisa-scan -- drives                    つながっているドライブの一覧
 //! cargo run -p lisa-scan -- dups [件数]               アプリの DB から重複の一覧を出す
+//! cargo run -p lisa-scan -- snapshots                   アプリの DB からスナップショットの一覧を出す
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -17,7 +18,8 @@ const USAGE: &str = "使い方:
   lisa-scan ls <フォルダ>            1 段だけ読んで一覧を出す
   lisa-scan tree <フォルダ> [深さ]   下までたどって数と速さを出す（別のボリュームには入らない）
   lisa-scan drives                    つながっているドライブの一覧
-  lisa-scan dups [件数]               アプリの DB から重複の一覧を出す（空く大きさの順）";
+  lisa-scan dups [件数]               アプリの DB から重複の一覧を出す（空く大きさの順）
+  lisa-scan snapshots                 アプリの DB からスナップショットの一覧を出す";
 
 fn main() -> ExitCode {
     if let Err(error) = lisa_core::cloud::prevent_downloads() {
@@ -33,6 +35,7 @@ fn main() -> ExitCode {
             Ok(depth) => tree(Path::new(path), depth),
             Err(_) => Err(format!("深さは数で: {depth}")),
         },
+        ["snapshots"] => snapshots(),
         ["dups"] => dups(20),
         ["dups", count] => match count.parse() {
             Ok(count) => dups(count),
@@ -249,6 +252,41 @@ fn drives() -> Result<(), String> {
         );
     }
     println!("--\n{} 個", volumes.len());
+    Ok(())
+}
+
+/// アプリの DB を開く。
+fn app_db() -> Result<lisa_core::db::Db, String> {
+    let path = directories::ProjectDirs::from("", "", "Lisa")
+        .ok_or("DB の場所が分かりません")?
+        .data_dir()
+        .join("lisa.db");
+    if !path.exists() {
+        return Err(format!("DB がありません: {}", path.display()));
+    }
+    lisa_core::db::Db::open(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// ドライブごとのスナップショット（新しい順）。
+fn snapshots() -> Result<(), String> {
+    let db = app_db()?;
+    let drives = lisa_core::volumes::list().map_err(|e| e.to_string())?;
+    for drive in drives {
+        let Some(id) = &drive.id else { continue };
+        let list = db.snapshots(id).map_err(|e| e.to_string())?;
+        if list.is_empty() {
+            continue;
+        }
+        println!("{}  [{}]", drive.mount_path.display(), drive.label);
+        for snap in list {
+            let hash: String = snap.root_hash[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let prev = snap.prev_id.map_or("—".to_string(), |p| p.to_string());
+            println!("  {}  {hash}…  前 {prev}  {} ms", snap.id, snap.taken_at);
+        }
+    }
     Ok(())
 }
 

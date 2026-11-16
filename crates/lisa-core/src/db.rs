@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS entry (
     error        TEXT,
     listed       INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tree (
+    hash    BLOB PRIMARY KEY,
+    algo    TEXT NOT NULL,
+    entries BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot (
+    id        INTEGER PRIMARY KEY,
+    drive_id  TEXT NOT NULL REFERENCES drive(id),
+    root_hash BLOB NOT NULL,
+    algo      TEXT NOT NULL,
+    prev_id   INTEGER REFERENCES snapshot(id),
+    taken_at  INTEGER NOT NULL,
+    device_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshot_drive ON snapshot(drive_id, id);
 CREATE UNIQUE INDEX IF NOT EXISTS entry_child ON entry(parent_id, name);
 CREATE UNIQUE INDEX IF NOT EXISTS entry_root ON entry(drive_id) WHERE parent_id IS NULL;
 CREATE INDEX IF NOT EXISTS entry_drive ON entry(drive_id);
@@ -110,6 +125,17 @@ pub struct Stored {
     pub hash: Option<crate::hash::Hash>,
     /// 子（読んだときの並び = `name::hash_order`）。
     pub children: Vec<Stored>,
+}
+
+/// ドライブのスナップショット。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Snapshot {
+    pub id: i64,
+    pub root_hash: crate::hash::Hash,
+    /// 前のスナップショット（鎖のようにつなぐ）。
+    pub prev_id: Option<i64>,
+    /// 撮った日時（UTC の Unix 時刻、ミリ秒）。
+    pub taken_at: i64,
 }
 
 pub struct Db {
@@ -262,12 +288,168 @@ impl Db {
         Ok(())
     }
 
+    /// フォルダの中身（`hash::tree_bytes`）を、そのハッシュをキーにして残す（同じ中身は 1 回だけ）。
+    pub fn save_tree(&mut self, hash: &crate::hash::Hash, entries: &[u8]) -> Result<()> {
+        self.conn
+            .prepare_cached("INSERT OR IGNORE INTO tree (hash, algo, entries) VALUES (?1, ?2, ?3)")?
+            .execute(params![&hash[..], crate::hash::ALGO, entries])?;
+        Ok(())
+    }
+
+    /// フォルダの中身（`tree` の表）。無ければ None。
+    pub fn tree(&self, hash: &crate::hash::Hash) -> Result<Option<Vec<u8>>> {
+        self.conn
+            .prepare_cached("SELECT entries FROM tree WHERE hash = ?1")?
+            .query_row([&hash[..]], |r| r.get(0))
+            .optional()
+    }
+
+    /// ハッシュはあるが `tree` の表に中身が無いフォルダ（前の版で作ったもの）の中身を、子の行から
+    /// 作って残す。`step` が false を返したらやめる。（残した数）を返す。
+    pub fn fill_trees(&mut self, step: &dyn Fn() -> bool) -> Result<u64> {
+        let ids: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT id FROM entry WHERE kind = 'dir' AND hash IS NOT NULL
+                   AND hash NOT IN (SELECT hash FROM tree)",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_>>()?;
+        let mut done = 0;
+        self.begin()?;
+        for (i, id) in ids.into_iter().enumerate() {
+            if !step() {
+                break;
+            }
+            let Some(folder) = self.entry(id)? else {
+                continue;
+            };
+            let Some(hash) = folder.hash else { continue };
+            let children = self.children(id)?;
+            let parts: Vec<crate::hash::Child> = children
+                .iter()
+                .map(|c| crate::hash::Child {
+                    kind: c.kind,
+                    name_nfc: &c.name_nfc,
+                    hash: c.hash.as_ref(),
+                    size: c.size,
+                })
+                .collect();
+            let entries = crate::hash::tree_bytes(&parts);
+            // 子が変わってハッシュが合わなくなっていたら、残さない（あとでハッシュし直す）。
+            if *blake3::hash(&entries).as_bytes() == hash {
+                self.save_tree(&hash, &entries)?;
+                done += 1;
+            }
+            if i % 2000 == 1999 {
+                self.commit()?;
+                self.begin()?;
+            }
+        }
+        self.commit()?;
+        Ok(done)
+    }
+
+    /// ドライブのスナップショットを撮る（一番上のハッシュを、前のスナップショットにつないで残す）。
+    /// 一番上のハッシュがまだ無いか、前と同じなら撮らない。撮ったら番号を返す。
+    pub fn take_snapshot(&mut self, drive_id: &str) -> Result<Option<i64>> {
+        let Some(root) = self.drive_root(drive_id)? else {
+            return Ok(None);
+        };
+        let Some(hash) = root.hash else {
+            return Ok(None);
+        };
+        let last: Option<(i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT id, root_hash FROM snapshot WHERE drive_id = ?1 ORDER BY id DESC LIMIT 1",
+                [drive_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if last.as_ref().is_some_and(|(_, h)| h[..] == hash[..]) {
+            return Ok(None);
+        }
+        let device: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'this_device'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = self.conn.query_row(
+            "INSERT INTO snapshot (drive_id, root_hash, algo, prev_id, taken_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id",
+            params![
+                drive_id,
+                &hash[..],
+                crate::hash::ALGO,
+                last.map(|(id, _)| id),
+                now_ms(),
+                device.unwrap_or_default()
+            ],
+            |r| r.get(0),
+        )?;
+        Ok(Some(id))
+    }
+
+    /// ドライブのスナップショット（新しい順）: (番号, 一番上のハッシュ, 前の番号, 撮った日時)。
+    pub fn snapshots(&self, drive_id: &str) -> Result<Vec<Snapshot>> {
+        self.conn
+            .prepare(
+                "SELECT id, root_hash, prev_id, taken_at FROM snapshot WHERE drive_id = ?1
+                 ORDER BY id DESC",
+            )?
+            .query_map([drive_id], |r| {
+                Ok(Snapshot {
+                    id: r.get(0)?,
+                    root_hash: r.get::<_, Vec<u8>>(1)?.try_into().unwrap_or([0; 32]),
+                    prev_id: r.get(2)?,
+                    taken_at: r.get(3)?,
+                })
+            })?
+            .collect()
+    }
+
     /// ファイルをハッシュできなかった理由を書く。
     pub fn set_hash_error(&mut self, id: i64, error: &str) -> Result<()> {
         self.conn
             .prepare_cached("UPDATE entry SET error = ?2 WHERE id = ?1")?
             .execute(params![id, error])?;
         Ok(())
+    }
+
+    /// `find_folder` と同じだが、覚えている番号を使わず、書き換えもしない（`&self` で引ける）。
+    pub fn find_folder_ref(
+        &self,
+        drive_id: &str,
+        mount: &Path,
+        path: &Path,
+    ) -> Result<Option<i64>> {
+        let Ok(relative) = path.strip_prefix(mount) else {
+            return Ok(None);
+        };
+        let mut id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM entry WHERE drive_id = ?1 AND parent_id IS NULL",
+                [drive_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        for part in relative.components() {
+            let Some(parent) = id else {
+                return Ok(None);
+            };
+            let name = crate::name::raw_bytes(part.as_os_str());
+            id = self
+                .conn
+                .prepare_cached("SELECT id FROM entry WHERE parent_id = ?1 AND name = ?2")?
+                .query_row(params![parent, name], |r| r.get(0))
+                .optional()?;
+        }
+        Ok(id)
     }
 
     /// フォルダ `path`（ドライブ `drive_id` の `mount` の下）の `entry.id`。無ければ None。
@@ -353,28 +535,41 @@ impl Db {
         mount: &Path,
         path: &Path,
         result: &std::result::Result<Listing, String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(folder) = self.folder_id(drive_id, mount, path)? else {
-            return Ok(());
+            return Ok(false);
         };
         self.folders.remove(path);
+        // 前に読んだことがあれば、読み直し（変わっていたら、このフォルダと祖先のハッシュを消す）。
+        let (was_listed, old_error): (bool, Option<String>) = self.conn.query_row(
+            "SELECT listed, error FROM entry WHERE id = ?1",
+            [folder],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut changed = false;
         match result {
             Err(error) => {
+                changed = old_error.as_deref() != Some(error.as_str());
                 self.conn.execute(
                     "UPDATE entry SET listed = 1, status = 'failed', error = ?2 WHERE id = ?1",
                     params![folder, error],
                 )?;
             }
             Ok(listing) => {
-                let mut old: HashMap<Vec<u8>, i64> = HashMap::new();
+                changed |= old_error.is_some();
+                // 名前 → (id, 種類, 大きさ, 更新日時)。
+                type Old = (i64, String, i64, Option<i64>);
+                let mut old: HashMap<Vec<u8>, Old> = HashMap::new();
                 {
-                    let mut statement = self
-                        .conn
-                        .prepare_cached("SELECT name, id FROM entry WHERE parent_id = ?1")?;
-                    let rows = statement.query_map([folder], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    let mut statement = self.conn.prepare_cached(
+                        "SELECT name, id, kind, size, mtime FROM entry WHERE parent_id = ?1",
+                    )?;
+                    let rows = statement.query_map([folder], |r| {
+                        Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                    })?;
                     for row in rows {
-                        let (name, id) = row?;
-                        old.insert(name, id);
+                        let (name, old_row) = row?;
+                        old.insert(name, old_row);
                     }
                 }
                 let mut upsert = self.conn.prepare_cached(
@@ -382,17 +577,30 @@ impl Db {
                                         file_id, nlink, cloud_only, other_volume, status, listed)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'unloaded', 0)
                      ON CONFLICT(parent_id, name) DO UPDATE SET pos = ?3, name_nfc = ?5,
+                         -- 種類・大きさ・日時が変わったものは、ハッシュを消す（古い）。
+                         hash = CASE WHEN kind = ?6 AND size = ?7 AND mtime IS ?8
+                                     THEN hash ELSE NULL END,
+                         error = CASE WHEN kind = ?6 AND size = ?7 AND mtime IS ?8
+                                      THEN error ELSE NULL END,
+                         listed = CASE WHEN kind = ?6 THEN listed ELSE 0 END,
                          kind = ?6, size = ?7, mtime = ?8, file_id = ?9, nlink = ?10,
                          cloud_only = ?11, other_volume = ?12
                      RETURNING id",
                 )?;
                 for (pos, entry) in listing.entries.iter().enumerate() {
-                    old.remove(&entry.name_raw);
                     let size = if entry.kind == Kind::Dir {
                         0
                     } else {
                         entry.size
                     };
+                    match old.remove(&entry.name_raw) {
+                        Some((_, kind, old_size, mtime)) => {
+                            changed |= kind != kind_name(entry.kind)
+                                || old_size != size as i64
+                                || mtime != entry.mtime_ms;
+                        }
+                        None => changed = true,
+                    }
                     let id: i64 = upsert.query_row(
                         params![
                             drive_id,
@@ -418,7 +626,8 @@ impl Db {
                 let mut delete = self
                     .conn
                     .prepare_cached("DELETE FROM entry WHERE id = ?1")?;
-                for id in old.into_values() {
+                changed |= !old.is_empty();
+                for (id, ..) in old.into_values() {
                     delete.execute([id])?;
                 }
                 drop(delete);
@@ -427,6 +636,25 @@ impl Db {
                     [folder],
                 )?;
             }
+        }
+        // 初めて読んだときは、まだハッシュが無いので消すものも無い。
+        let changed = was_listed && changed;
+        if changed {
+            self.clear_hash_up(folder)?;
+        }
+        Ok(changed)
+    }
+
+    /// `id` とその祖先のハッシュを消す（中が変わったので、作り直しが要る）。
+    pub fn clear_hash_up(&mut self, id: i64) -> Result<()> {
+        let mut cur = Some(id);
+        while let Some(i) = cur {
+            cur = self
+                .conn
+                .prepare_cached("UPDATE entry SET hash = NULL WHERE id = ?1 RETURNING parent_id")?
+                .query_row([i], |r| r.get(0))
+                .optional()?
+                .flatten();
         }
         Ok(())
     }
@@ -661,6 +889,104 @@ mod tests {
         let root = load_tree(&db, "test:1");
         let names: Vec<&str> = root.children.iter().map(|c| c.name_nfc.as_str()).collect();
         assert_eq!(names, ["new.txt"]);
+    }
+
+    #[test]
+    fn reading_again_marks_changed_files_and_ancestors() {
+        let tmp = TempDir::new("reread");
+        fs::create_dir(tmp.0.join("sub")).unwrap();
+        fs::write(tmp.0.join("sub/a.txt"), b"one").unwrap();
+        fs::write(tmp.0.join("sub/b.txt"), b"two").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let device = db.this_device("mac", "mac.local", "macos").unwrap();
+        db.upsert_drive(&device, &volume(&tmp.0)).unwrap();
+        let read = |p: &Path| read_dir(p).map_err(|e| e.to_string());
+        let sub = tmp.0.join("sub");
+        assert!(
+            !db.save_listing("test:1", &tmp.0, &tmp.0, &read(&tmp.0))
+                .unwrap()
+        );
+        assert!(
+            !db.save_listing("test:1", &tmp.0, &sub, &read(&sub))
+                .unwrap()
+        );
+        crate::hash::hash_drive(
+            &mut db,
+            "test:1",
+            &tmp.0,
+            1,
+            &mut |_| {},
+            &crate::hash::Pace::FREE,
+        )
+        .unwrap();
+        // 変わっていなければ、何も消さない。
+        assert!(
+            !db.save_listing("test:1", &tmp.0, &sub, &read(&sub))
+                .unwrap()
+        );
+        assert!(db.drive_root("test:1").unwrap().unwrap().hash.is_some());
+        // a.txt の大きさを変えると、a.txt と sub と一番上のハッシュが消え、b.txt は残る。
+        fs::write(tmp.0.join("sub/a.txt"), b"longer").unwrap();
+        assert!(
+            db.save_listing("test:1", &tmp.0, &sub, &read(&sub))
+                .unwrap()
+        );
+        let root = db.drive_root("test:1").unwrap().unwrap();
+        assert!(root.hash.is_none());
+        let sub_row = &db.children(root.id).unwrap()[0];
+        assert!(sub_row.hash.is_none());
+        let files = db.children(sub_row.id).unwrap();
+        assert!(files[0].hash.is_none());
+        assert!(files[1].hash.is_some());
+    }
+
+    #[test]
+    fn snapshots_chain_and_trees_are_kept() {
+        let tmp = TempDir::new("snap");
+        fs::write(tmp.0.join("a.txt"), b"one").unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let device = db.this_device("mac", "mac.local", "macos").unwrap();
+        db.upsert_drive(&device, &volume(&tmp.0)).unwrap();
+        let read = |p: &Path| read_dir(p).map_err(|e| e.to_string());
+        let hash = |db: &mut Db| {
+            crate::hash::hash_drive(
+                db,
+                "test:1",
+                &tmp.0,
+                1,
+                &mut |_| {},
+                &crate::hash::Pace::FREE,
+            )
+            .unwrap()
+        };
+        // ハッシュの前は撮れない。
+        db.save_listing("test:1", &tmp.0, &tmp.0, &read(&tmp.0))
+            .unwrap();
+        assert_eq!(db.take_snapshot("test:1").unwrap(), None);
+        hash(&mut db);
+        let first = db.take_snapshot("test:1").unwrap().unwrap();
+        // 変わっていなければ撮らない。
+        assert_eq!(db.take_snapshot("test:1").unwrap(), None);
+        let root = db.drive_root("test:1").unwrap().unwrap().hash.unwrap();
+        let entries = db.tree(&root).unwrap().unwrap();
+        assert_eq!(*blake3::hash(&entries).as_bytes(), root);
+        // 変えてハッシュし直すと、前につないで撮る。
+        fs::write(tmp.0.join("b.txt"), b"two").unwrap();
+        assert!(
+            db.save_listing("test:1", &tmp.0, &tmp.0, &read(&tmp.0))
+                .unwrap()
+        );
+        hash(&mut db);
+        let second = db.take_snapshot("test:1").unwrap().unwrap();
+        let list = db.snapshots("test:1").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, second);
+        assert_eq!(list[0].prev_id, Some(first));
+        assert!(db.tree(&list[1].root_hash).unwrap().is_some());
+        // tree の表が空でも、子の行から作り直せる。
+        db.conn.execute_batch("DELETE FROM tree").unwrap();
+        assert!(db.fill_trees(&|| true).unwrap() >= 1);
+        assert!(db.tree(&list[0].root_hash).unwrap().is_some());
     }
 
     #[test]

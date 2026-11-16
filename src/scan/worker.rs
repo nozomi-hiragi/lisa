@@ -2,9 +2,12 @@
 //! 待つ。`docs/scan.md` の「裏で読む分」の決まりに従う:
 //!
 //! - 見ているところ（開いたフォルダ）の頼み（`Request::Visible`）が来たら、裏の分はすぐやめて
-//!   （ハッシュは 1 MiB ごとに合図を見る）、先にそれを読んでハッシュする。これは決まりにかからない。
+//!   （ハッシュは 1 MiB ごとに合図を見る）、先にそれを 1 段読み直す。DB と違えば DB を直し、変わった
+//!   ものとそのフォルダ・祖先のハッシュを消して（古い）、ハッシュし直す。これは決まりにかからない。
 //! - 裏の分は I/O を後回しにし（`pace::set_thread_background`）、速さの上限（設定）を守る。
 //! - 一時停止、電池で動いているとき、CPU が混んでいるとき（設定のしきい値）は休む。
+//! - 監視（`Request::Hint`、FSEvents など）で変わったと知らされたフォルダは、裏の分として（上の
+//!   決まりに従って）読み直す。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -32,8 +35,10 @@ const NAP: Duration = Duration::from_millis(250);
 
 /// UI から読む係への頼み。
 pub enum Request {
-    /// このフォルダを今見ている（読み終えていなければ読み、ハッシュの無いものをハッシュする）。
+    /// このフォルダを今見ている（1 段読み直し、ハッシュの無いものをハッシュする）。
     Visible(PathBuf),
+    /// このフォルダの中が変わったらしい（監視からの知らせ。裏の分として読み直す）。
+    Hint(PathBuf),
 }
 
 /// 休んでいる理由（`Control::resting`）。
@@ -173,6 +178,10 @@ pub(super) struct Worker {
     pub proxy: EventLoopProxy<WinitUserEvent>,
     pub progress: Arc<Mutex<Progress>>,
     pub control: Arc<Control>,
+    /// 読み直しでハッシュを消したので、裏でドライブ全体のハッシュをやり直す（祖先を作り直す）。
+    pub dirty: bool,
+    /// 監視から知らされた、読み直すフォルダ（同じものは 1 つにまとめる）。
+    pub hints: std::collections::BTreeSet<PathBuf>,
 }
 
 impl Worker {
@@ -204,7 +213,7 @@ impl Worker {
                 last_commit = Instant::now();
             }
             let failed = result.is_err();
-            let alive = self.store(index, path, result, due);
+            let (alive, _) = self.store(index, path, result, due);
             report(&self.progress, |p| {
                 p.done += 1;
                 p.failed += failed as u64;
@@ -231,43 +240,48 @@ impl Worker {
         if !self.send(Message::Committed) {
             return;
         }
-        // 2. ハッシュの無いものを、下からハッシュする（やめさせられたら、頼みを済ませてやり直す）。
+        // 2. ハッシュの無いものを、下からハッシュする。
         if self.db.is_some() {
             report(&self.progress, |p| p.hash.started = Some(Instant::now()));
-            for index in 0..self.roots.len() {
-                loop {
-                    if !self.wait_turn(&background) {
-                        return;
-                    }
-                    let interrupted = AtomicBool::new(false);
-                    let step = |bytes: u64| {
-                        let go = background.step(bytes);
-                        if !go {
-                            interrupted.store(true, Ordering::Relaxed);
-                        }
-                        go
-                    };
-                    let pace = Pace {
-                        background: true,
-                        step: &step,
-                    };
-                    if !self.hash(index, None, &pace) {
-                        return;
-                    }
-                    if !interrupted.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
+            if !self.hash_all(&background) {
+                return;
             }
+            self.snapshot_all(&background);
             report(&self.progress, |p| {
                 p.hash.folder = None;
                 p.hash.finished = Some(Instant::now());
             });
             self.wake();
         }
-        // 3. あとは頼みを待つ。
+        // 3. あとは頼みを待つ。監視の知らせは裏の分として読み直し、ハッシュを消したら、裏で祖先を
+        //    作り直す。
         loop {
-            match self.requests.recv_timeout(Duration::from_secs(60)) {
+            while !self.hints.is_empty() {
+                if !self.wait_turn(&background) {
+                    return;
+                }
+                let Some(path) = self.hints.pop_first() else {
+                    break;
+                };
+                if !self.reread(&path, true) {
+                    return;
+                }
+            }
+            if self.dirty && self.db.is_some() {
+                self.dirty = false;
+                if !self.hash_all(&background) {
+                    return;
+                }
+                self.snapshot_all(&background);
+                self.wake();
+            }
+            // 知らせが続くあいだは、少しまとめてから読み直す。
+            let wait = if self.hints.is_empty() {
+                Duration::from_secs(60)
+            } else {
+                NAP
+            };
+            match self.requests.recv_timeout(wait) {
                 Ok(request) => {
                     if !self.handle(request) {
                         return;
@@ -277,6 +291,65 @@ impl Worker {
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
+    }
+
+    /// ハッシュがそろったドライブのスナップショットを撮る（一番上のハッシュが前と違えば）。その前に、
+    /// 前の版で作ったフォルダの中身（`tree` の表）を、裏の分として埋める。
+    fn snapshot_all(&mut self, background: &Background) {
+        lisa_core::pace::set_thread_background(true);
+        let Some(db) = self.db.as_mut() else {
+            return;
+        };
+        let step = || background.step(0);
+        match db.fill_trees(&step) {
+            Ok(n) if n > 0 => bevy::log::info!("フォルダの中身を {n} 個残しました"),
+            Ok(_) => {}
+            Err(error) => warn!("フォルダの中身を残せませんでした: {error}"),
+        }
+        for root in &self.roots {
+            let Some(drive_id) = &root.drive_id else {
+                continue;
+            };
+            match db.take_snapshot(drive_id) {
+                Ok(Some(id)) => bevy::log::info!(
+                    "{} のスナップショットを撮りました（{id}）",
+                    root.mount.display()
+                ),
+                Ok(None) => {}
+                Err(error) => warn!("スナップショットを撮れませんでした: {error}"),
+            }
+        }
+    }
+
+    /// 全部のドライブの、ハッシュの無いものを裏の分としてハッシュする（やめさせられたら、頼みを
+    /// 済ませてやり直す）。UI が閉じたら false。
+    fn hash_all(&mut self, background: &Background) -> bool {
+        for index in 0..self.roots.len() {
+            loop {
+                if !self.wait_turn(background) {
+                    return false;
+                }
+                let interrupted = AtomicBool::new(false);
+                let step = |bytes: u64| {
+                    let go = background.step(bytes);
+                    if !go {
+                        interrupted.store(true, Ordering::Relaxed);
+                    }
+                    go
+                };
+                let pace = Pace {
+                    background: true,
+                    step: &step,
+                };
+                if !self.hash(index, None, &pace) {
+                    return false;
+                }
+                if !interrupted.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+        }
+        true
     }
 
     /// 読み始めるものを、深さ優先で後ろから先に積む。DB に残っているドライブは、まだ読み終えて
@@ -324,39 +397,94 @@ impl Worker {
 
     /// 頼みを済ませる（決まりにかからず、すぐ）。UI が閉じたら false。
     fn handle(&mut self, request: Request) -> bool {
-        let Request::Visible(path) = request;
-        let alive = self.visible(&path);
-        self.control.urgent.fetch_sub(1, Ordering::Relaxed);
-        alive
+        match request {
+            Request::Visible(path) => {
+                // 見ているところは、知らせがあっても今読み直すので、二度は読まない。
+                self.hints.remove(&path);
+                let alive = self.visible(&path);
+                self.control.urgent.fetch_sub(1, Ordering::Relaxed);
+                alive
+            }
+            Request::Hint(path) => {
+                self.hints.insert(path);
+                true
+            }
+        }
     }
 
-    /// 見ているフォルダ `path` を、読み終えていなければ読み、ハッシュの無いものをハッシュする。
+    /// 見ているフォルダ `path` を 1 段読み直し（下は、裏の深さ優先がたどる）、ハッシュの無いものを
+    /// ハッシュする。変わっていたら、裏で祖先のハッシュも作り直す。
     fn visible(&mut self, path: &Path) -> bool {
-        lisa_core::pace::set_thread_background(false);
+        if !self.reread(path, false) {
+            return false;
+        }
         let Some(index) = self.root_of(path) else {
             return true;
         };
+        self.hash(index, Some(path), &Pace::FREE)
+    }
+
+    /// フォルダ `path` を 1 段読み直す（`background` なら I/O を後回しに）。変わっていたら、新しく
+    /// できたフォルダの中も読み、あとで裏でハッシュし直す。UI が閉じたら false。
+    fn reread(&mut self, path: &Path, background: bool) -> bool {
+        lisa_core::pace::set_thread_background(background);
+        let Some(index) = self.root_of(path) else {
+            return true;
+        };
+        if self.roots[index].drive_id.is_none() || self.db.is_none() || !path.is_dir() {
+            return true;
+        }
+        let result = listing::read_dir(path).map_err(|e| e.to_string());
+        let (alive, changed) = self.store(index, path.to_path_buf(), result, true);
+        if !alive {
+            return false;
+        }
+        if changed {
+            self.dirty = true;
+            if !self.fill_unlisted(index, path) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `path` の下の、まだ読んでいないフォルダ（読み直しで新しくできたもの）を深さ優先で読む。
+    fn fill_unlisted(&mut self, index: usize, path: &Path) -> bool {
         let Some(drive_id) = self.roots[index].drive_id.clone() else {
             return true;
         };
         let mount = self.roots[index].mount.clone();
-        let Some(db) = self.db.as_mut() else {
-            return true;
-        };
-        // 読み終えていなければ、先に 1 段読む（下は、裏の深さ優先がたどる）。
-        let listed = db
-            .find_folder(&drive_id, &mount, path)
-            .ok()
-            .flatten()
-            .and_then(|id| db.entry(id).ok().flatten())
-            .is_some_and(|row| row.listed);
-        if !listed {
-            let result = listing::read_dir(path).map_err(|e| e.to_string());
-            if !self.store(index, path.to_path_buf(), result, true) {
-                return false;
+        let mut stack = vec![path.to_path_buf()];
+        while let Some(folder) = stack.pop() {
+            let Some(db) = self.db.as_ref() else {
+                return true;
+            };
+            let children = match db
+                .find_folder_ref(&drive_id, &mount, &folder)
+                .ok()
+                .flatten()
+                .map(|id| db.children(id))
+            {
+                Some(Ok(children)) => children,
+                _ => continue,
+            };
+            for child in children.iter().rev() {
+                let readable =
+                    child.kind == listing::Kind::Dir && !child.cloud_only && !child.other_volume;
+                if !readable {
+                    continue;
+                }
+                let child_path = folder.join(lisa_core::name::from_raw_bytes(&child.name_raw));
+                if !child.listed {
+                    let result = listing::read_dir(&child_path).map_err(|e| e.to_string());
+                    if !self.store(index, child_path.clone(), result, true).0 {
+                        return false;
+                    }
+                    stack.push(child_path);
+                }
             }
         }
-        self.hash(index, Some(path), &Pace::FREE)
+        true
     }
 
     /// ドライブ `index` の、`folder`（無ければ全体）のハッシュの無いものをハッシュする。UI が閉じたら false。
@@ -410,23 +538,28 @@ impl Worker {
         !closed.load(Ordering::Relaxed)
     }
 
-    /// 読んだ結果を DB に書き（`commit` なら確定もし）、UI に知らせる。UI が閉じたら false。
+    /// 読んだ結果を DB に書き（`commit` なら確定もし）、UI に知らせる。（UI がまだいるか、読み直しで
+    /// DB と違っていたか）を返す。
     fn store(
         &mut self,
         index: usize,
         path: PathBuf,
         result: Result<listing::Listing, String>,
         commit: bool,
-    ) -> bool {
+    ) -> (bool, bool) {
         let root = &self.roots[index];
         let mut stored = false;
         let mut committed = false;
+        let mut changed = false;
         if let (Some(db), Some(drive_id)) = (self.db.as_mut(), &root.drive_id) {
             match db
                 .begin()
                 .and_then(|()| db.save_listing(drive_id, &root.mount, &path, &result))
             {
-                Ok(()) => stored = true,
+                Ok(c) => {
+                    stored = true;
+                    changed = c;
+                }
                 Err(error) => warn!("DB に書けませんでした（{}）: {error}", path.display()),
             }
             if commit {
@@ -436,13 +569,16 @@ impl Worker {
                 }
             }
         }
-        let alive = self.send(Message::Listed {
-            path,
-            result,
-            stored,
-        }) && (!committed || self.send(Message::Committed));
+        // 変わっていたら、先に知らせる（UI は木の子を出し直し、古いにする）。
+        let alive = (!changed || self.send(Message::Changed { path: path.clone() }))
+            && self.send(Message::Listed {
+                path,
+                result,
+                stored,
+            })
+            && (!committed || self.send(Message::Committed));
         self.wake();
-        alive
+        (alive, changed)
     }
 
     /// `path` があるドライブ（つないでいる場所がいちばん長く合うもの）。
