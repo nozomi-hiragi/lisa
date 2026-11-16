@@ -41,8 +41,14 @@ pub struct Node {
     /// ディスク上の場所。読めるフォルダだけ持つ（ダミーの木、別のボリューム、クラウドにだけある
     /// フォルダは無し）。
     pub path: Option<PathBuf>,
-    /// 子を読み終えた（読めなかったときも含む）。
+    /// 子を読み終えた（読めなかったときも含む）。読み終えていても、子がまだメモリに無いことがある
+    /// （`loaded`）。
     pub listed: bool,
+    /// 子がメモリ（この木）にある。読み終えて DB にあるが、まだ出していなければ false。
+    /// 見えるところに来たら DB から出す（`scan.rs` の `load_visible`）。
+    pub loaded: bool,
+    /// DB の `entry.id`（DB から出したフォルダだけ）。
+    pub entry: Option<i64>,
 }
 
 /// ダミーの木を書くための入れ物。
@@ -190,6 +196,7 @@ impl FileTree {
             let id = tree.push(&label, 0, Some(device), 0, true);
             tree.nodes[id].path = Some(drive.mount_path.clone());
             tree.nodes[id].listed = false;
+            tree.nodes[id].loaded = false;
             tree.nodes[id].state = LoadState::Unloaded;
         }
         tree.nodes[device].state = LoadState::Unloaded;
@@ -197,12 +204,81 @@ impl FileTree {
         tree
     }
 
-    /// フォルダ `id` を読んだ結果を足す。読めなければ失敗にする。祖先の大きさと状態も直す。
-    pub fn add_listing(&mut self, id: NodeId, result: Result<Listing, String>) {
-        if self.nodes[id].listed {
+    /// ドライブのノード `id` に、DB に残っていた一番上の行を合わせる（子はまだ出さない）。
+    pub fn set_drive_row(&mut self, id: NodeId, row: &lisa_core::db::Stored) {
+        let node = &mut self.nodes[id];
+        node.entry = Some(row.id);
+        node.listed = row.listed;
+        if row.error.is_some() {
+            node.state = LoadState::Failed;
+            node.loaded = true;
+        } else if row.listed {
+            node.state = LoadState::Loaded;
+        }
+        self.update_ancestor_states(id);
+    }
+
+    /// 読み終えた（DB にはある）が、子をまだ出していない。
+    pub fn mark_listed(&mut self, id: NodeId) {
+        self.nodes[id].listed = true;
+        if !self.nodes[id].loaded {
+            self.nodes[id].state = LoadState::Loaded;
+            self.update_ancestor_states(id);
+        }
+    }
+
+    /// DB にあるフォルダ `id` の子（`rows`、子の子は入れない）を足す。`scanned` は、DB にはまだ
+    /// 書かれていないが読み終えたフォルダか（読む係が書く前に結果が届いていることがある）。
+    pub fn add_stored_children(
+        &mut self,
+        id: NodeId,
+        rows: Vec<lisa_core::db::Stored>,
+        scanned: impl Fn(&std::path::Path) -> bool,
+    ) {
+        if self.nodes[id].loaded {
             return;
         }
         self.nodes[id].listed = true;
+        self.nodes[id].loaded = true;
+        let device = self.nodes[id].device;
+        let base = self.nodes[id].path.clone().unwrap_or_default();
+        let mut added = 0;
+        for row in rows {
+            let is_dir = row.kind == Kind::Dir;
+            let readable = is_dir && !row.cloud_only && !row.other_volume;
+            let child = self.push(&row.name_nfc, row.size, Some(id), device, is_dir);
+            // 中に入って読まないもの（ファイル、クラウドのみ、別のボリューム）は、一覧に載った時点で
+            // 読み込み済み（ハッシュはまだしないので）。
+            self.nodes[child].state = LoadState::Loaded;
+            if readable {
+                let path = base.join(lisa_core::name::from_raw_bytes(&row.name_raw));
+                let node = &mut self.nodes[child];
+                node.listed = row.listed || scanned(&path);
+                node.loaded = false;
+                node.entry = Some(row.id);
+                // 読み終えて DB にあるフォルダは、子を出していなくても読み込み済みとする。
+                node.state = if row.error.is_some() {
+                    node.loaded = true;
+                    LoadState::Failed
+                } else if node.listed {
+                    LoadState::Loaded
+                } else {
+                    LoadState::Unloaded
+                };
+                node.path = Some(path);
+            }
+            added += row.size;
+        }
+        self.finish_children(id, added);
+    }
+
+    /// フォルダ `id` を読んだ結果を足す。読めなければ失敗にする。祖先の大きさと状態も直す。
+    pub fn add_listing(&mut self, id: NodeId, result: Result<Listing, String>) {
+        if self.nodes[id].loaded {
+            return;
+        }
+        self.nodes[id].listed = true;
+        self.nodes[id].loaded = true;
         let device = self.nodes[id].device;
         let base = self.nodes[id].path.clone().unwrap_or_default();
         match result {
@@ -215,28 +291,42 @@ impl FileTree {
                     let is_dir = entry.kind == Kind::Dir;
                     let size = if is_dir { 0 } else { entry.size };
                     let child = self.push(&entry.name_nfc, size, Some(id), device, is_dir);
-                    // まだハッシュしていないので、ファイルは未読み込み。フォルダは中を読むまで未読み込み。
-                    self.nodes[child].state = LoadState::Unloaded;
+                    // ハッシュはまだしないので、一覧に載ったら読み込み済み。中に入って読むフォルダだけ、
+                    // 中を読むまで未読み込み。
+                    self.nodes[child].state = LoadState::Loaded;
                     if readable {
+                        self.nodes[child].state = LoadState::Unloaded;
                         self.nodes[child].path = Some(base.join(&entry.name));
                         self.nodes[child].listed = false;
+                        self.nodes[child].loaded = false;
                     }
                     added += size;
                 }
-                // 子が無ければ、読み終えた空のフォルダ。
-                self.nodes[id].state = if self.nodes[id].children.is_empty() {
-                    LoadState::Loaded
-                } else {
-                    LoadState::Unloaded
-                };
-                let mut cur = Some(id);
-                while let Some(i) = cur {
-                    self.nodes[i].size += added;
-                    cur = self.nodes[i].parent;
-                }
+                self.finish_children(id, added);
+                return;
             }
         }
-        // 祖先の状態を子から決め直す。
+        self.update_ancestor_states(id);
+    }
+
+    /// 子を足し終えたフォルダ `id` の状態と、祖先の大きさ（`added` を足す）と状態を直す。
+    fn finish_children(&mut self, id: NodeId, added: u64) {
+        // 子が無ければ、読み終えた空のフォルダ。
+        self.nodes[id].state = if self.nodes[id].children.is_empty() {
+            LoadState::Loaded
+        } else {
+            self.state_from_children(id)
+        };
+        let mut cur = Some(id);
+        while let Some(i) = cur {
+            self.nodes[i].size += added;
+            cur = self.nodes[i].parent;
+        }
+        self.update_ancestor_states(id);
+    }
+
+    /// 祖先の状態を子から決め直す。
+    fn update_ancestor_states(&mut self, id: NodeId) {
         let mut cur = self.nodes[id].parent;
         while let Some(i) = cur {
             self.nodes[i].state = self.state_from_children(i);
@@ -320,6 +410,8 @@ impl FileTree {
             state,
             path: None,
             listed: true,
+            loaded: true,
+            entry: None,
         });
         if let Some(p) = parent {
             self.nodes[p].children.push(id);
@@ -433,7 +525,11 @@ mod tests {
     }
 
     fn one_drive(path: &std::path::Path) -> FileTree {
-        let drive = lisa_core::volumes::Volume {
+        FileTree::this_device("端末", &[one_drive_volume(path)])
+    }
+
+    fn one_drive_volume(path: &std::path::Path) -> lisa_core::volumes::Volume {
+        lisa_core::volumes::Volume {
             id: None,
             label: "テスト".into(),
             fs: String::new(),
@@ -445,8 +541,7 @@ mod tests {
             read_only: false,
             case_sensitive: None,
             hidden: false,
-        };
-        FileTree::this_device("端末", &[drive])
+        }
     }
 
     #[test]
@@ -478,6 +573,60 @@ mod tests {
         assert_eq!(
             tree.nodes[sub].path.as_deref(),
             Some(dir.join("sub").as_path())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_tree_comes_back_like_a_listing() {
+        let dir = temp_dir("stored");
+        std::fs::write(dir.join("a.txt"), b"12345").unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/b.txt"), b"xy").unwrap();
+        std::fs::create_dir(dir.join("unread")).unwrap();
+        let volume = lisa_core::volumes::Volume {
+            id: Some("test:1".into()),
+            ..one_drive_volume(&dir)
+        };
+        let mut db = lisa_core::db::Db::open_in_memory().unwrap();
+        let device = db.this_device("端末", "host", "macos").unwrap();
+        db.upsert_drive(&device, &volume).unwrap();
+        let read = |p: &std::path::Path| lisa_core::listing::read_dir(p).map_err(|e| e.to_string());
+        db.save_listing("test:1", &dir, &dir, &read(&dir)).unwrap();
+        let sub_path = dir.join("sub");
+        db.save_listing("test:1", &dir, &sub_path, &read(&sub_path))
+            .unwrap();
+
+        let mut tree = FileTree::this_device("端末", &[volume]);
+        let drive = tree.nodes[tree.nodes[FileTree::ROOT].children[0]].children[0];
+        let root = db.drive_root("test:1").unwrap().unwrap();
+        tree.set_drive_row(drive, &root);
+        assert!(tree.nodes[drive].listed && !tree.nodes[drive].loaded);
+        tree.add_stored_children(drive, db.children(root.id).unwrap(), |_| false);
+        let node = &tree.nodes[drive];
+        assert!(node.loaded);
+        assert_eq!(node.children.len(), 3);
+        assert_eq!(node.size, 5);
+        let child = |tree: &FileTree, name: &str| {
+            tree.nodes[drive]
+                .children
+                .iter()
+                .copied()
+                .find(|&c| tree.nodes[c].name == name)
+                .unwrap()
+        };
+        // sub は読み終えているが、子はまだ出していない。出すと大きさが足される。
+        let sub = child(&tree, "sub");
+        assert!(tree.nodes[sub].listed && !tree.nodes[sub].loaded);
+        let sub_entry = tree.nodes[sub].entry.unwrap();
+        tree.add_stored_children(sub, db.children(sub_entry).unwrap(), |_| false);
+        assert_eq!(tree.nodes[sub].size, 2);
+        assert_eq!(tree.nodes[drive].size, 7);
+        assert!(!tree.nodes[child(&tree, "unread")].listed);
+        let child = |name: &str| child(&tree, name);
+        assert_eq!(
+            tree.nodes[child("unread")].path.as_deref(),
+            Some(dir.join("unread").as_path())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

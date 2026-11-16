@@ -20,6 +20,24 @@ pub fn raw_bytes(name: &OsStr) -> Vec<u8> {
     }
 }
 
+/// `raw_bytes` の逆。ディスク上の名前に戻す。
+pub fn from_raw_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(bytes.to_vec())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        std::ffi::OsString::from_wide(&wide)
+    }
+}
+
 /// NFC に正規化した名前。文字にできないところは U+FFFD になる（表示と並べ替え用）。
 pub fn nfc(name: &OsStr) -> String {
     name.to_string_lossy().nfc().collect()
@@ -53,6 +71,7 @@ mod tests {
         let nfc_name = OsStr::new("\u{304C}");
         assert_eq!(nfc(nfd), nfc(nfc_name));
         assert_ne!(raw_bytes(nfd), raw_bytes(nfc_name));
+        assert_eq!(from_raw_bytes(&raw_bytes(nfd)), nfd);
     }
 
     #[test]
