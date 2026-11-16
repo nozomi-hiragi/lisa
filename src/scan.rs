@@ -295,11 +295,8 @@ fn request_visible(
         return;
     }
     *last = Some(folder);
-    let node = &tree.nodes[folder];
-    if node.state == crate::model::tree::LoadState::Loaded {
-        return;
-    }
-    if let Some(path) = &node.path {
+    // 開いたら、読み直してもらう（変わっていなければ何もしない）。
+    if let Some(path) = &tree.nodes[folder].path {
         control.visible(path.clone());
     }
 }
@@ -320,6 +317,8 @@ struct Scanner {
     folders: HashMap<PathBuf, NodeId>,
     /// ハッシュができて DB に書いたが、まだ確定していないフォルダ。
     hashed: HashSet<PathBuf>,
+    /// 読み直したら変わっていて、まだハッシュし直していないフォルダ（子を出し直しても古いにする）。
+    stale: HashSet<PathBuf>,
 }
 
 enum Message {
@@ -331,6 +330,8 @@ enum Message {
     },
     /// フォルダのハッシュができた（中のファイルもハッシュした）。
     Hashed { path: PathBuf },
+    /// 読み直したら DB と違っていた（このあと `Listed` が来る）。
+    Changed { path: PathBuf },
     /// ここまでに書いたものを確定した。
     Committed,
 }
@@ -366,6 +367,7 @@ fn start_workers(
         proxy: (**proxy).clone(),
         progress: progress.0.clone(),
         control: control.clone(),
+        dirty: false,
     };
     std::thread::Builder::new()
         .name("lisa-scan".into())
@@ -382,6 +384,7 @@ fn start_workers(
         recent: HashMap::new(),
         folders: HashMap::new(),
         hashed: HashSet::new(),
+        stale: HashSet::new(),
     };
     for id in 0..tree.nodes.len() {
         scanner.track(&tree, id);
@@ -421,6 +424,7 @@ fn receive(
     scanner: Option<ResMut<Scanner>>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
+    mut nav: ResMut<crate::view::Nav>,
 ) {
     let Some(mut scanner) = scanner else {
         return;
@@ -441,11 +445,28 @@ fn receive(
                 scanner.hashed.clear();
             }
             Message::Hashed { path } => {
+                scanner.stale.remove(&path);
                 if let Some(&id) = scanner.folders.get(&path) {
                     tree.mark_hashed(id);
                     any = true;
                 }
                 scanner.hashed.insert(path);
+            }
+            Message::Changed { path } => {
+                // 木にあれば、子を出し直す（このあと届く `Listed` から）。ハッシュができるまで古い。
+                if let Some(&id) = scanner.folders.get(&path) {
+                    tree.reset_children(id);
+                    tree.mark_stale(id);
+                    // 外した子を開いていたら、そのフォルダまで戻る（子は出し直すと別のノードになる）。
+                    if let Some(at) = nav.stack.iter().position(|l| l.node == id)
+                        && at + 1 < nav.stack.len()
+                    {
+                        nav.stack.truncate(at + 1);
+                    }
+                    any = true;
+                }
+                scanner.hashed.remove(&path);
+                scanner.stale.insert(path);
             }
             Message::Listed {
                 path,
@@ -554,6 +575,9 @@ fn load_children(
         }
     }
     scanner.track_children(tree, id);
+    if scanner.stale.contains(&path) {
+        tree.mark_stale(id);
+    }
     true
 }
 
