@@ -73,6 +73,7 @@ fn spawn_panel(mut commands: Commands, font: Res<LabelFont>, progress: Option<Re
 
 fn show_progress(
     progress: Option<Res<ScanProgress>>,
+    control: Option<Res<crate::scan::ScanControl>>,
     mut last: Local<Option<Instant>>,
     mut panel: Query<&mut Visibility, With<Panel>>,
     mut summary: Query<&mut Text, (With<Summary>, Without<Lines>)>,
@@ -160,6 +161,16 @@ fn show_progress(
                 body.join("\n"),
             )
         }
+    };
+    // 裏の分を休んでいるなら、その理由を添える。
+    let rest = control.map_or(crate::scan::Rest::No, |c| c.control.rest());
+    let working = p.finished.is_none() || (hash.started.is_some() && hash.finished.is_none());
+    let head = match rest {
+        _ if !working => head,
+        crate::scan::Rest::No => head,
+        crate::scan::Rest::Paused => format!("{head}（一時停止中）"),
+        crate::scan::Rest::Battery => format!("{head}（電池なので休み中）"),
+        crate::scan::Rest::Cpu => format!("{head}（CPU が混んでいるので休み中）"),
     };
     if let Ok(mut text) = summary.single_mut()
         && text.0 != head

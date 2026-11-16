@@ -316,7 +316,15 @@ mod tests {
         for dir in [tmp.clone(), tmp.join("a"), tmp.join("b"), tmp.join("c")] {
             db.save_listing("test:d", &tmp, &dir, &read(&dir)).unwrap();
         }
-        crate::hash::hash_drive(&mut db, "test:d", &tmp, 2, &mut |_| {}, &|| false).unwrap();
+        crate::hash::hash_drive(
+            &mut db,
+            "test:d",
+            &tmp,
+            2,
+            &mut |_| {},
+            &crate::hash::Pace::FREE,
+        )
+        .unwrap();
 
         let found = groups(&db, 10).unwrap();
         assert_eq!(found.len(), 2, "{found:#?}");

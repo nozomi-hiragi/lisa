@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
+use bevy::winit::EventLoopProxyWrapper;
 use lisa_core::db::Db;
 use lisa_core::listing::{self, Kind, Listing};
 
@@ -30,13 +30,15 @@ use crate::model::tree::{FileTree, NodeId};
 
 /// 1 フレームで木に足す結果の数の上限（一度にたくさん届いても固まらないように）。
 const APPLY_PER_FRAME: usize = 256;
-/// DB に書いたものを確定する間隔。
-const COMMIT_EVERY: Duration = Duration::from_millis(300);
 /// 木を並べ直す間隔の下限。読めるたびに並べ直して焼き直すと重いので、まとめる。
 const RELAYOUT_EVERY: Duration = Duration::from_millis(300);
 
 /// 1 フレームで DB から子を出すフォルダの数の上限。
 const LOAD_PER_FRAME: usize = 256;
+
+mod worker;
+
+pub use worker::Rest;
 
 pub struct ScanPlugin;
 
@@ -110,7 +112,13 @@ impl Plugin for ScanPlugin {
             .add_systems(Startup, start_workers)
             .add_systems(
                 Update,
-                (receive, load_visible, resolve_jump)
+                (
+                    apply_settings,
+                    request_visible,
+                    receive,
+                    load_visible,
+                    resolve_jump,
+                )
                     .chain()
                     .before(crate::view::ViewSystems),
             );
@@ -226,6 +234,76 @@ pub struct HashProgress {
     pub finished: Option<Instant>,
 }
 
+/// 裏で読むときの決まり（一時停止、速さの上限など）と、読む係への頼み。
+#[derive(Resource)]
+pub struct ScanControl {
+    pub control: Arc<worker::Control>,
+    requests: Mutex<std::sync::mpsc::Sender<worker::Request>>,
+}
+
+impl ScanControl {
+    /// 見ているフォルダを、裏の分より先に読んで（読み終えていなければ）ハッシュしてもらう。
+    fn visible(&self, path: PathBuf) {
+        let sent = self
+            .requests
+            .lock()
+            .is_ok_and(|s| s.send(worker::Request::Visible(path)).is_ok());
+        if sent {
+            self.control
+                .urgent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// 設定の値を、読む係との決まりに写す。
+fn apply_settings(settings: Res<crate::settings::Settings>, control: Option<Res<ScanControl>>) {
+    use std::sync::atomic::Ordering;
+    let Some(control) = control else {
+        return;
+    };
+    if !settings.is_changed() && !control.is_added() {
+        return;
+    }
+    let c = &control.control;
+    c.limit.store(
+        (settings.background_mb_per_sec * 1_000_000.0) as u64,
+        Ordering::Relaxed,
+    );
+    c.rest_on_battery
+        .store(settings.rest_on_battery >= 0.5, Ordering::Relaxed);
+    c.cpu_limit
+        .store(settings.rest_cpu_percent as u32, Ordering::Relaxed);
+}
+
+/// 開いている場面のフォルダが変わったら、そこを先に読んで（ハッシュして）もらう。
+fn request_visible(
+    nav: Res<crate::view::Nav>,
+    tree: Res<FileTree>,
+    control: Option<Res<ScanControl>>,
+    mut last: Local<Option<NodeId>>,
+) {
+    let Some(control) = control else {
+        return;
+    };
+    if !nav.is_changed() {
+        return;
+    }
+    let path = crate::view::scene_path(&nav, &tree);
+    let folder = path[path.len() - 1].node;
+    if *last == Some(folder) {
+        return;
+    }
+    *last = Some(folder);
+    let node = &tree.nodes[folder];
+    if node.state == crate::model::tree::LoadState::Loaded {
+        return;
+    }
+    if let Some(path) = &node.path {
+        control.visible(path.clone());
+    }
+}
+
 /// 読む係の進み具合を UI から覗く。
 #[derive(Resource, Clone)]
 pub struct ScanProgress(pub Arc<Mutex<Progress>>);
@@ -257,9 +335,6 @@ enum Message {
     Committed,
 }
 
-/// ファイルを同時にハッシュする数。
-const HASH_THREADS: usize = 4;
-
 /// 中に入って読むもの（フォルダで、クラウドのみでも別のボリュームでもない）。
 /// `FileTree::add_listing` がパスを付けるものと同じ。
 fn readable(entry: &listing::Entry) -> bool {
@@ -272,157 +347,34 @@ fn start_workers(
     tree: Res<FileTree>,
     setup: Res<Setup>,
 ) {
-    let Some((mut db, roots)) = setup.0.lock().ok().and_then(|mut s| s.take()) else {
+    let Some((db, roots)) = setup.0.lock().ok().and_then(|mut s| s.take()) else {
         return;
     };
     commands.remove_resource::<Setup>();
     let (sender, receiver) = channel();
-    let proxy = (**proxy).clone();
+    let (requests, request_receiver) = channel();
     let progress = ScanProgress(Arc::new(Mutex::new(Progress {
         started: Some(Instant::now()),
         ..default()
     })));
-    let shared = progress.0.clone();
+    let control = Arc::new(worker::Control::default());
+    let worker = worker::Worker {
+        db,
+        roots,
+        sender,
+        requests: request_receiver,
+        proxy: (**proxy).clone(),
+        progress: progress.0.clone(),
+        control: control.clone(),
+    };
     std::thread::Builder::new()
         .name("lisa-scan".into())
-        .spawn(move || {
-            // 読むものを、深さ優先で後ろから先に積む。DB に残っているドライブは、まだ読み終えて
-            // いないフォルダから（DB の木の並びの順に）。
-            let mut stack: Vec<(usize, PathBuf)> = Vec::new();
-            for (index, root) in roots.iter().enumerate().rev() {
-                let todo = match (db.as_ref(), &root.drive_id) {
-                    (Some(store), Some(drive_id)) if root.listed => store
-                        .unlisted_folders(drive_id, &root.mount)
-                        .unwrap_or_else(|error| {
-                            warn!("DB から続きを読めませんでした: {error}");
-                            vec![root.mount.clone()]
-                        }),
-                    _ => vec![root.mount.clone()],
-                };
-                stack.extend(todo.into_iter().rev().map(|path| (index, path)));
-            }
-            if stack.is_empty() {
-                report(&shared, |p| p.finished = Some(Instant::now()));
-            }
-            let mut last_commit = Instant::now();
-            // 深さ優先: 取り出したフォルダの子を、名前順の逆に積む（上の子から先に取り出される）。
-            while let Some((index, path)) = stack.pop() {
-                report(&shared, |p| {
-                    p.current = Some(path.clone());
-                    p.queued = stack.len();
-                });
-                let result = listing::read_dir(&path).map_err(|e| e.to_string());
-                if let Ok(listing) = &result {
-                    for entry in listing.entries.iter().rev().filter(|e| readable(e)) {
-                        stack.push((index, path.join(&entry.name)));
-                    }
-                }
-                let root = &roots[index];
-                let mut stored = false;
-                let mut committed = false;
-                if let (Some(store), Some(drive_id)) = (db.as_mut(), &root.drive_id) {
-                    let saved = store
-                        .begin()
-                        .and_then(|()| store.save_listing(drive_id, &root.mount, &path, &result));
-                    match saved {
-                        Ok(()) => stored = true,
-                        Err(error) => warn!("DB に書けませんでした（{}）: {error}", path.display()),
-                    }
-                    if stack.is_empty() || last_commit.elapsed() >= COMMIT_EVERY {
-                        match store.commit() {
-                            Ok(()) => committed = true,
-                            Err(error) => warn!("DB に確定できませんでした: {error}"),
-                        }
-                        last_commit = Instant::now();
-                    }
-                }
-                let failed = result.is_err();
-                report(&shared, |p| {
-                    p.done += 1;
-                    p.failed += failed as u64;
-                    p.queued = stack.len();
-                    p.next = stack
-                        .iter()
-                        .rev()
-                        .take(SHOWN_NEXT)
-                        .map(|(_, p)| p.clone())
-                        .collect();
-                    if stack.is_empty() {
-                        p.current = None;
-                        p.finished = Some(Instant::now());
-                    }
-                });
-                let message = Message::Listed {
-                    path,
-                    result,
-                    stored,
-                };
-                if sender.send(message).is_err()
-                    || (committed && sender.send(Message::Committed).is_err())
-                {
-                    break;
-                }
-                // 止まっている間でも、すぐに木に足して描けるように起こす。
-                let _ = proxy.send_event(WinitUserEvent::WakeUp);
-            }
-            if let Some(store) = db.as_mut() {
-                let _ = store.commit();
-            }
-            if sender.send(Message::Committed).is_err() {
-                return;
-            }
-            // 読み終えたら、ハッシュの無いものを下からハッシュする。
-            let Some(store) = db.as_mut() else {
-                return;
-            };
-            report(&shared, |p| p.hash.started = Some(Instant::now()));
-            let closed = std::sync::atomic::AtomicBool::new(false);
-            for root in &roots {
-                let Some(drive_id) = &root.drive_id else {
-                    continue;
-                };
-                let mut on = |event: lisa_core::hash::Event| {
-                    let message = match event {
-                        lisa_core::hash::Event::Folder(path) => {
-                            report(&shared, |p| p.hash.folder = Some(path.to_path_buf()));
-                            return;
-                        }
-                        lisa_core::hash::Event::File { bytes } => {
-                            report(&shared, |p| {
-                                p.hash.files += 1;
-                                p.hash.bytes += bytes;
-                            });
-                            return;
-                        }
-                        lisa_core::hash::Event::FolderDone(path) => Message::Hashed {
-                            path: path.to_path_buf(),
-                        },
-                        lisa_core::hash::Event::Committed => Message::Committed,
-                    };
-                    if sender.send(message).is_err() {
-                        closed.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    let _ = proxy.send_event(WinitUserEvent::WakeUp);
-                };
-                let stop = || closed.load(std::sync::atomic::Ordering::Relaxed);
-                if let Err(error) = lisa_core::hash::hash_drive(
-                    store,
-                    drive_id,
-                    &root.mount,
-                    HASH_THREADS,
-                    &mut on,
-                    &stop,
-                ) {
-                    warn!("ハッシュを DB に書けませんでした: {error}");
-                }
-            }
-            report(&shared, |p| {
-                p.hash.folder = None;
-                p.hash.finished = Some(Instant::now());
-            });
-            let _ = proxy.send_event(WinitUserEvent::WakeUp);
-        })
+        .spawn(move || worker.run())
         .expect("読む係を作る");
+    commands.insert_resource(ScanControl {
+        control,
+        requests: Mutex::new(requests),
+    });
     commands.insert_resource(progress);
     let mut scanner = Scanner {
         results: Mutex::new(receiver),
