@@ -534,7 +534,12 @@ mod tests {
         let rgba: Vec<u8> = (0..w * h)
             .flat_map(|i| {
                 let (x, y) = (i % w, i / w);
-                [(x / 4) as u8, (y / 3) as u8, 120, if x < 10 { 0 } else { 255 }]
+                [
+                    (x / 4) as u8,
+                    (y / 3) as u8,
+                    120,
+                    if x < 10 { 0 } else { 255 },
+                ]
             })
             .collect();
         let key = [3u8; 32];
@@ -547,7 +552,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        #[test]
+    #[test]
     fn keys_change_when_a_child_changes() {
         let mut tree = FileTree::deep(3);
         let dirs: Vec<NodeId> = (1..tree.nodes.len())
