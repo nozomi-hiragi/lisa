@@ -88,6 +88,11 @@ impl Gesture {
         self.last_input.is_some() || self.coast.is_some()
     }
 
+    /// 縮めたまま止まって、親の場面を下に敷いている。
+    pub fn has_parent_scene(&self) -> bool {
+        self.parent_scene.is_some()
+    }
+
     /// 下に敷いたままの親の場面を返して手放す（クリックなどで場面を作り直すとき、消すため）。
     pub fn take_parent_scene(&mut self) -> Option<Entity> {
         self.parent_scene.take()
@@ -396,7 +401,7 @@ pub fn gesture(
         // カーソルの下の点が動かないように拡大縮小する。
         let factor = (-pinch).exp();
         // 縮める上限は Root を基準にする（開いている場所が途中で変わっても、急に止まらない）。
-        let root_scale = fit(maker.layouts.0[FileTree::ROOT].fit, &window).1;
+        let root_scale = fit(maker.layouts[FileTree::ROOT].fit, &window).1;
         let new_scale =
             (state.raw_scale * factor).clamp(rest_scale / MAX_ZOOM_IN, root_scale * MAX_ZOOM_OUT);
         let anchor = cursor_world.unwrap_or(state.raw_pos);
@@ -517,7 +522,7 @@ impl Siblings {
         let mut centers = maker.tree.nodes[parent.node]
             .children
             .iter()
-            .map(|c| maker.layouts.0[*c].fit.center());
+            .map(|c| maker.layouts[*c].fit.center());
         let first = centers.next()?;
         let area = centers.fold(Rect::from_corners(first, first), |r, c| r.union_point(c));
         Some(Self { area })

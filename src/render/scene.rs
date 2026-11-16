@@ -6,7 +6,7 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::sprite_render::ColorMaterial;
 
-use crate::layout::NodeLayout;
+use crate::layout::Layouts;
 use crate::model::tree::{FileTree, NodeId};
 use crate::render::cache::FolderImages;
 use crate::render::ear::{self, EarSizes};
@@ -25,7 +25,7 @@ pub struct SceneRoot;
 
 pub struct SceneSource<'a> {
     pub tree: &'a FileTree,
-    pub layouts: &'a [NodeLayout],
+    pub layouts: &'a Layouts,
     pub images: &'a FolderImages,
     pub font: &'a Handle<Font>,
     pub ears: &'a EarSizes,

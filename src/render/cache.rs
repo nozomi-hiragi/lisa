@@ -2,9 +2,11 @@
 //!
 //! 画面に映らないカメラで、フォルダの場面を1枚の画像に描く（render to texture）。
 //! 深い階層のカメラから先に描くので、親の画像には子の焼き上がった画像が入る。
-//! 今はダミーの木なので、起動時に全部のフォルダを焼き、捨てることはしない。
+//! 焼くのは、並べてあるもの（基準のフォルダの周り、`layout.rs`）だけ。基準が変わったら、
+//! 新しく並んだものの入れ物を足し、並ばなくなったものは捨てて、まとめて焼き直す。
+//! 焼き直している間は、前に焼いた画像をそのまま見せる（同じ画像に上書きする）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::camera::RenderTarget;
 use bevy::camera::visibility::RenderLayers;
@@ -13,7 +15,7 @@ use bevy::render::render_resource::TextureFormat;
 use bevy::sprite_render::ColorMaterial;
 use bevy::window::RequestRedraw;
 
-use crate::layout::Layouts;
+use crate::layout::{BODY_ASPECT, Layouts};
 use crate::model::tree::{FileTree, NodeId};
 use crate::render::ear::EarSizes;
 use crate::render::scene::{self, LabelFont, SceneSource};
@@ -24,19 +26,41 @@ const IMAGE_WIDTH: u32 = 1024;
 const BAKE_FRAMES: u32 = 3;
 
 /// フォルダごとの画像。キーは今はノードの番号だが、いずれフォルダのハッシュにする。
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct FolderImages {
     images: HashMap<NodeId, Handle<Image>>,
-    baked: bool,
+    /// 一度でも焼き上がったもの。
+    baked: HashSet<NodeId>,
 }
 
 impl FolderImages {
     /// 焼き上がっていれば画像を返す。
     pub fn ready(&self, id: NodeId) -> Option<Handle<Image>> {
-        if self.baked {
+        if self.baked.contains(&id) {
             self.images.get(&id).cloned()
         } else {
             None
+        }
+    }
+
+    /// 並べてあるフォルダ（Root 以外）の画像の入れ物をそろえる。並ばなくなったものは捨てる。
+    pub fn prepare(&mut self, tree: &FileTree, layouts: &Layouts, assets: &mut Assets<Image>) {
+        let wanted: HashSet<NodeId> = layouts
+            .ids()
+            .filter(|&id| id != FileTree::ROOT && tree.nodes[id].is_dir)
+            .collect();
+        self.images.retain(|id, _| wanted.contains(id));
+        self.baked.retain(|id| wanted.contains(id));
+        let height = (IMAGE_WIDTH as f32 / BODY_ASPECT).round() as u32;
+        for id in wanted {
+            self.images.entry(id).or_insert_with(|| {
+                assets.add(Image::new_target_texture(
+                    IMAGE_WIDTH,
+                    height,
+                    TextureFormat::Rgba8Unorm,
+                    Some(TextureFormat::Rgba8UnormSrgb),
+                ))
+            });
         }
     }
 }
@@ -57,31 +81,6 @@ pub enum Bake {
 /// 焼き上がった直後の1回だけ存在する。
 #[derive(Resource)]
 pub struct BakeFinished;
-
-/// 全部のフォルダ（Root 以外）の画像の入れ物を用意する。
-pub fn create_images(tree: &FileTree, aspect: f32, assets: &mut Assets<Image>) -> FolderImages {
-    let height = (IMAGE_WIDTH as f32 / aspect).round() as u32;
-    let images = tree
-        .nodes
-        .iter()
-        .enumerate()
-        .skip(1)
-        .filter(|(_, node)| node.is_dir)
-        .map(|(id, _)| {
-            let image = Image::new_target_texture(
-                IMAGE_WIDTH,
-                height,
-                TextureFormat::Rgba8Unorm,
-                Some(TextureFormat::Rgba8UnormSrgb),
-            );
-            (id, assets.add(image))
-        })
-        .collect();
-    FolderImages {
-        images,
-        baked: false,
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn bake(
@@ -104,10 +103,11 @@ pub fn bake(
                 return;
             }
             // 親の場面には子の画像を貼る。子は同じフレームの先に焼かれる。
-            images.baked = true;
+            let all: Vec<NodeId> = images.images.keys().copied().collect();
+            images.baked.extend(all);
             let source = SceneSource {
                 tree: &tree,
-                layouts: &layouts.0,
+                layouts: &layouts,
                 images: &images,
                 font: &font.0,
                 ears: &ears,
@@ -115,7 +115,7 @@ pub fn bake(
             let mut entities = Vec::new();
             for (i, (&id, image)) in images.images.iter().enumerate() {
                 let layer = RenderLayers::layer(i + 1);
-                let frame = layouts.0[id].frame;
+                let frame = layouts[id].frame;
                 let scale = frame.width() / IMAGE_WIDTH as f32;
                 entities.push(scene::spawn(
                     &mut commands,
