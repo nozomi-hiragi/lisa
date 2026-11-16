@@ -5,6 +5,7 @@
 
 pub mod cloud;
 pub mod db;
+pub mod dups;
 pub mod hash;
 pub mod listing;
 pub mod name;

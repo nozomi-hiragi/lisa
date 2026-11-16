@@ -127,6 +127,11 @@ impl Db {
         Self::with(Connection::open(path)?)
     }
 
+    /// 中のつなぎ（同じ crate の読み出し用）。
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// メモリの中だけの DB（テスト用）。
     pub fn open_in_memory() -> Result<Self> {
         Self::with(Connection::open_in_memory()?)

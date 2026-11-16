@@ -4,6 +4,7 @@
 //! cargo run -p lisa-scan -- ls <フォルダ>            1 段だけ読んで一覧を出す
 //! cargo run -p lisa-scan -- tree <フォルダ> [深さ]   下までたどって数と速さを出す
 //! cargo run -p lisa-scan -- drives                    つながっているドライブの一覧
+//! cargo run -p lisa-scan -- dups [件数]               アプリの DB から重複の一覧を出す
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -15,7 +16,8 @@ use lisa_core::listing::{self, Entry, Kind};
 const USAGE: &str = "使い方:
   lisa-scan ls <フォルダ>            1 段だけ読んで一覧を出す
   lisa-scan tree <フォルダ> [深さ]   下までたどって数と速さを出す（別のボリュームには入らない）
-  lisa-scan drives                    つながっているドライブの一覧";
+  lisa-scan drives                    つながっているドライブの一覧
+  lisa-scan dups [件数]               アプリの DB から重複の一覧を出す（空く大きさの順）";
 
 fn main() -> ExitCode {
     if let Err(error) = lisa_core::cloud::prevent_downloads() {
@@ -30,6 +32,11 @@ fn main() -> ExitCode {
         ["tree", path, depth] => match depth.parse() {
             Ok(depth) => tree(Path::new(path), depth),
             Err(_) => Err(format!("深さは数で: {depth}")),
+        },
+        ["dups"] => dups(20),
+        ["dups", count] => match count.parse() {
+            Ok(count) => dups(count),
+            Err(_) => Err(format!("件数は数で: {count}")),
         },
         _ => Err(USAGE.to_string()),
     };
@@ -242,6 +249,51 @@ fn drives() -> Result<(), String> {
         );
     }
     println!("--\n{} 個", volumes.len());
+    Ok(())
+}
+
+/// アプリの DB（`~/Library/Application Support/Lisa/lisa.db`）から、同じ中身のファイルのまとまりを
+/// 空く大きさの順に出す。ハードリンクは同じ実体として 1 つにまとめる。
+fn dups(count: usize) -> Result<(), String> {
+    let path = directories::ProjectDirs::from("", "", "Lisa")
+        .ok_or("DB の場所が分かりません")?
+        .data_dir()
+        .join("lisa.db");
+    if !path.exists() {
+        return Err(format!("DB がありません: {}", path.display()));
+    }
+    let db = lisa_core::db::Db::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let start = Instant::now();
+    let found = lisa_core::dups::groups(&db, count).map_err(|e| e.to_string())?;
+    let mut total = 0;
+    for group in &found {
+        total += group.wasted();
+        let kind = if group.kind == Kind::Dir {
+            "フォルダ"
+        } else {
+            "ファイル"
+        };
+        println!(
+            "{kind}  {}  {}  {} か所・合計 {}（空く {}）",
+            group.name,
+            human(group.size),
+            group.copies.len(),
+            human(group.total()),
+            human(group.wasted())
+        );
+        for copy in &group.copies {
+            println!("  - {}", copy.path.display());
+            for link in &copy.hard_links {
+                println!("    = {}", link.display());
+            }
+        }
+    }
+    println!(
+        "--\n{} 組、合わせて {} 空く（{:.1} 秒。「=」はすぐ上と同じ実体のハードリンク）",
+        found.len(),
+        human(total),
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
