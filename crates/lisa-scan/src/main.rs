@@ -6,7 +6,10 @@
 //! cargo run -p lisa-scan -- drives                    つながっているドライブの一覧
 //! cargo run -p lisa-scan -- dups [件数]               アプリの DB から重複の一覧を出す
 //! cargo run -p lisa-scan -- snapshots                   アプリの DB からスナップショットの一覧を出す
+//! cargo run -p lisa-scan -- share <ファイル> [ポート]  LAN の他の PC へファイルを HTTP で渡す
 //! ```
+
+mod share;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -19,7 +22,8 @@ const USAGE: &str = "使い方:
   lisa-scan tree <フォルダ> [深さ]   下までたどって数と速さを出す（別のボリュームには入らない）
   lisa-scan drives                    つながっているドライブの一覧
   lisa-scan dups [件数]               アプリの DB から重複の一覧を出す（空く大きさの順）
-  lisa-scan snapshots                 アプリの DB からスナップショットの一覧を出す";
+  lisa-scan snapshots                 アプリの DB からスナップショットの一覧を出す
+  lisa-scan share <ファイル> [ポート] LAN の他の PC へファイルを HTTP で渡す（ポートは既定で 8765）";
 
 fn main() -> ExitCode {
     if let Err(error) = lisa_core::cloud::prevent_downloads() {
@@ -36,6 +40,11 @@ fn main() -> ExitCode {
             Err(_) => Err(format!("深さは数で: {depth}")),
         },
         ["snapshots"] => snapshots(),
+        ["share", path] => share::share(Path::new(path), share::DEFAULT_PORT),
+        ["share", path, port] => match port.parse() {
+            Ok(port) => share::share(Path::new(path), port),
+            Err(_) => Err(format!("ポートは数で: {port}")),
+        },
         ["dups"] => dups(20),
         ["dups", count] => match count.parse() {
             Ok(count) => dups(count),

@@ -47,11 +47,32 @@ cargo run -p lisa-scan -- drives             # つながっているドライブ
 ```
 
 - 初回のビルドは、依存している Bevy のコンパイルに十数分かかります。2 回目以降は数秒です。
-- フォント（`assets/fonts/NotoSansJP-Light.otf`）はリポジトリからの相対パスで読みます。
-  `target/debug/lisa` を直接起動すると文字が出ないので、`cargo run` で起動してください。
+- フォント（`assets/fonts/NotoSansJP-Light.otf`）は実行ファイルに埋め込んであるので、
+  `target/release/lisa` を直接起動しても、他の PC へコピーしても文字が出ます。
 - `lisa-scan` はファイルの中身を読みません（名前、大きさ、日時だけ）。Mac では、クラウドにだけある
   ファイルを読んでもダウンロードしない設定にしてから動きます。`~/Documents` などを初めて読むときは、
   起動した Terminal にアクセスの許可を聞かれます。
+
+## 他の PC へ渡す（Mac で Windows 用を作る）
+
+Mac で Windows 用の `lisa.exe` を作り、同じ LAN の PC へ HTTP で渡せます。
+
+```sh
+# 初めてのときだけ
+brew install mingw-w64
+rustup target add x86_64-pc-windows-gnu
+
+scripts/share-windows.sh        # ビルドして http://<この Mac>:8765/ で渡す（Ctrl+C で止める）
+scripts/share-windows.sh 9000   # ポートを変える
+```
+
+- 表示された URL を Windows のブラウザで開いて落とすか、PowerShell で表示された
+  `curl.exe -o lisa.exe http://...` を打って落とします。
+- ブラウザで落とすと、署名のない exe なので SmartScreen が「PC が保護されました」と止めます。
+  「詳細情報」から「実行」で起動できます。`curl.exe` で落とした場合は止められません。
+- Mac のファイアウォールが受信を許可するか聞いてきたら、許可してください。
+- 渡すだけなら、どのファイルでも `cargo run -p lisa-scan -- share <ファイル> [ポート]` で渡せます。
+  合言葉も暗号化もないので、家など信頼できる LAN でだけ使ってください。
 
 ## 操作
 

@@ -180,13 +180,16 @@ fn setup(
     mut commands: Commands,
     tree: Res<FileTree>,
     settings: Res<Settings>,
-    assets: Res<AssetServer>,
+    mut fonts: ResMut<Assets<Font>>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     window: Single<&Window, With<PrimaryWindow>>,
 ) {
-    let font = assets.load("fonts/NotoSansJP-Light.otf");
+    // フォントは実行ファイルに埋め込む（`lisa.exe` 1 つを他の PC へ渡すだけで文字が出るように）。
+    let font = fonts.add(Font::from_bytes(
+        include_bytes!("../assets/fonts/NotoSansJP-Light.otf").to_vec(),
+    ));
     // 本体はどれも √2:1（A4 の横長）。耳の高さの設定は、本体を画面に収めたときのピクセル数で決める。
     // 最初は Root を基準にして並べる。
     let (spec, ears) = ear_spec(&settings, &window);
