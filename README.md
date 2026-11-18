@@ -293,6 +293,7 @@ cargo run -p lisa-scan -- remote-screenshot <名前か device_id> --count 8 --in
 - [docs/design.md](docs/design.md) — ハッシュでの管理の考え方と仕組み
 - [docs/schema.md](docs/schema.md) — 保存するデータの形（一部実装）
 - [docs/scan.md](docs/scan.md) — 実際のスキャンに要るものと、実装の順番（一部実装）
+- [docs/catalog.md](docs/catalog.md) — フォルダをアプリと結びつけるカタログ（計画）
 
 ## ライセンス
 
