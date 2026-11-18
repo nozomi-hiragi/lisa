@@ -7,6 +7,10 @@
 //!   変わったら当て直す（ハッシュの途中は 1 分ごと）。当てた結果は `catalog_match` に書く。
 //! - 1 か所ごとの仕分け（`assignment`）も同じスレッドで読み、型の当たりより先にする。
 
+mod lan;
+
+pub use lan::{RemoteCatalogs, import};
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -36,8 +40,12 @@ impl Plugin for CatalogPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CatalogView>()
             .init_resource::<CatalogMarks>()
+            .init_resource::<RemoteCatalogs>()
             .add_systems(Startup, start_worker)
-            .add_systems(Update, (receive, update_marks, order_duplicates).chain());
+            .add_systems(
+                Update,
+                (receive, lan::fetch_remote, update_marks, order_duplicates).chain(),
+            );
     }
 }
 
@@ -403,13 +411,35 @@ fn receive(mut view: ResMut<CatalogView>, mut redraw: MessageWriter<RequestRedra
 fn update_marks(
     mut commands: Commands,
     view: Res<CatalogView>,
+    remote: Res<RemoteCatalogs>,
     tree: Res<FileTree>,
     mut marks: ResMut<CatalogMarks>,
 ) {
-    if !view.is_changed() && !tree.is_changed() {
+    if !view.is_changed() && !tree.is_changed() && !remote.is_changed() {
         return;
     }
     let mut next = CatalogMarks::default();
+    // LAN の相手の木（相手の Lisa が当てた結果）。
+    if !remote.by_device.is_empty() {
+        for (id, node) in tree.nodes.iter().enumerate() {
+            let Some(r) = &node.remote else {
+                continue;
+            };
+            let (Some(entry), Some(snapshot)) = (r.entry_id, remote.by_device.get(&r.device_id))
+            else {
+                continue;
+            };
+            if let Some(hit) = snapshot.hits.iter().find(|h| h.entry_id == entry) {
+                next.tags.insert(id, (hit.label.clone(), hit.color));
+            }
+            if matches!(
+                snapshot.roles.get(&entry),
+                Some(Role::Cache | Role::Install | Role::Log)
+            ) {
+                next.dim.insert(id);
+            }
+        }
+    }
     if let Some(snapshot) = &view.snapshot {
         let by_entry: HashMap<i64, NodeId> = tree
             .nodes

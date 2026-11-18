@@ -156,6 +156,7 @@ fn role_text(role: Role) -> &'static str {
 fn fill_panel(
     mut commands: Commands,
     view: Res<CatalogView>,
+    remote: Res<crate::catalog::RemoteCatalogs>,
     nav: Res<Nav>,
     tree: Res<FileTree>,
     font: Res<LabelFont>,
@@ -164,7 +165,7 @@ fn fill_panel(
 ) {
     let open_folder = nav.top().node;
     let folder_changed = *last_open != Some(open_folder);
-    if !view.open || !(view.is_changed() || folder_changed) {
+    if !view.open || !(view.is_changed() || remote.is_changed() || folder_changed) {
         return;
     }
     *last_open = Some(open_folder);
@@ -359,6 +360,66 @@ fn fill_panel(
                 .observe(move |_: On<PointerClick>, mut commands: Commands| {
                     commands.insert_resource(JumpTo(chain.clone()));
                 });
+            }
+        }
+        // LAN の相手（相手の Lisa が当てた結果）と、相手にしか無い型。
+        let mut devices: Vec<_> = remote.by_device.values().collect();
+        devices.sort_by(|a, b| a.name.cmp(&b.name));
+        for device in devices {
+            section(
+                list,
+                &big,
+                &format!("{} の当たり  {} か所", device.name, device.hits.len()),
+            );
+            if let Some(error) = &device.error {
+                list.spawn((
+                    Text::new(format!("読めませんでした: {error}")),
+                    small.clone(),
+                    TextColor(ERROR_COLOR),
+                ));
+            }
+            let mut by_app: BTreeMap<&str, usize> = BTreeMap::new();
+            for hit in &device.hits {
+                *by_app.entry(&hit.app).or_default() += 1;
+            }
+            if !by_app.is_empty() {
+                let text = by_app
+                    .iter()
+                    .map(|(a, n)| format!("{a} {n}"))
+                    .collect::<Vec<_>>()
+                    .join("・");
+                list.spawn((Text::new(text), small.clone(), TextColor(DIM_COLOR)));
+            }
+            if !device.only_there.is_empty() {
+                list.spawn((
+                    Text::new("相手にしか無い型（押すと、こちらのカタログに取り込みます）"),
+                    small.clone(),
+                    TextColor(DIM_COLOR),
+                ));
+                let chips: Vec<(String, Color)> = device
+                    .only_there
+                    .iter()
+                    .map(|c| {
+                        let rgb = lisa_core::catalog::app_color(&c.app);
+                        (
+                            format!("取り込む: {}", c.name),
+                            Color::srgb_u8(rgb[0], rgb[1], rgb[2]),
+                        )
+                    })
+                    .collect();
+                let texts: Vec<String> = device.only_there.iter().map(|c| c.text.clone()).collect();
+                chip_row(
+                    list,
+                    &small,
+                    &chips,
+                    move |i| match crate::catalog::import(&texts[i]) {
+                        Ok(path) => {
+                            info!("カタログを取り込みました: {}", path.display());
+                            crate::catalog::refresh_now();
+                        }
+                        Err(error) => warn!("カタログを取り込めませんでした: {error}"),
+                    },
+                );
             }
         }
         let roles: usize = snapshot.roles.len();
