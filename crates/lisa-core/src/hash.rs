@@ -22,6 +22,9 @@ const BUFFER: usize = 1 << 20;
 
 pub type Hash = [u8; 32];
 
+/// ストリームで BLAKE3 を計算するときのハッシャー。
+pub use blake3::Hasher;
+
 /// ファイルの中身のハッシュ。
 pub fn hash_file(path: &Path) -> io::Result<Hash> {
     hash_file_paced(path, &|_| true)

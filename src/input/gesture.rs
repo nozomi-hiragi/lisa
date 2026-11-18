@@ -171,6 +171,7 @@ pub fn gesture(
     animating: Option<Res<Animating>>,
     mut fades: Query<&mut Fade>,
     popup: Res<Popup>,
+    banners: Query<&bevy::picking::hover::Hovered, With<crate::lan::PairBanner>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut input: ResMut<TrackpadInput>,
 ) {
@@ -306,7 +307,8 @@ pub fn gesture(
     let (_, rest_scale) = fit(top.frame(&maker.layouts), &window);
     let cursor = window.cursor_position();
     let cursor_world = cursor.and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok());
-    let over_ui = ui_has_pointer(&window, &popup);
+    let over_banner = banners.iter().any(|h| h.get());
+    let over_ui = ui_has_pointer(&window, &popup, over_banner);
 
     // macOS の慣性は使わない（離したあとの動きは、こちらで重力をかけて作る）。
     if !momentum.is_empty() || lifted_now {

@@ -90,6 +90,7 @@ fn handle(
     control: Option<Res<ScanControl>>,
     progress: Option<Res<ScanProgress>>,
     mut redraw: MessageWriter<RequestRedraw>,
+    mut exit: MessageWriter<AppExit>,
 ) {
     let Some(inbox) = inbox else {
         return;
@@ -138,6 +139,10 @@ fn handle(
                 }
                 None => Err("読む係がまだ動いていません".into()),
             },
+            Command::Quit => {
+                exit.write(AppExit::Success);
+                Ok(())
+            }
         };
         let answer = match result {
             Ok(()) => Reply::ok(state(

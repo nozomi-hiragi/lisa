@@ -7,7 +7,8 @@ Lisa は [Bevy](https://bevyengine.org/) 0.20 の上で動く 2D のアプリで
 
 ```
 src/
-  main.rs                  アプリの組み立て（プラグインの登録、ログの絞り込み）
+  main.rs                  アプリの組み立て（プラグインの登録、ログの絞り込み、Windows の OpenGL 既定）
+  crash.rs                 落ちたときの処理（crash.log への記録、Windows の知らせの窓）
   model.rs
   model/tree.rs            ファイルの木（読んだところだけ。この端末とドライブ、読めたら子を足す。ダミーの木）
   layout.rs                木の配置（名前順のタイル、列の数の選び方、入れ子の枠、基準のフォルダの周りだけ）
@@ -18,8 +19,10 @@ src/
   render/preview.rs        ファイルの仮のプレビュー（拡張子ごとの絵）
   render/cache.rs          フォルダの中身を画像に焼くキャッシュ（render to texture）
   render/status.rs         読み込みの状態ごとのタイルの見た目（枠だけ、脈打つ光、暗い膜、×）
-  scan.rs                  本物のフォルダを裏のスレッドで読んで木に足す（見ている所から近い順）
-  view.rs                  開いている場所（Nav）、場面の切り替え、クリック、並べ直し
+  scan.rs                  本物のフォルダを裏のスレッドで読んで木に足す（DB からの出し入れと監視）
+  scan/worker.rs           裏のスレッドでフォルダの読み取りとハッシュを進める係
+  dups.rs                  重複の一覧を裏で作り、選んだ組のコピーを木の上で光らせる
+  view.rs                  開いている場所（Nav）、場面の切り替え、クリック、飛ぶ、並べ直し
   view/camera.rs           枠に合わせる位置と倍率、ズームのアニメーション、描画頻度
   view/fade.rs             場面のフェード
   view/title.rs            ウィンドウのタイトルとメニューバーの場所の表示
@@ -31,18 +34,30 @@ src/
   input/mac_scroll.rs      macOS: NSEvent のスクロールを直接見るモニタ
   ui.rs
   ui/menu.rs               メニューバーと設定のポップアップ（Bevy UI）
+  ui/progress.rs           読み込み中・ハッシュ中のリスト（画面左下）
+  ui/dups.rs               重複の一覧のパネル（画面右側）
   settings.rs              設定（settings.json への保存と、ポップアップの項目）
   debug.rs                 デバッグビルドで FPS をタイトルに出す
   remote.rs                外（lisa-mcp）からの頼みを受けて画面を動かす（飛ぶ、重複の一覧、読み直し、一時停止）
+  lan.rs                   LAN の他の PC の Lisa を見つけ、ペアリングして、木に出す（HTTP 待ち受け・UDP 発見・MCP 呼び出し・sidecar 管理）
 crates/lisa-core/          スキャンの中身（Bevy に依存しない）
+  src/db.rs                SQLite への保存と読み出し（device、drive、entry、tree、snapshot、meta）
+  src/dups.rs              同じハッシュのファイル・フォルダをまとめた重複の一覧とキャッシュの署名
+  src/fsevents.rs          Mac: FSEvents のイベント番号から前回以降に変わったフォルダを取る
+  src/hash.rs              ファイルの BLAKE3 ハッシュと、フォルダの Merkle ハッシュ
   src/listing.rs           フォルダを 1 段読む（種類、大きさ、日時、リンク先、クラウドのみ、別のボリューム）
   src/name.rs              名前（ディスク上のバイト列、NFC、フォルダのハッシュと同じ並び、OS のゴミ）
+  src/pace.rs              裏で読むときの I/O 優先度、速さの上限、電池・CPU・ディスクの混み具合の判定
   src/cloud.rs             Mac: クラウドにだけあるファイルを読んでもダウンロードしない設定
   src/volumes.rs           つながっているドライブの一覧（ID、名前、ファイルシステム、容量、外付けか）
   src/query.rs             DB を外から読む問い合わせ（パスから道のり、名前で探す、同じハッシュ）
   src/remote.rs            起動中のアプリを外から動かす口（127.0.0.1 と control.json、1 行の JSON）
 crates/lisa-scan/          lisa-core を Bevy なしで試す CLI
-crates/lisa-mcp/           MCP のサーバー（標準入出力。DB を読む道具と、アプリを動かす道具）
+  src/main.rs              ls、tree、drives、dups、snapshots、remote-logs、remote-update、remote-app
+  src/share.rs             LAN の他の PC へファイルを HTTP で渡す簡易サーバー
+crates/lisa-mcp/           MCP のサーバー（標準入出力と Streamable HTTP。DB を読む道具と、アプリを動かす・更新する道具）
+  src/main.rs              起動オプション（--listen、--token、--parent、--linger）と待ち受け
+  src/lib.rs               MCP の道具一式、認証、ペアリング、sidecar 管理、バイナリ更新
 docs/                      このドキュメント
 assets/fonts/              Noto Sans JP と、そのライセンス
 ```
@@ -55,11 +70,11 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 `view.rs` の `TreeViewPlugin` が、毎フレーム次の順に動かします（`.chain()`）。
 
 1. `cache::bake` — フォルダの画像を作る（鍵が変わったものだけ。ディスクにあれば読み、無ければ焼く）
-2. `show_baked` / `relayout` / `reanchor` / `show_relayout` — 焼き上がりや並べ直し、基準の付け替えに
+2. `show_baked` / `jump` / `relayout` / `reanchor` / `show_relayout` — 焼き上がりや一覧からのジャンプ、並べ直し、基準の付け替えに
    合わせて、今の場面を作り直す
 3. `navigate` — クリック、右クリック、Esc
 4. `gesture` — トラックパッドとマウスのジェスチャー、離したあとの動き
-5. `refit_on_resize` — ウィンドウの大きさが変わったら合わせ直す
+5. `refit_on_resize` / `follow_side_panel` — ウィンドウの大きさや右の一覧の幅が変わったら合わせ直す
 6. `animate_camera` — クリックや Esc で移るときのズームのアニメーション
 7. `update_ears` — カメラの倍率に合わせて耳の大きさを直す
 8. `fade_scenes` — 場面のフェード
@@ -67,8 +82,7 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 10. `keep_redrawing` — 動いている間だけ、次のフレームを頼む
 11. `update_title` — タイトルの書き換え（変わったときだけ）
 
-メニューの処理（`MenuSystems`）は、これより先に動きます（Esc はまずポップアップを閉じる）。
-木を読む処理（`scan.rs` の `apply_listings`）も、これより先に動きます。
+メニューの処理（`MenuSystems`）、木を読む処理（`scan.rs`）、LAN の処理（`lan.rs` の `sync_share_listener`、`poll_discovery`、`poll_incoming_pairs`、`poll_worker_events`、`request_remote_nodes`、`update_lan_ui`）は、これより先に動きます。
 
 ## 本物のフォルダを読む
 
@@ -130,8 +144,8 @@ assets/fonts/              Noto Sans JP と、そのライセンス
   （下の「画像キャッシュ」）。
 - 読めたら、winit のイベントループを起こし（止まっている間は 1 秒に 1 回しか描かないため）、木に
   足します。木が変わったら、動きが止まるのを待って、0.3 秒に 1 回まで並べ直し、画像を焼き直します。
-- 読めなかったフォルダは「失敗」、空のフォルダは「読み込み済み」です。ファイルはまだハッシュを
-  しないので「未読み込み」、フォルダは子から決まります。別のボリュームとクラウドにだけあるフォルダは
+- 読めなかったフォルダは「失敗」、空のフォルダは「読み込み済み」です。ファイルはハッシュができるまで
+  「未読み込み」、できたら「読み込み済み」、フォルダは子から決まります。別のボリュームとクラウドにだけあるフォルダは
   読みません。シンボリックリンクはファイルとして出します（たどらない）。
 - 並べる数（`MAX_LAID_OUT`）と画像の数（`MAX_IMAGES`、基準から 2 段下まで）に上限があり、中身の
   多いフォルダが並んでいても重くなりすぎないようにしています。
@@ -192,9 +206,7 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 
 ファイルとフォルダは、それぞれ読み込みの状態（`model/tree.rs` の `LoadState`）を持ちます。
 読み込み済みと言えるのは、ハッシュとフォルダの画像キャッシュが両方そろったときです。中身が
-変われば、ハッシュと画像キャッシュは同じタイミングで作り直します。今はハッシュがまだ無いので、
-本物の木では、一覧に載ったファイルと中に入らないフォルダは「読み込み済み」、中に入って読むフォルダは
-読むまで「未読み込み」（DB で読み終えていれば「読み込み済み」）、読めなかったものは「失敗」です。ダミーの木では名前でいくつかの状態に散らしています（`dummy_state`）。
+変われば、ハッシュと画像キャッシュは同じタイミングで作り直します。本物の木では、ハッシュができたファイルとフォルダ（およびハッシュしないクラウドのみ・リンク・中に入らないフォルダ）は「読み込み済み」、まだハッシュしていないものは「未読み込み」、読み直して中身が変わったものはハッシュし直すまで「古い」、読めなかったものは「失敗」です。ダミーの木では名前でいくつかの状態に散らしています（`dummy_state`）。
 
 | 状態 | 見た目（`render/status.rs`） |
 | --- | --- |
@@ -266,6 +278,15 @@ assets/fonts/              Noto Sans JP と、そのライセンス
   作り直している間は、前の画像をそのまま見せます。
 - 半透明の色を画像に焼くと色が変わるので、枠や紙の色は「下の色に重ねた結果」を不透明な色として
   計算して描いています（`render/shapes.rs` の `over`）。
+
+## LAN の他の PC の Lisa を見る（`lan.rs`）
+
+- 設定の「LAN に公開」（`lan_share`）が 1 のあいだ、アプリの中で `lisa_mcp::HttpListener`（既定 `0.0.0.0:47800`、使えなければ空いている番号）と UDP の返事（`0.0.0.0:47801`）を動かします。あわせて、同じフォルダの `lisa-mcp` を別プロセス（sidecar、既定 `0.0.0.0:47802`、`sidecar.json` に `pid` と `port` を記録）として裏で立ち上げます。0 に戻せば `unblock` でアプリの待ち受けを止め、sidecar も `/health` を確かめてから止めます。
+- sidecar（`lisa-mcp`）はアプリ本体が落ちたあとも既定で 10 分間（`--linger 600`）残るので、ペアリングした端末から `lisa_logs` で `logs/lisa.log` や `crash.log` を読んだり、`lisa_update` や `lisa_app_start` / `lisa_app_stop` / `lisa_app_alive` でバイナリの入れ替えや再起動を行えます。
+- 認証は `lan.json`（`{"token", "peers": [{"device_id", "name", "key", "added_at"}]}`）で、合言葉（`token`）かペアリングで発行した `peer.key` のどちらでも通します（`lisa_update` や `lisa_app_start` / `lisa_app_stop` は `peer.key` のみ）。設定のポップアップの「つないだ端末」から相手ごとに `key` を取り消せます。
+- どの側も起動時と 30 秒ごとに UDP 47801 へ `{"lisa":"hello","v":1}` をブロードキャストし、`{"lisa":"here","v":1,"device_id","name","port","mcp_port"}` の返事を 2 秒集めます。
+- 見つけた端末と、`peers.json` に覚えている端末を、Root の下に端末ノード（`Node.remote: Some(RemoteRef)`、`path: None`）として並べます。
+- 相手の端末ノードが開かれたとき、未ペアリングなら 4 桁の番号を作って `POST /pair` を送り、相手の画面のポップアップで許可されたら返ってきた `key` を `peers.json` に覚えます。つながったら `lisa_drives` でドライブを、フォルダが見えるところに来たら `lisa_list`（1000 件ずつ）で子を裏のスレッドで取って木に足します。木で見るときは、相手の DB を読むだけです。
 
 ## 描画頻度
 

@@ -35,6 +35,9 @@ use crate::render::scene::{self, LabelFont, SceneSource};
 const IMAGE_WIDTH: u32 = 1024;
 /// 一度に持つ画像の数の上限。
 const MAX_IMAGES: usize = 300;
+/// 一度に焼く画像の数の上限。焼く画像ごとにカメラを 1 つ立てるので、一度に何十枚も焼くと、
+/// 弱い GPU（Windows の古い Intel など）ではそのフレームが何秒も止まる。深いものから順に分けて焼く。
+const BAKE_BATCH: usize = 8;
 /// 焼くカメラを何フレーム残すか（描き終わるまでの余裕）。
 const BAKE_FRAMES: u32 = 3;
 /// 描き方の版。描き方を変えたら上げる（ディスクの古い画像を使わなくなる）。
@@ -108,11 +111,13 @@ impl FolderImages {
 
 /// 焼ける入れ物（読み戻せるように COPY_SRC も付ける）。
 fn target_image() -> Image {
+    // 中身は sRGB のまま持つ（描くのも貼るのも sRGB として扱う）。Unorm の画像に sRGB の見方を
+    // 足す形（view_formats）は、OpenGL（WGPU_BACKEND=gl）では作れずに落ちるので使わない。
     let mut image = Image::new_target_texture(
         IMAGE_WIDTH,
         image_height(),
-        TextureFormat::Rgba8Unorm,
-        Some(TextureFormat::Rgba8UnormSrgb),
+        TextureFormat::Rgba8UnormSrgb,
+        None,
     );
     image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
     image
@@ -132,7 +137,6 @@ fn loaded_image(rgba: Vec<u8>) -> Image {
         RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_view_descriptor = None;
-    image.texture_descriptor.view_formats = &[TextureFormat::Rgba8UnormSrgb];
     image
 }
 
@@ -145,8 +149,7 @@ pub struct ImageCache {
 
 impl ImageCache {
     pub fn new() -> Self {
-        let dir = directories::ProjectDirs::from("", "", "Lisa")
-            .map(|dirs| dirs.cache_dir().join("folder-images"));
+        let dir = crate::scan::cache_dir().map(|dir| dir.join("folder-images"));
         if let Some(dir) = &dir {
             let _ = std::fs::create_dir_all(dir);
             // 使われなくなった画像を、裏で消す。
@@ -339,6 +342,8 @@ pub enum Bake {
         entities: Vec<Entity>,
         /// 焼き終えたら読み戻してディスクに残すもの。
         saves: Vec<(Key, Handle<Image>)>,
+        /// このあと焼くもの（`BAKE_BATCH` を超えた分。浅いものほど後ろ）。
+        rest: Vec<NodeId>,
     },
     Done,
 }
@@ -467,6 +472,7 @@ pub fn bake(
             frames,
             entities,
             saves,
+            rest,
         } => {
             redraw.write(RequestRedraw);
             *frames += 1;
@@ -488,8 +494,22 @@ pub fn bake(
             for entity in entities.drain(..) {
                 commands.entity(entity).despawn();
             }
-            *bake = Bake::Done;
-            commands.insert_resource(BakeFinished);
+            let rest = std::mem::take(rest);
+            *bake = start_baking(
+                &mut commands,
+                &mut images,
+                &mut assets,
+                &mut meshes,
+                &mut materials,
+                &tree,
+                &layouts,
+                &font,
+                &ears,
+                rest,
+            );
+            if matches!(*bake, Bake::Done) {
+                commands.insert_resource(BakeFinished);
+            }
         }
         Bake::Done => {}
     }
@@ -507,11 +527,14 @@ fn start_baking(
     layouts: &Layouts,
     font: &LabelFont,
     ears: &EarSizes,
-    targets: Vec<NodeId>,
+    mut targets: Vec<NodeId>,
 ) -> Bake {
     if targets.is_empty() {
         return Bake::Done;
     }
+    // 子は親より先に焼く（親の場面には子の焼き上がった画像を貼る）。深いものから `BAKE_BATCH` 枚だけ。
+    targets.sort_by_key(|&id| (std::cmp::Reverse(tree.nodes[id].depth), id));
+    let rest = targets.split_off(targets.len().min(BAKE_BATCH));
     // ディスクから読んだ画像には焼けないので、入れ物を作り直す。
     let mut saves = Vec::new();
     for &id in &targets {
@@ -582,6 +605,7 @@ fn start_baking(
         frames: 0,
         entities,
         saves,
+        rest,
     }
 }
 

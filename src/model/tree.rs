@@ -49,6 +49,25 @@ pub struct Node {
     pub loaded: bool,
     /// DB の `entry.id`（DB から出したフォルダだけ）。
     pub entry: Option<i64>,
+    /// LAN の相手のノードなら、どの相手かと相手の DB の `entry.id`。
+    pub remote: Option<RemoteRef>,
+}
+
+/// LAN の他の PC のノードが指す相手と、相手の DB の `entry.id`（端末のノード自身は `None`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRef {
+    pub device_id: String,
+    pub entry_id: Option<i64>,
+}
+
+/// 相手の端末のドライブ 1 つ分の情報（木に足すとき用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteDrive {
+    pub label: String,
+    pub entry_id: i64,
+    pub listed: bool,
+    pub has_hash: bool,
+    pub has_error: bool,
 }
 
 /// ダミーの木を書くための入れ物。
@@ -369,6 +388,127 @@ impl FileTree {
         self.update_ancestor_states(id);
     }
 
+    /// Root の下に LAN の他の PC の端末ノードを足す（すでにあれば名前と状態を直す）。
+    pub fn ensure_remote_device(
+        &mut self,
+        device_id: &str,
+        name: &str,
+        initial_state: LoadState,
+    ) -> NodeId {
+        if let Some(&id) = self.nodes[Self::ROOT].children.iter().find(|&&c| {
+            self.nodes[c]
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.device_id == device_id)
+        }) {
+            self.nodes[id].name = name.to_string();
+            return id;
+        }
+        let next_device = self.nodes[Self::ROOT]
+            .children
+            .iter()
+            .map(|&c| self.nodes[c].device)
+            .max()
+            .map_or(1, |m| m + 1);
+        let id = self.push(name, 0, Some(Self::ROOT), next_device, true);
+        let node = &mut self.nodes[id];
+        node.state = initial_state;
+        node.listed = true;
+        node.loaded = false;
+        node.remote = Some(RemoteRef {
+            device_id: device_id.to_string(),
+            entry_id: None,
+        });
+        self.update_ancestor_states(id);
+        id
+    }
+
+    /// 相手のノード `id`（端末またはフォルダ）の読み込み状態を変える（読み込み中・失敗・未読み込みなど）。
+    pub fn set_remote_state(&mut self, id: NodeId, state: LoadState, loaded: bool) {
+        self.nodes[id].state = state;
+        self.nodes[id].loaded = loaded;
+        self.update_ancestor_states(id);
+    }
+
+    /// 相手の端末ノード `id` に、`lisa_drives` で取ったドライブ一覧を子として足す。
+    pub fn add_remote_drives(&mut self, id: NodeId, drives: Vec<RemoteDrive>) {
+        if self.nodes[id].loaded {
+            return;
+        }
+        let Some(device_id) = self.nodes[id].remote.as_ref().map(|r| r.device_id.clone()) else {
+            return;
+        };
+        let device = self.nodes[id].device;
+        self.nodes[id].listed = true;
+        self.nodes[id].loaded = true;
+        for drive in drives {
+            let child = self.push(&drive.label, 0, Some(id), device, true);
+            let node = &mut self.nodes[child];
+            node.listed = drive.listed;
+            node.loaded = false;
+            node.remote = Some(RemoteRef {
+                device_id: device_id.clone(),
+                entry_id: Some(drive.entry_id),
+            });
+            node.state = if drive.has_error {
+                node.loaded = true;
+                LoadState::Failed
+            } else if drive.has_hash {
+                LoadState::Loaded
+            } else {
+                LoadState::Unloaded
+            };
+        }
+        self.finish_children(id, 0);
+    }
+
+    /// 相手のフォルダ（またはドライブ）`id` に、`lisa_list` で取った子（`items`）を足す。
+    pub fn add_remote_children(&mut self, id: NodeId, items: Vec<lisa_core::query::Item>) {
+        if self.nodes[id].loaded {
+            return;
+        }
+        let Some(device_id) = self.nodes[id].remote.as_ref().map(|r| r.device_id.clone()) else {
+            return;
+        };
+        self.nodes[id].listed = true;
+        self.nodes[id].loaded = true;
+        let device = self.nodes[id].device;
+        let mut added = 0;
+        for item in items {
+            let is_dir = item.kind == "dir";
+            let readable = is_dir && !item.cloud_only && !item.other_volume;
+            let size = if is_dir { 0 } else { item.size };
+            let child = self.push(&item.name, size, Some(id), device, is_dir);
+            let skip = item.kind != "file" || item.cloud_only;
+            self.nodes[child].state = if skip || item.hash.is_some() {
+                LoadState::Loaded
+            } else if item.error.is_some() {
+                LoadState::Failed
+            } else {
+                LoadState::Unloaded
+            };
+            self.nodes[child].remote = Some(RemoteRef {
+                device_id: device_id.clone(),
+                entry_id: Some(item.id),
+            });
+            if readable {
+                let node = &mut self.nodes[child];
+                node.listed = item.listed;
+                node.loaded = false;
+                node.state = if item.error.is_some() {
+                    node.loaded = true;
+                    LoadState::Failed
+                } else if item.hash.is_some() {
+                    LoadState::Loaded
+                } else {
+                    LoadState::Unloaded
+                };
+            }
+            added += size;
+        }
+        self.finish_children(id, added);
+    }
+
     /// 子を足し終えたフォルダ `id` の状態と、祖先の大きさ（`added` を足す）と状態を直す。
     fn finish_children(&mut self, id: NodeId, added: u64) {
         // 子が無ければ、読み終えた空のフォルダ。
@@ -472,6 +612,7 @@ impl FileTree {
             listed: true,
             loaded: true,
             entry: None,
+            remote: None,
         });
         if let Some(p) = parent {
             self.nodes[p].children.push(id);
@@ -738,6 +879,126 @@ mod tests {
             lisa_core::listing::read_dir(&dir).map_err(|e| e.to_string()),
         );
         assert_eq!(tree.nodes[drive].state, LoadState::Loaded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_drives_and_children_populate_tree() {
+        let dir = temp_dir("remote");
+        let mut tree = one_drive(&dir);
+        let remote_dev = tree.ensure_remote_device("peer-1", "Windows PC", LoadState::Unloaded);
+        assert_eq!(tree.nodes[remote_dev].device, 1);
+        assert!(tree.nodes[remote_dev].path.is_none());
+        assert_eq!(
+            tree.nodes[remote_dev].remote,
+            Some(RemoteRef {
+                device_id: "peer-1".into(),
+                entry_id: None
+            })
+        );
+
+        tree.add_remote_drives(
+            remote_dev,
+            vec![RemoteDrive {
+                label: "C:".into(),
+                entry_id: 10,
+                listed: true,
+                has_hash: false,
+                has_error: false,
+            }],
+        );
+        assert!(tree.nodes[remote_dev].loaded);
+        let drive = tree.nodes[remote_dev].children[0];
+        assert_eq!(tree.nodes[drive].name, "C:");
+        assert_eq!(tree.nodes[drive].device, 1);
+        assert!(tree.nodes[drive].path.is_none());
+        assert!(tree.nodes[drive].listed && !tree.nodes[drive].loaded);
+        assert_eq!(
+            tree.nodes[drive].remote,
+            Some(RemoteRef {
+                device_id: "peer-1".into(),
+                entry_id: Some(10)
+            })
+        );
+
+        let items = vec![
+            lisa_core::query::Item {
+                id: 11,
+                name: "docs".into(),
+                kind: "dir".into(),
+                size: 0,
+                mtime: None,
+                hash: Some("a".repeat(64)),
+                cloud_only: false,
+                other_volume: false,
+                listed: true,
+                error: None,
+            },
+            lisa_core::query::Item {
+                id: 12,
+                name: "hashed.txt".into(),
+                kind: "file".into(),
+                size: 100,
+                mtime: None,
+                hash: Some("b".repeat(64)),
+                cloud_only: false,
+                other_volume: false,
+                listed: false,
+                error: None,
+            },
+            lisa_core::query::Item {
+                id: 13,
+                name: "unhashed.txt".into(),
+                kind: "file".into(),
+                size: 50,
+                mtime: None,
+                hash: None,
+                cloud_only: false,
+                other_volume: false,
+                listed: false,
+                error: None,
+            },
+            lisa_core::query::Item {
+                id: 14,
+                name: "broken.txt".into(),
+                kind: "file".into(),
+                size: 20,
+                mtime: None,
+                hash: None,
+                cloud_only: false,
+                other_volume: false,
+                listed: false,
+                error: Some("permission denied".into()),
+            },
+        ];
+        tree.add_remote_children(drive, items);
+        assert!(tree.nodes[drive].loaded);
+        assert_eq!(tree.nodes[drive].size, 170);
+        assert_eq!(tree.nodes[remote_dev].size, 170);
+
+        let find = |name: &str| {
+            tree.nodes[drive]
+                .children
+                .iter()
+                .copied()
+                .find(|&c| tree.nodes[c].name == name)
+                .unwrap()
+        };
+        let docs = find("docs");
+        assert!(tree.nodes[docs].is_dir);
+        assert!(tree.nodes[docs].listed && !tree.nodes[docs].loaded);
+        assert_eq!(tree.nodes[docs].state, LoadState::Loaded);
+        assert!(tree.nodes[docs].path.is_none());
+        assert_eq!(
+            tree.nodes[docs].remote,
+            Some(RemoteRef {
+                device_id: "peer-1".into(),
+                entry_id: Some(11)
+            })
+        );
+        assert_eq!(tree.nodes[find("hashed.txt")].state, LoadState::Loaded);
+        assert_eq!(tree.nodes[find("unhashed.txt")].state, LoadState::Unloaded);
+        assert_eq!(tree.nodes[find("broken.txt")].state, LoadState::Failed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

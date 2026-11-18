@@ -43,6 +43,8 @@ pub enum Command {
     Rescan { path: PathBuf },
     /// 裏の読み込みを一時停止する・再開する。
     Pause { paused: bool },
+    /// アプリを終了する。
+    Quit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +160,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         options.mode(0o600);
     }
     options.open(path)?.write_all(bytes)
+}
+
+/// `control.json` を読む。無いか壊れていれば None。
+pub fn read_endpoint(dir: &Path) -> Option<Endpoint> {
+    let bytes = std::fs::read(dir.join(FILE_NAME)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// `control.json` を消す（自分の書いたものだけ）。

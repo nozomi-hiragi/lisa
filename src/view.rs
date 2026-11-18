@@ -45,52 +45,49 @@ pub struct ViewSystems;
 
 impl Plugin for TreeViewPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(WinitSettings {
-            // 止まっているあいだは1秒に1回。入力があればすぐ描画する。
-            focused_mode: UpdateMode::reactive(Duration::from_secs(1)),
-            unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs(1)),
-        })
-        .insert_resource(ClearColor(BACKGROUND))
-        .insert_resource(Nav {
-            stack: vec![Level {
-                node: FileTree::ROOT,
-            }],
-        })
-        .insert_resource(Bake::Waiting)
-        .insert_resource(cache::ImageCache::new())
-        .insert_resource(Breadcrumb("Root".into()))
-        .init_resource::<Busy>()
-        .init_resource::<crate::render::status::PulseClock>()
-        .init_resource::<crate::input::gesture::Gesture>()
-        .init_resource::<crate::input::gesture::TrackpadInput>()
-        .add_systems(
-            Startup,
-            (setup, crate::input::gesture::install_scroll_monitor),
-        )
-        .add_systems(
-            Update,
-            (
-                cache::bake,
-                show_baked,
-                jump,
-                relayout,
-                reanchor,
-                show_relayout,
-                navigate,
-                crate::input::gesture::gesture,
-                refit_on_resize,
-                follow_side_panel,
-                animate_camera,
-                update_ears,
-                fade_scenes,
-                crate::render::status::pulse_loading,
-                keep_redrawing,
-                update_title,
+        let (update_settings, _) = update_settings_from_env();
+        app.insert_resource(update_settings)
+            .insert_resource(ClearColor(BACKGROUND))
+            .insert_resource(Nav {
+                stack: vec![Level {
+                    node: FileTree::ROOT,
+                }],
+            })
+            .insert_resource(Bake::Waiting)
+            .insert_resource(cache::ImageCache::new())
+            .insert_resource(Breadcrumb("Root".into()))
+            .init_resource::<Busy>()
+            .init_resource::<crate::render::status::PulseClock>()
+            .init_resource::<crate::input::gesture::Gesture>()
+            .init_resource::<crate::input::gesture::TrackpadInput>()
+            .add_systems(
+                Startup,
+                (setup, crate::input::gesture::install_scroll_monitor),
             )
-                .chain()
-                .in_set(ViewSystems)
-                .after(MenuSystems),
-        );
+            .add_systems(
+                Update,
+                (
+                    cache::bake,
+                    show_baked,
+                    jump,
+                    relayout,
+                    reanchor,
+                    show_relayout,
+                    navigate,
+                    crate::input::gesture::gesture,
+                    refit_on_resize,
+                    follow_side_panel,
+                    animate_camera,
+                    update_ears,
+                    fade_scenes,
+                    crate::render::status::pulse_loading,
+                    keep_redrawing,
+                    update_title,
+                )
+                    .chain()
+                    .in_set(ViewSystems)
+                    .after(MenuSystems),
+            );
     }
 }
 
@@ -504,9 +501,10 @@ fn scene_levels<'a>(stack: &'a [Level], tree: &FileTree) -> &'a [Level] {
     &stack[..=depth]
 }
 
-/// メニューバーの上やポップアップを操作しているときは、下の画面は操作しない。
-pub(crate) fn ui_has_pointer(window: &Window, popup: &Popup) -> bool {
+/// メニューバーの上やポップアップ、ペアリングのバナーを操作しているときは、下の画面は操作しない。
+pub(crate) fn ui_has_pointer(window: &Window, popup: &Popup, over_banner: bool) -> bool {
     popup.open
+        || over_banner
         || window
             .cursor_position()
             .is_some_and(|p| p.y < BAR_PX || p.x > view_width(window))
@@ -543,13 +541,15 @@ fn navigate(
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
     popup: Res<Popup>,
+    banners: Query<&bevy::picking::hover::Hovered, With<crate::lan::PairBanner>>,
     mut gesture: ResMut<crate::input::gesture::Gesture>,
 ) {
     // 切り替えの途中や、メニューやジェスチャーを操作しているときは受け付けない。
+    let over_banner = banners.iter().any(|h| h.get());
     if animating.is_some()
         || !fades.is_empty()
         || gesture.active()
-        || ui_has_pointer(&window, &popup)
+        || ui_has_pointer(&window, &popup, over_banner)
     {
         return;
     }
@@ -677,4 +677,73 @@ fn change_scene(
         current.0 = maker.spawn(container, scale_of(container, maker));
     }
     maker.tree.nodes[target].is_dir
+}
+
+/// 環境変数 `LISA_UPDATE_MODE` から `WinitSettings` と起動ログ用の名前を決める。
+/// 知らない値は既定の `reactive` にして `warn!` を出す。
+pub(crate) fn update_settings_from_env() -> (WinitSettings, &'static str) {
+    let raw = std::env::var("LISA_UPDATE_MODE").ok();
+    let (settings, label, unknown) = parse_update_mode(raw.as_deref());
+    if let Some(bad) = unknown {
+        warn!("知らない LISA_UPDATE_MODE={bad:?}（reactive を使います）");
+    }
+    (settings, label)
+}
+
+pub(crate) fn parse_update_mode(raw: Option<&str>) -> (WinitSettings, &'static str, Option<&str>) {
+    let reactive = || WinitSettings {
+        // 止まっているあいだは1秒に1回。入力があればすぐ描画する。
+        focused_mode: UpdateMode::reactive(Duration::from_secs(1)),
+        unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs(1)),
+    };
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (reactive(), "reactive (default)", None);
+    };
+    if s.eq_ignore_ascii_case("reactive") {
+        (reactive(), "reactive", None)
+    } else if s.eq_ignore_ascii_case("continuous") {
+        (
+            WinitSettings {
+                focused_mode: UpdateMode::Continuous,
+                unfocused_mode: UpdateMode::Continuous,
+            },
+            "continuous",
+            None,
+        )
+    } else {
+        (reactive(), "reactive (default)", Some(s))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_update_mode_values() {
+        let (s, label, bad) = parse_update_mode(None);
+        assert_eq!(label, "reactive (default)");
+        assert!(bad.is_none());
+        assert!(matches!(s.focused_mode, UpdateMode::Reactive { .. }));
+
+        let (_, label, bad) = parse_update_mode(Some(""));
+        assert_eq!(label, "reactive (default)");
+        assert!(bad.is_none());
+
+        let (s, label, bad) = parse_update_mode(Some("reactive"));
+        assert_eq!(label, "reactive");
+        assert!(bad.is_none());
+        assert!(matches!(s.focused_mode, UpdateMode::Reactive { .. }));
+
+        let (s, label, bad) = parse_update_mode(Some("CONTINUOUS"));
+        assert_eq!(label, "continuous");
+        assert!(bad.is_none());
+        assert!(matches!(s.focused_mode, UpdateMode::Continuous));
+        assert!(matches!(s.unfocused_mode, UpdateMode::Continuous));
+
+        let (s, label, bad) = parse_update_mode(Some("weird"));
+        assert_eq!(label, "reactive (default)");
+        assert_eq!(bad, Some("weird"));
+        assert!(matches!(s.focused_mode, UpdateMode::Reactive { .. }));
+    }
 }

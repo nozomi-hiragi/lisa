@@ -29,6 +29,8 @@ pub struct Settings {
     pub rest_cpu_percent: f32,
     /// ほかのアプリのディスクの読み書き（MB 毎秒）がこれを超えたら、裏の分を休む（0 なら休まない）。
     pub rest_disk_mb_per_sec: f32,
+    /// LAN の他の PC にこの端末の DB を公開する（1 なら公開する、0 なら公開しない）。
+    pub lan_share: f32,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             rest_on_battery: 1.0,
             rest_cpu_percent: 80.0,
             rest_disk_mb_per_sec: 100.0,
+            lan_share: 0.0,
         }
     }
 }
@@ -64,16 +67,18 @@ enum Item {
     RestOnBattery,
     RestCpu,
     RestDisk,
+    LanShare,
 }
 
 impl Item {
-    const ALL: [Item; 6] = [
+    const ALL: [Item; 7] = [
         Item::EarSelected,
         Item::EarPreview,
         Item::BackgroundSpeed,
         Item::RestOnBattery,
         Item::RestCpu,
         Item::RestDisk,
+        Item::LanShare,
     ];
 
     fn label(self) -> &'static str {
@@ -84,6 +89,7 @@ impl Item {
             Item::RestOnBattery => "電池のときは裏で読まない",
             Item::RestCpu => "CPU が混んだら裏で読まない",
             Item::RestDisk => "ディスクが混んだら裏で読まない",
+            Item::LanShare => "LAN に公開",
         }
     }
 
@@ -96,6 +102,7 @@ impl Item {
             Item::RestOnBattery => (0.0, 1.0, 1.0),
             Item::RestCpu => (20.0, 100.0, 10.0),
             Item::RestDisk => (0.0, 1000.0, 25.0),
+            Item::LanShare => (0.0, 1.0, 1.0),
         }
     }
 
@@ -107,6 +114,7 @@ impl Item {
             Item::RestOnBattery => settings.rest_on_battery,
             Item::RestCpu => settings.rest_cpu_percent,
             Item::RestDisk => settings.rest_disk_mb_per_sec,
+            Item::LanShare => settings.lan_share,
         }
     }
 
@@ -120,6 +128,7 @@ impl Item {
             Item::RestOnBattery => settings.rest_on_battery = value.round(),
             Item::RestCpu => settings.rest_cpu_percent = value,
             Item::RestDisk => settings.rest_disk_mb_per_sec = value,
+            Item::LanShare => settings.lan_share = value.round(),
         }
     }
 
@@ -135,6 +144,8 @@ impl Item {
             Item::RestCpu => format!("{} % 超", settings.rest_cpu_percent),
             Item::RestDisk if settings.rest_disk_mb_per_sec <= 0.0 => "休まない".into(),
             Item::RestDisk => format!("{} MB/秒超", settings.rest_disk_mb_per_sec),
+            Item::LanShare if settings.lan_share >= 0.5 => "公開する".into(),
+            Item::LanShare => "しない".into(),
         }
     }
 
@@ -161,11 +172,14 @@ impl Plugin for SettingsPlugin {
 }
 
 fn settings_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("LISA_DATA_DIR").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(dir).join("settings.json"));
+    }
     ProjectDirs::from("", "", "Lisa").map(|dirs| dirs.config_dir().join("settings.json"))
 }
 
 /// 保存した設定を読む。無いか読めなければ既定値。項目が足りなければその項目だけ既定値。
-fn load() -> Settings {
+pub fn load() -> Settings {
     let Some(path) = settings_path() else {
         return Settings::default();
     };
