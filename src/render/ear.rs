@@ -163,6 +163,38 @@ pub fn draw_ear(painter: &mut Painter, slot: Slot, size: Size, name: &str, color
     }
 }
 
+/// カタログの札（アプリの色と `label`）を、フォルダ `name` の耳のすぐ右に描く。
+pub fn draw_tag(
+    painter: &mut Painter,
+    slot: Slot,
+    size: Size,
+    name: &str,
+    label: &str,
+    color: Color,
+    z: f32,
+) {
+    let name_em = em_width(name).max(0.1);
+    draw_part(
+        painter,
+        slot,
+        size,
+        label,
+        color,
+        z,
+        Part::TagBack { name_em },
+    );
+    let text = over(color, Color::srgb(0.06, 0.06, 0.08), 0.92);
+    draw_part(
+        painter,
+        slot,
+        size,
+        label,
+        text,
+        z,
+        Part::TagText { name_em },
+    );
+}
+
 /// ファイルの名前を、プレビューの下に描く。大きさは、同じ一覧のフォルダの耳の名前と同じ。
 pub fn draw_name(painter: &mut Painter, slot: Slot, size: Size, name: &str, color: Color, z: f32) {
     draw_part(painter, slot, size, name, color, z, Part::Below);
@@ -197,12 +229,12 @@ fn draw_part(
         BaseAlpha(color.alpha()),
     );
     let mut entity = match part {
-        Part::Back => painter.commands.spawn((
+        Part::Back | Part::TagBack { .. } => painter.commands.spawn((
             common,
             Sprite::from_color(color, Vec2::ONE),
             Anchor::BOTTOM_LEFT,
         )),
-        Part::Text | Part::Below => painter.commands.spawn((
+        Part::Text | Part::Below | Part::TagText { .. } => painter.commands.spawn((
             common,
             Text2d::new(name),
             TextLayout::no_wrap(),
@@ -247,6 +279,10 @@ enum Part {
     Text,
     /// ファイルのプレビューの下に書く名前。
     Below,
+    /// カタログの札の四角（耳のすぐ右）。`name_em` は耳の名前の幅（耳の横幅を決めるため）。
+    TagBack { name_em: f32 },
+    /// 札に書く文字。
+    TagText { name_em: f32 },
 }
 
 /// 耳の高さが `h` のときの、部品の位置と大きさ、見せるかどうか。
@@ -266,12 +302,49 @@ fn part_transform(
             size / scale >= MIN_TEXT_PX,
         )
     };
+    // 耳は見えている本体の左上に乗り、横幅は名前に合わせる（本体の幅の 1/3 から本体の幅まで）。
+    let ear_width = |em: f32| {
+        (em * h * TEXT_RATIO + h * 0.9)
+            .max(shown.width() * MIN_WIDTH)
+            .min(shown.width())
+    };
     match part {
+        Part::TagBack { name_em } | Part::TagText { name_em } => {
+            // 札は耳のすぐ右に置く。入らなければ、本体の左上（耳のすぐ下）に掛ける。
+            let th = h * 0.7;
+            let want = em * th * TEXT_RATIO + th * 0.8;
+            let x_right = shown.min.x + ear_width(name_em) + h * 0.2;
+            let (bottom_left, w) = if shown.max.x - x_right >= want.min(th * 3.0) {
+                (
+                    Vec2::new(x_right, shown.max.y),
+                    want.min(shown.max.x - x_right),
+                )
+            } else {
+                (
+                    Vec2::new(shown.min.x, shown.max.y - th),
+                    want.min(shown.width()),
+                )
+            };
+            let fits = w >= th * 1.5;
+            match part {
+                Part::TagBack { .. } => (
+                    Transform::from_translation(bottom_left.extend(z)).with_scale(Vec3::new(
+                        w.max(0.0),
+                        th,
+                        1.0,
+                    )),
+                    fits && w / scale >= 1.0 && th / scale >= 1.0,
+                ),
+                _ => {
+                    let size = (th * TEXT_RATIO).min((w - th * 0.5) * 0.95 / em);
+                    let (transform, shown_text) =
+                        text(bottom_left + Vec2::new(th * 0.4, th / 2.0), size);
+                    (transform, fits && shown_text)
+                }
+            }
+        }
         Part::Back | Part::Text => {
-            // 耳は見えている本体の左上に乗り、横幅は名前に合わせる（本体の幅の 1/3 から本体の幅まで）。
-            let w = (em * h * TEXT_RATIO + h * 0.9)
-                .max(shown.width() * MIN_WIDTH)
-                .min(shown.width());
+            let w = ear_width(em);
             let top_left = Vec2::new(shown.min.x, shown.max.y);
             match part {
                 Part::Back => (

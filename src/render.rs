@@ -5,3 +5,4 @@ pub mod preview;
 pub mod scene;
 pub mod shapes;
 pub mod status;
+pub mod tag;

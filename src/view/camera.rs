@@ -38,9 +38,30 @@ pub(crate) fn side_px() -> f32 {
     f32::from_bits(SIDE_PX.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// 右の一覧ごとの幅（0: 重複、1: カタログ）。木を映す領域は、そのうち広い方だけ狭める。
+static PANEL_PX: [std::sync::atomic::AtomicU32; 2] = [
+    std::sync::atomic::AtomicU32::new(0),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
 /// 右に開いている一覧の幅を変える（`ui/dups.rs` が開け閉めの動きに合わせて呼ぶ）。
 pub(crate) fn set_side_px(px: f32) {
-    SIDE_PX.store(px.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    set_panel_px(0, px);
+}
+
+/// カタログの一覧の幅を変える（`ui/catalog.rs` が呼ぶ）。
+pub(crate) fn set_catalog_side_px(px: f32) {
+    set_panel_px(1, px);
+}
+
+fn set_panel_px(panel: usize, px: f32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PANEL_PX[panel].store(px.to_bits(), Relaxed);
+    let widest = PANEL_PX
+        .iter()
+        .map(|p| f32::from_bits(p.load(Relaxed)))
+        .fold(0.0, f32::max);
+    SIDE_PX.store(widest.to_bits(), Relaxed);
 }
 
 /// 木を映す領域の幅（ウィンドウから右の一覧を除いたもの）。

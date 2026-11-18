@@ -12,6 +12,7 @@ use crate::render::cache::FolderImages;
 use crate::render::ear::{self, EarSizes};
 use crate::render::shapes::{Painter, over};
 use crate::render::status;
+use crate::render::tag;
 
 pub const BACKGROUND: Color = Color::srgb(0.08, 0.08, 0.1);
 
@@ -31,6 +32,8 @@ pub struct SceneSource<'a> {
     pub ears: &'a EarSizes,
     /// 重複の一覧で選んだ組の印（本物の場面だけ）。
     pub highlight: Option<&'a crate::dups::DupHighlight>,
+    /// カタログの札と役割の印（本物の場面だけ）。
+    pub catalog: Option<&'a crate::catalog::CatalogMarks>,
 }
 
 /// フォルダ `folder` の場面を作る。`scale` はこの倍率で見たときにくっきり見えるように作る。
@@ -123,6 +126,9 @@ pub fn spawn(
             draw_children(painter, source, folder, true, None, focus);
         });
         ear::draw_ear(&mut painter, slot, size, &node.name, background, z + 0.5);
+        if let Some(marks) = source.catalog {
+            tag::draw_tag(&mut painter, marks, folder, slot, size, &node.name, z + 0.5);
+        }
     }
     root
 }
@@ -170,6 +176,7 @@ fn draw_children(
                 );
             });
             ear::draw_ear(painter, slot, size, &child_node.name, color, z);
+            mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
         } else {
             in_group(painter, slot, size, |painter| {
@@ -186,10 +193,40 @@ fn draw_children(
             // 名前はプレビューの下に、同じフォルダの中のフォルダの耳の名前と同じ大きさで書く。
             let color = over(background, Color::WHITE, 0.9);
             ear::draw_name(painter, slot, size, &child_node.name, color, z);
+            mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
         }
     }
     painter.no_cull = true;
+}
+
+/// カタログの印（札、役割で暗くする膜、選んだ枠）。本物の場面だけ。
+fn mark_catalog(
+    painter: &mut Painter,
+    source: &SceneSource,
+    id: NodeId,
+    slot: ear::Slot,
+    size: ear::Size,
+    z: f32,
+) {
+    let Some(marks) = source.catalog else {
+        return;
+    };
+    let frame = source.layouts[id].frame;
+    in_group(painter, slot, size, |painter| {
+        tag::draw_body_marks(painter, marks, id, frame, z);
+    });
+    if source.tree.nodes[id].is_dir {
+        tag::draw_tag(
+            painter,
+            marks,
+            id,
+            slot,
+            size,
+            &source.tree.nodes[id].name,
+            z,
+        );
+    }
 }
 
 /// 重複の印の色（暖かい黄色。読み込み中の青い光とは別の色）。
