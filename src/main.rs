@@ -192,20 +192,31 @@ fn describe_wgpu_backend(raw: Option<&str>, is_windows: bool) -> String {
     if let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) {
         format!("{s} (env)")
     } else if is_windows {
-        "dx12 (default)".into()
+        "gl (default)".into()
     } else {
         "auto (default)".into()
     }
 }
 
-/// 描き方の設定。Windows は、`WGPU_BACKEND` が無ければ（または空文字列なら）Vulkan ではなく DirectX 12 で描く。
+/// 描き方の設定。Windows は、`WGPU_BACKEND` が無ければ（または空文字列なら）OpenGL で描く。
 /// Intel Iris Graphics 550 の PC で、Vulkan だと GPU の情報を出した直後に、panic もなく
-/// プロセスごと落ちていたため（ドライバーの中で落ちていると見ている）。
+/// プロセスごと落ち（ドライバーの中で落ちていると見ている）、DirectX 12 だと画面がちらつき、
+/// しばらくすると GPU を見失って落ちた（`material uniform data 0` が invalid）ため。
 fn render_plugin() -> bevy::render::RenderPlugin {
     use bevy::render::settings::{Backends, RenderCreation, WgpuSettings};
     let mut settings = WgpuSettings::default();
-    if cfg!(windows) && should_default_to_dx12(std::env::var_os("WGPU_BACKEND").as_deref()) {
-        settings.backends = Some(Backends::DX12);
+    let env = std::env::var_os("WGPU_BACKEND");
+    let default_gl = cfg!(windows) && is_unset(env.as_deref());
+    if default_gl {
+        settings.backends = Some(Backends::GL);
+    }
+    if default_gl || is_gl_backend(env.as_deref()) {
+        // OpenGL では、Bevy が組み込む SSAO の compute shader（textureGatherOffset）が作れずに落ちる。
+        // Lisa は SSAO を使わないので、SSAO が「使えない GPU」と判断して組み込みを飛ばす値まで下げる。
+        settings.constrained_limits = Some(bevy::render::settings::WgpuLimits {
+            max_storage_textures_per_shader_stage: 4,
+            ..bevy::render::settings::WgpuLimits::unlimited()
+        });
     }
     bevy::render::RenderPlugin {
         render_creation: RenderCreation::Automatic(Box::new(settings)),
@@ -213,7 +224,18 @@ fn render_plugin() -> bevy::render::RenderPlugin {
     }
 }
 
-fn should_default_to_dx12(wgpu_backend: Option<&std::ffi::OsStr>) -> bool {
+fn is_gl_backend(wgpu_backend: Option<&std::ffi::OsStr>) -> bool {
+    wgpu_backend.and_then(|v| v.to_str()).is_some_and(|v| {
+        v.split(',').any(|b| {
+            matches!(
+                b.trim().to_ascii_lowercase().as_str(),
+                "gl" | "gles" | "opengl"
+            )
+        })
+    })
+}
+
+fn is_unset(wgpu_backend: Option<&std::ffi::OsStr>) -> bool {
     wgpu_backend.filter(|v| !v.is_empty()).is_none()
 }
 
@@ -222,15 +244,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dx12_default_handles_unset_and_empty_wgpu_backend() {
-        assert!(should_default_to_dx12(None));
-        assert!(should_default_to_dx12(Some(std::ffi::OsStr::new(""))));
-        assert!(!should_default_to_dx12(Some(std::ffi::OsStr::new(
-            "vulkan"
-        ))));
-        assert!(!should_default_to_dx12(Some(std::ffi::OsStr::new("dx12"))));
+    fn gl_default_handles_unset_and_empty_wgpu_backend() {
+        assert!(is_gl_backend(Some(std::ffi::OsStr::new("gl"))));
+        assert!(is_gl_backend(Some(std::ffi::OsStr::new("dx12,GL"))));
+        assert!(!is_gl_backend(Some(std::ffi::OsStr::new("dx12"))));
+        assert!(!is_gl_backend(None));
 
-        assert_eq!(describe_wgpu_backend(None, true), "dx12 (default)");
+        assert!(is_unset(None));
+        assert!(is_unset(Some(std::ffi::OsStr::new(""))));
+        assert!(!is_unset(Some(std::ffi::OsStr::new("vulkan"))));
+        assert!(!is_unset(Some(std::ffi::OsStr::new("dx12"))));
+
+        assert_eq!(describe_wgpu_backend(None, true), "gl (default)");
         assert_eq!(describe_wgpu_backend(Some(""), false), "auto (default)");
         assert_eq!(describe_wgpu_backend(Some("vulkan"), true), "vulkan (env)");
     }

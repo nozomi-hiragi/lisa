@@ -37,3 +37,6 @@ opt-level = 3
 [target.'cfg(windows)'.dependencies]
 # 落ちたときに小さな窓で知らせる（src/crash.rs）、管理者として動いているか見る（src/main.rs）。
 windows-sys = { version = "0.61.2", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# DX12 も Vulkan も不安定な古い Intel GPU 向けに、`WGPU_BACKEND=gl` で OpenGL も選べるようにする
+# （Bevy の既定では Windows に OpenGL が入らない）。版は Bevy が使う wgpu に合わせる。
+wgpu = { version = "30.0.2", default-features = false, features = ["gles"] }

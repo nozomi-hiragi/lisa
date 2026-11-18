@@ -7,7 +7,7 @@ Lisa は [Bevy](https://bevyengine.org/) 0.20 の上で動く 2D のアプリで
 
 ```
 src/
-  main.rs                  アプリの組み立て（プラグインの登録、ログの絞り込み、Windows の DX12 既定）
+  main.rs                  アプリの組み立て（プラグインの登録、ログの絞り込み、Windows の OpenGL 既定）
   crash.rs                 落ちたときの処理（crash.log への記録、Windows の知らせの窓）
   model.rs
   model/tree.rs            ファイルの木（読んだところだけ。この端末とドライブ、読めたら子を足す。ダミーの木）

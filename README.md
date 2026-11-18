@@ -221,7 +221,7 @@ cargo run -p lisa-scan -- remote-screenshot <名前か device_id> --count 8 --in
 - `start` の `--env KEY=VALUE` で渡せる環境変数は次の 4 つだけです（値は 64 文字まで、英数字と `_,=:.-` だけ）。選んだ値は起動時の `logs/lisa.log` の 1 行目（`backend=...`, `present_mode=...`, `update_mode=...`）に出ます。
   - `LISA_UPDATE_MODE`: `reactive`（既定、止まっている間は 1 秒に 1 回だけ描く）か `continuous`（いつも描く）
   - `LISA_PRESENT_MODE`: `auto_vsync`（既定）、`auto_no_vsync`、`fifo`、`fifo_relaxed`、`mailbox`、`immediate`
-  - `WGPU_BACKEND`: `dx12`（Windows の既定）、`vulkan`、`gl` など
+  - `WGPU_BACKEND`: `gl`（Windows の既定）、`dx12`、`vulkan` など
   - `RUST_LOG`: ログの絞り込み（例: `info,wgpu=warn`）
 
 #### まだペアリングしていない・設定を変える前に落ちるとき（手で `lisa-mcp.exe --listen` を動かす）
@@ -281,9 +281,10 @@ cargo run -p lisa-scan -- remote-screenshot <名前か device_id> --count 8 --in
   **あとでジーニースケール（カーソルの近くのタイルだけを大きく見せる、Dock の拡大のような
   見せ方）を入れる予定。** 詳しくは [docs/architecture.md](docs/architecture.md) の「今後」。
 - 本物のトラックパッドでの手ざわり（重さ、勢い、吸い付きの強さ）は、まだ調整中。
-- Windows では DirectX 12 で描く（`src/main.rs` の `render_plugin`）。Intel Iris Graphics 550 の PC で、
-  Vulkan だと起動の直後に panic もなく落ちたため。DirectX 12 の無い古い Windows や、ほかの描き方を
-  試したいときは、環境変数 `WGPU_BACKEND`（`vulkan`、`dx12`、`gl` など）で変えられる。
+- Windows では OpenGL で描く（`src/main.rs` の `render_plugin`）。Intel Iris Graphics 550 の PC で、
+  Vulkan だと起動の直後に panic もなく落ち、DirectX 12 だと画面がちらついたうえ、しばらくすると GPU を
+  見失って落ちたため。OpenGL では Bevy の SSAO が作れないので、使わない形で組み込む。ほかの描き方を
+  試したいときは、環境変数 `WGPU_BACKEND`（`dx12`、`vulkan`、`gl` など）で変えられる。
 
 ## ドキュメント
 

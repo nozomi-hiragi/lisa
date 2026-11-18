@@ -108,11 +108,13 @@ impl FolderImages {
 
 /// 焼ける入れ物（読み戻せるように COPY_SRC も付ける）。
 fn target_image() -> Image {
+    // 中身は sRGB のまま持つ（描くのも貼るのも sRGB として扱う）。Unorm の画像に sRGB の見方を
+    // 足す形（view_formats）は、OpenGL（WGPU_BACKEND=gl）では作れずに落ちるので使わない。
     let mut image = Image::new_target_texture(
         IMAGE_WIDTH,
         image_height(),
-        TextureFormat::Rgba8Unorm,
-        Some(TextureFormat::Rgba8UnormSrgb),
+        TextureFormat::Rgba8UnormSrgb,
+        None,
     );
     image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
     image
@@ -132,7 +134,6 @@ fn loaded_image(rgba: Vec<u8>) -> Image {
         RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_view_descriptor = None;
-    image.texture_descriptor.view_formats = &[TextureFormat::Rgba8UnormSrgb];
     image
 }
 
