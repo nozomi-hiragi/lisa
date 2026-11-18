@@ -19,9 +19,12 @@ src/
   render/preview.rs        ファイルの仮のプレビュー（拡張子ごとの絵）
   render/cache.rs          フォルダの中身を画像に焼くキャッシュ（render to texture）
   render/status.rs         読み込みの状態ごとのタイルの見た目（枠だけ、脈打つ光、暗い膜、×）
+  render/tag.rs            カタログの札、役割で暗くする膜、パネルで選んだ当たりの枠（本物の場面だけ）
   scan.rs                  本物のフォルダを裏のスレッドで読んで木に足す（DB からの出し入れと監視）
   scan/worker.rs           裏のスレッドでフォルダの読み取りとハッシュを進める係
   dups.rs                  重複の一覧を裏で作り、選んだ組のコピーを木の上で光らせる
+  catalog.rs               カタログを裏で DB に当て、札と役割の印を決める、仕分けを書く、重複の一覧を並べ直す
+  catalog/lan.rs           LAN の相手のカタログの当たりを読み、相手の木に印を付ける、相手の型を取り込む
   view.rs                  開いている場所（Nav）、場面の切り替え、クリック、飛ぶ、並べ直し
   view/camera.rs           枠に合わせる位置と倍率、ズームのアニメーション、描画頻度
   view/fade.rs             場面のフェード
@@ -36,6 +39,7 @@ src/
   ui/menu.rs               メニューバーと設定のポップアップ（Bevy UI）
   ui/progress.rs           読み込み中・ハッシュ中のリスト（画面左下）
   ui/dups.rs               重複の一覧のパネル（画面右側）
+  ui/catalog.rs            カタログのパネル（画面右側。当たり、今のフォルダの仕分け、大きな未分類、LAN の相手）
   settings.rs              設定（settings.json への保存と、ポップアップの項目）
   debug.rs                 デバッグビルドで FPS をタイトルに出す
   remote.rs                外（lisa-mcp）からの頼みを受けて画面を動かす（飛ぶ、重複の一覧、読み直し、一時停止）
@@ -51,13 +55,19 @@ crates/lisa-core/          スキャンの中身（Bevy に依存しない）
   src/cloud.rs             Mac: クラウドにだけあるファイルを読んでもダウンロードしない設定
   src/volumes.rs           つながっているドライブの一覧（ID、名前、ファイルシステム、容量、外付けか）
   src/query.rs             DB を外から読む問い合わせ（パスから道のり、名前で探す、同じハッシュ）
+  src/catalog.rs           カタログの型の読み込み（TOML、組み込みは build.rs で埋め込む）、札の文字と色、設定
+  src/catalog/pattern.rs   パスのパターン（glob、**、段ごとの re:、NFC、大文字小文字）
+  src/catalog/content.rs   中身の条件（content、content_bytes、hash、size、head）
+  src/catalog/eval.rs      木（Tree）と中身の読み方（Reader）に対する当てはめと役割
+  src/catalog/db.rs        DB の木への当てはめ、catalog_match、content_check、assignment、大きな未分類
   src/remote.rs            起動中のアプリを外から動かす口（127.0.0.1 と control.json、1 行の JSON）
 crates/lisa-scan/          lisa-core を Bevy なしで試す CLI
-  src/main.rs              ls、tree、drives、dups、snapshots、remote-logs、remote-update、remote-app
+  src/main.rs              ls、tree、drives、dups、snapshots、catalog、remote-logs、remote-update、remote-app
   src/share.rs             LAN の他の PC へファイルを HTTP で渡す簡易サーバー
 crates/lisa-mcp/           MCP のサーバー（標準入出力と Streamable HTTP。DB を読む道具と、アプリを動かす・更新する道具）
   src/main.rs              起動オプション（--listen、--token、--parent、--linger）と待ち受け
   src/lib.rs               MCP の道具一式、認証、ペアリング、sidecar 管理、バイナリ更新
+  src/catalog.rs           カタログの道具（一覧、当たり、未分類、形の要約、試す、保存、仕分け）
 docs/                      このドキュメント
 assets/fonts/              Noto Sans JP と、そのライセンス
 ```

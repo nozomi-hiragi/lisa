@@ -138,6 +138,11 @@ Lisa が SQLite に残すものと、残さないものをまとめます。
 | `taken_at` | 撮った日時 |
 | `device_id` | どの端末につないで撮ったか |
 
+## catalog_match・content_check・assignment（カタログ）
+
+カタログの当たり、中身の条件の結果、1 か所の仕分けです。列は [catalog.md](catalog.md) の
+「保存するデータ（DB）」にあります。
+
 ## 残さないもの
 
 権限、所有者、作成日時、拡張属性、Finder のタグ、ACL。今の使い方（重複を見つけて整理する）には
