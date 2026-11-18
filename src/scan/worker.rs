@@ -518,6 +518,7 @@ impl Worker {
     /// できたフォルダの中も読み、あとで裏でハッシュし直す。UI が閉じたら false。
     fn reread(&mut self, path: &Path, background: bool) -> bool {
         lisa_core::pace::set_thread_background(background);
+        bevy::log::debug!("読み直し: {}", path.display());
         let Some(index) = self.root_of(path) else {
             return true;
         };

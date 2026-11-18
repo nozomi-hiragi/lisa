@@ -291,6 +291,7 @@ fn watch(
     if let Some(dir) = data_dir() {
         own.push(dir);
     }
+    let noisy = noisy_dirs();
     let handler = move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else {
             return;
@@ -302,7 +303,7 @@ fn watch(
             let Some(folder) = path.parent() else {
                 continue;
             };
-            if own.iter().any(|o| path.starts_with(o)) {
+            if own.iter().any(|o| path.starts_with(o)) || is_under_any(&path, &noisy) {
                 continue;
             }
             let _ = requests.send(worker::Request::Hint(folder.to_path_buf()));
@@ -321,6 +322,42 @@ fn watch(
         }
     }
     Some(watcher)
+}
+
+/// OS やアプリがいつも書き換えていて、変わるたびに読み直すと重いだけのフォルダ（Windows のみ）。
+/// ここの変化は知らせにしない（開いたときの読み直しでは読む）。比べるときは大文字・小文字を区別しない。
+fn noisy_dirs() -> Vec<String> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let env = |key: &str| std::env::var_os(key).map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    dirs.extend(env("SystemRoot"));
+    dirs.extend(env("ProgramData"));
+    dirs.extend(env("USERPROFILE").map(|home| home.join("AppData")));
+    if let Some(drive) = env("SystemDrive") {
+        let root = PathBuf::from(format!("{}\\", drive.display()));
+        dirs.push(root.join("$Recycle.Bin"));
+        dirs.push(root.join("System Volume Information"));
+    }
+    dirs.iter().map(|d| fold_path(d)).collect()
+}
+
+/// 大文字・小文字と区切りの違いをならした、比べるための文字列（末尾に区切りを付ける）。
+fn fold_path(path: &std::path::Path) -> String {
+    let mut s = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    if !s.ends_with('\\') {
+        s.push('\\');
+    }
+    s
+}
+
+fn is_under_any(path: &std::path::Path, dirs: &[String]) -> bool {
+    if dirs.is_empty() {
+        return false;
+    }
+    let folded = fold_path(path);
+    dirs.iter().any(|d| folded.starts_with(d.as_str()))
 }
 
 impl ScanControl {
@@ -745,4 +782,35 @@ fn drive_of(tree: &FileTree, store: &Store, id: NodeId) -> Option<(String, PathB
         cur = tree.nodes[i].parent;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noisy_dirs_match_ignoring_case_and_separators() {
+        let dirs = vec![
+            fold_path(std::path::Path::new("C:\\Windows")),
+            fold_path(std::path::Path::new("C:/Users/nozomi/AppData")),
+        ];
+        assert!(is_under_any(
+            std::path::Path::new("c:\\windows\\Prefetch"),
+            &dirs
+        ));
+        assert!(is_under_any(std::path::Path::new("C:\\WINDOWS"), &dirs));
+        assert!(is_under_any(
+            std::path::Path::new("C:\\Users\\nozomi\\AppData\\Local\\x"),
+            &dirs
+        ));
+        assert!(!is_under_any(
+            std::path::Path::new("C:\\WindowsApps2"),
+            &dirs
+        ));
+        assert!(!is_under_any(
+            std::path::Path::new("C:\\Users\\nozomi\\Documents"),
+            &dirs
+        ));
+        assert!(!is_under_any(std::path::Path::new("C:\\Windows"), &[]));
+    }
 }
