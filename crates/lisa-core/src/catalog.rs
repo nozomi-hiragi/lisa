@@ -448,6 +448,37 @@ impl CatalogSet {
     }
 }
 
+/// 重複の一覧を、カタログに合わせて並べ直す（`docs/catalog.md` の「重複の一覧との関係」）。
+/// - どのコピーも `hidden`（重複の一覧に出さない型に当たったフォルダ）の中にある組は除く。
+/// - どのコピーも `regen`（`cache` か `install` の役割のフォルダ）の中にある組は、後ろに回す（順は保つ）。
+///
+/// 中にあるかは、コピーの `chain`（ドライブの一番上からの `entry.id`）で見る。変わったら true。
+pub fn order_duplicates(
+    groups: &mut Vec<crate::dups::Group>,
+    regen: &std::collections::HashSet<i64>,
+    hidden: &std::collections::HashSet<i64>,
+) -> bool {
+    let inside = |group: &crate::dups::Group, set: &std::collections::HashSet<i64>| {
+        !set.is_empty()
+            && !group.copies.is_empty()
+            && group
+                .copies
+                .iter()
+                .all(|c| c.chain.iter().any(|e| set.contains(e)))
+    };
+    let before = groups.len();
+    groups.retain(|g| !inside(g, hidden));
+    let keys: Vec<bool> = groups.iter().map(|g| inside(g, regen)).collect();
+    let sorted = keys.windows(2).all(|w| w[0] <= w[1]);
+    if !sorted {
+        let mut pairs: Vec<(bool, crate::dups::Group)> =
+            keys.into_iter().zip(groups.drain(..)).collect();
+        pairs.sort_by_key(|(k, _)| *k);
+        groups.extend(pairs.into_iter().map(|(_, g)| g));
+    }
+    before != groups.len() || !sorted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,5 +1105,40 @@ role = "data"
         assert!(set.errors[0].0.ends_with("broken.toml"));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn duplicates_in_cache_go_last_and_hidden_are_removed() {
+        use crate::dups::{Copy, Group};
+        use std::collections::HashSet;
+        let group = |name: &str, chains: &[&[i64]]| Group {
+            kind: crate::listing::Kind::File,
+            name: name.into(),
+            size: 1,
+            hash: [0; 32],
+            copies: chains
+                .iter()
+                .map(|c| Copy {
+                    drive_id: "d".into(),
+                    path: PathBuf::from(name),
+                    chain: c.to_vec(),
+                    hard_links: Vec::new(),
+                })
+                .collect(),
+        };
+        // 10 が cache の中、20 が出さない型の中。
+        let regen: HashSet<i64> = [10].into_iter().collect();
+        let hidden: HashSet<i64> = [20].into_iter().collect();
+        let mut groups = vec![
+            group("cache", &[&[1, 10, 11], &[1, 10, 12]]),
+            group("mixed", &[&[1, 10, 13], &[1, 2, 14]]),
+            group("hidden", &[&[1, 20, 21], &[1, 20, 22]]),
+            group("plain", &[&[1, 3, 15], &[1, 4, 16]]),
+        ];
+        assert!(order_duplicates(&mut groups, &regen, &hidden));
+        let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["mixed", "plain", "cache"]);
+        // もう並んでいれば変えない。
+        assert!(!order_duplicates(&mut groups, &regen, &hidden));
     }
 }
