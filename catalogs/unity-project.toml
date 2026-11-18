@@ -1,0 +1,45 @@
+# Unity プロジェクト
+# Assets/ フォルダと ProjectVersion.txt の存在で見分け、Unity のバージョン番号をラベルに取得する。
+id    = "unity-project"
+name  = "Unity プロジェクト"
+app   = "Unity"
+color = "#80b5ff"
+label = "Unity {ver}"
+
+[[match]]
+path = "Assets/"
+
+[[match]]
+path = "ProjectSettings/ProjectVersion.txt"
+content = 're:m_EditorVersion: (?<ver>\S+)'
+
+[[exclude]]
+path = "package.json"
+
+[[part]]
+path = "Assets/"
+role = "data"
+
+[[part]]
+path = "Packages/"
+role = "data"
+
+[[part]]
+path = "ProjectSettings/"
+role = "config"
+
+[[part]]
+path = "Library/"
+role = "cache"
+
+[[part]]
+path = "Temp/"
+role = "cache"
+
+[[part]]
+path = "Logs/"
+role = "log"
+
+[[part]]
+path = "obj/"
+role = "cache"

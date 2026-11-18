@@ -1,0 +1,20 @@
+# Xcode DerivedData ルート
+# ModuleCache.noindex/ フォルダおよびプロジェクトごとのハッシュ付きフォルダ (*-*/info.plist) の存在で見分ける。
+id    = "xcode-derived-data"
+name  = "Xcode DerivedData"
+app   = "Xcode"
+color = "#5ac8fa"
+
+[[match]]
+path = "ModuleCache.noindex/"
+
+[[match]]
+path = "*-*/info.plist"
+
+[[part]]
+path = "ModuleCache.noindex/"
+role = "cache"
+
+[[part]]
+path = "*-*/"
+role = "cache"

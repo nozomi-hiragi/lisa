@@ -1,0 +1,28 @@
+# Git リポジトリ
+# .git/ フォルダと .git/HEAD ファイルの存在で見分ける。.git/ は未プッシュのコミットや作業履歴など消すと戻らない情報を含むため data とする。
+id    = "git-repository"
+name  = "Git リポジトリ"
+app   = "Git"
+color = "#f15b40"
+
+[[match]]
+path = ".git/"
+
+[[match]]
+path = ".git/HEAD"
+
+[[part]]
+path = ".git/"
+role = "data"
+
+[[part]]
+path = ".git/config"
+role = "config"
+
+[[part]]
+path = ".git/logs/"
+role = "log"
+
+[[part]]
+path = ".gitignore"
+role = "config"

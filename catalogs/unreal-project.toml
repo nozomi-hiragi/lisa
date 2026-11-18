@@ -1,0 +1,40 @@
+# Unreal Engine プロジェクト
+# *.uproject ファイルと Content/ フォルダの存在で見分ける。
+id    = "unreal-project"
+name  = "Unreal Engine プロジェクト"
+app   = "Unreal Engine"
+color = "#9c88ff"
+
+[[match]]
+path = "*.uproject"
+
+[[match]]
+path = "Content/"
+
+[[part]]
+path = "Content/"
+role = "data"
+
+[[part]]
+path = "Config/"
+role = "config"
+
+[[part]]
+path = "Source/"
+role = "data"
+
+[[part]]
+path = "Intermediate/"
+role = "cache"
+
+[[part]]
+path = "Saved/"
+role = "cache"
+
+[[part]]
+path = "DerivedDataCache/"
+role = "cache"
+
+[[part]]
+path = "Binaries/"
+role = "cache"

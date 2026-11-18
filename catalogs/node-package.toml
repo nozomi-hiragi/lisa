@@ -1,0 +1,34 @@
+# Node.js パッケージ
+# package.json と node_modules/ フォルダの存在で見分け、package.json の "name" をラベルに取得する。
+id    = "node-package"
+name  = "Node.js パッケージ"
+app   = "Node.js"
+color = "#7cb342"
+label = "{name}"
+
+[[match]]
+path = "package.json"
+content = 're:"name"\s*:\s*"(?<name>[^"]+)"'
+
+[[match]]
+path = "node_modules/"
+
+[[part]]
+path = "node_modules/"
+role = "cache"
+
+[[part]]
+path = "package.json"
+role = "config"
+
+[[part]]
+path = "package-lock.json"
+role = "config"
+
+[[part]]
+path = "pnpm-lock.yaml"
+role = "config"
+
+[[part]]
+path = "yarn.lock"
+role = "config"

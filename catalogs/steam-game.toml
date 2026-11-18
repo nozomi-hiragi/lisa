@@ -1,0 +1,13 @@
+# Steam ゲーム
+# steamapps/common/ 下の各ゲームフォルダ。Steamworks ランタイムや Steam 設定ファイルの存在で見分ける。
+id    = "steam-game"
+name  = "Steam ゲーム"
+app   = "Steam"
+color = "#66c0f4"
+
+[[match]]
+path = "{steam_autocloud.vdf,installscript.vdf,steam_api.dll,steam_api64.dll,libsteam_api.so,libsteam_api.dylib}"
+
+[[part]]
+path = "*/"
+role = "install"
