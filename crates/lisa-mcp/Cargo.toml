@@ -2,9 +2,22 @@
 name = "lisa-mcp"
 version = "0.1.0"
 edition = "2024"
-description = "Lisa を MCP（Model Context Protocol）で使うためのサーバー（stdio）"
+description = "Lisa を MCP（Model Context Protocol）で使うためのサーバー（stdio / HTTP）"
 
 [dependencies]
 directories = "6.0.0"
 lisa-core = { path = "../lisa-core" }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tiny_http = "0.12"
+ureq = { version = "3", default-features = false }
+uuid = { version = "1.29.2", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

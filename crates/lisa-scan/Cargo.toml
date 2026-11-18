@@ -7,3 +7,5 @@ description = "lisa-core を Bevy なしで試す CLI"
 [dependencies]
 directories = "6.0.0"
 lisa-core = { path = "../lisa-core" }
+serde_json = "1.0.154"
+ureq = { version = "3", default-features = false }

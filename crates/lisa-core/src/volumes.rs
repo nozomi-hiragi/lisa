@@ -62,6 +62,15 @@ pub fn device_name() -> String {
     "この端末".to_string()
 }
 
+/// LAN で使っているこの PC のアドレス。外へ向かう UDP の口を作るだけで、何も送らない。
+pub fn lan_address() -> Option<std::net::IpAddr> {
+    use std::net::{Ipv4Addr, UdpSocket};
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified()).then_some(ip)
+}
+
 /// つながっているボリュームの一覧。
 pub fn list() -> io::Result<Vec<Volume>> {
     imp::list()
@@ -213,9 +222,12 @@ mod imp {
 mod imp {
     use super::*;
 
+    use std::collections::HashSet;
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::ptr;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -230,6 +242,15 @@ mod imp {
     const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
     const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
 
+    /// ネットワークドライブを調べるのを待つ長さ。つながっていないドライブは、ここで諦める。
+    const REMOTE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// 今まだ `GetVolumeInformationW` の返事を待っているネットワークドライブ（0 で終わる UTF-16）。
+    /// つながっていないドライブの問い合わせスレッドがまだ残っている間は、同じドライブの新しいスレッドを
+    /// 重ねて作らないようにする。
+    static REMOTE_IN_FLIGHT: LazyLock<Mutex<HashSet<Vec<u16>>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+
     pub fn list() -> io::Result<Vec<Volume>> {
         let mut buffer = vec![0u16; 1024];
         // SAFETY: 長さを渡したバッファに書いてもらう。
@@ -237,25 +258,78 @@ mod imp {
         if len == 0 {
             return Err(io::Error::last_os_error());
         }
-        let mut volumes = Vec::new();
-        for root in buffer[..len as usize]
+        let roots: Vec<Vec<u16>> = buffer[..len as usize]
             .split(|&c| c == 0)
             .filter(|s| !s.is_empty())
-        {
-            let mut root_z = root.to_vec();
-            root_z.push(0);
-            if let Some(volume) = volume(&root_z) {
-                volumes.push(volume);
+            .map(|root| {
+                let mut root_z = root.to_vec();
+                root_z.push(0);
+                root_z
+            })
+            .collect();
+
+        // ネットワークドライブが何本あっても合計の待ち時間が `REMOTE_TIMEOUT` で済むよう、先に並べて投げる。
+        let mut slots: Vec<Option<Volume>> = vec![None; roots.len()];
+        let mut pending_remote: Vec<(usize, std::sync::mpsc::Receiver<Option<Volume>>)> =
+            Vec::new();
+        for (idx, root_z) in roots.into_iter().enumerate() {
+            // SAFETY: 0 で終わる文字列を渡す。GetDriveTypeW はディスクを読まないので待たない。
+            let drive_type = unsafe { GetDriveTypeW(root_z.as_ptr()) };
+            if drive_type != DRIVE_REMOTE {
+                slots[idx] = query(&root_z, drive_type);
+            } else if let Some(rx) = spawn_remote_query(root_z, drive_type) {
+                pending_remote.push((idx, rx));
             }
         }
-        Ok(volumes)
+        if !pending_remote.is_empty() {
+            let deadline = Instant::now() + REMOTE_TIMEOUT;
+            for (idx, rx) in pending_remote {
+                let remain = deadline.saturating_duration_since(Instant::now());
+                if let Ok(Some(vol)) = rx.recv_timeout(remain) {
+                    slots[idx] = Some(vol);
+                }
+            }
+        }
+        Ok(slots.into_iter().flatten().collect())
     }
 
-    /// `root` は「C:\」のような、0 で終わる UTF-16。
-    fn volume(root: &[u16]) -> Option<Volume> {
+    /// ネットワークドライブは、つながっていないと `GetVolumeInformationW` が長く返らない
+    /// （管理者で動かすと割り当てたドライブが見えないので、普通に起動したときだけ止まっていた）。
+    /// 別のスレッドで聞き、待ちきれなければ飛ばす。同じドライブの問い合わせがまだ残っていればもう出さない。
+    fn spawn_remote_query(
+        root: Vec<u16>,
+        drive_type: u32,
+    ) -> Option<std::sync::mpsc::Receiver<Option<Volume>>> {
+        {
+            let mut in_flight = REMOTE_IN_FLIGHT.lock().ok()?;
+            if !in_flight.insert(root.clone()) {
+                return None;
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        if std::thread::Builder::new()
+            .name("lisa-volume".into())
+            .spawn(move || {
+                struct InFlightGuard(Vec<u16>);
+                impl Drop for InFlightGuard {
+                    fn drop(&mut self) {
+                        if let Ok(mut set) = REMOTE_IN_FLIGHT.lock() {
+                            set.remove(&self.0);
+                        }
+                    }
+                }
+                let guard = InFlightGuard(root);
+                let _ = tx.send(query(&guard.0, drive_type));
+            })
+            .is_err()
+        {
+            return None;
+        }
+        Some(rx)
+    }
+
+    fn query(root: &[u16], drive_type: u32) -> Option<Volume> {
         let mount_path = PathBuf::from(OsString::from_wide(&root[..root.len() - 1]));
-        // SAFETY: 0 で終わる文字列を渡す。
-        let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
         let mut name = [0u16; 261];
         let mut fs = [0u16; 261];
         let mut serial = 0u32;

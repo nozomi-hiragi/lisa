@@ -145,8 +145,7 @@ pub struct ImageCache {
 
 impl ImageCache {
     pub fn new() -> Self {
-        let dir = directories::ProjectDirs::from("", "", "Lisa")
-            .map(|dirs| dirs.cache_dir().join("folder-images"));
+        let dir = crate::scan::cache_dir().map(|dir| dir.join("folder-images"));
         if let Some(dir) = &dir {
             let _ = std::fs::create_dir_all(dir);
             // 使われなくなった画像を、裏で消す。

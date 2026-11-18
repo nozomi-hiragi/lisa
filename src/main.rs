@@ -1,10 +1,12 @@
 // Windows のリリースビルドでは、起動したときに黒いコンソールの窓を出さない。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod crash;
 #[cfg(debug_assertions)]
 mod debug;
 mod dups;
 mod input;
+mod lan;
 mod layout;
 mod model;
 mod remote;
@@ -14,16 +16,28 @@ mod settings;
 mod ui;
 mod view;
 
-use bevy::log::{DEFAULT_FILTER, LogPlugin};
+use bevy::log::{BoxedLayer, DEFAULT_FILTER, LogPlugin, tracing_subscriber};
 use bevy::prelude::*;
+use bevy::window::PresentMode;
 
 fn main() {
+    crash::install();
+    if settings::load().lan_share >= 0.5 {
+        lan::ensure_sidecar();
+    }
+    let (present_mode, present_label, bad_present) =
+        parse_present_mode(std::env::var("LISA_PRESENT_MODE").ok().as_deref());
+    let (_, update_label, _) =
+        view::parse_update_mode(std::env::var("LISA_UPDATE_MODE").ok().as_deref());
+    let backend_label =
+        describe_wgpu_backend(std::env::var("WGPU_BACKEND").ok().as_deref(), cfg!(windows));
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "Lisa — Root".into(),
+                    present_mode,
                     ..default()
                 }),
                 ..default()
@@ -34,12 +48,20 @@ fn main() {
                 // なったら、Bevy の `complex_script_segmentation` 機能でデータを入れ、この絞り込みと
                 // Cargo.toml の icu_provider の logging 機能を外す（README の「既知の課題」を参照）。
                 filter: format!("{DEFAULT_FILTER},icu_provider=off"),
+                custom_layer: file_log_layer,
                 ..default()
-            }),
-    )
-    .add_plugins((
+            })
+            // 音とゲームパッドは使わない。どちらも作るときに OS の機器を開くので、Windows で
+            // 起動の途中で止まることがあった（GPU の情報のあとで止まり、Lisa の処理まで来なかった）。
+            .set(render_plugin())
+            .disable::<bevy::audio::AudioPlugin>()
+            .disable::<bevy::gilrs::GilrsPlugin>(),
+    );
+    info!("Bevy の準備ができました");
+    app.add_plugins((
         settings::SettingsPlugin,
         scan::ScanPlugin,
+        lan::LanPlugin,
         view::TreeViewPlugin,
         ui::menu::MenuPlugin,
         ui::progress::ProgressPlugin,
@@ -49,5 +71,236 @@ fn main() {
     ));
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);
+    if let Some(bad) = bad_present {
+        warn!("知らない LISA_PRESENT_MODE={bad:?}（auto_vsync を使います）");
+    }
+    log_startup(&backend_label, present_label, update_label);
     app.run();
+}
+
+/// 実際に開いたログファイルの場所（起動時の 1 行に出すため）。
+static LOG_FILE_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// ログを `<data_dir>/logs/lisa.log` にも出す。起動ごとに前の `lisa.log` を `lisa.1.log` に回し、
+/// 2 世代だけ残す。別の Lisa が `lisa.log` を開いていて回せない・開けないときは、`lisa-<pid>.log` に書く。
+/// 書けなければ黙って続ける。
+fn file_log_layer(_app: &mut App) -> Option<BoxedLayer> {
+    let logs_dir = scan::data_dir()?.join("logs");
+    let (file, path) = open_log_file_in(&logs_dir, std::process::id())?;
+    if let Ok(mut slot) = LOG_FILE_PATH.lock() {
+        *slot = Some(path);
+    }
+    Some(Box::new(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file)),
+    ))
+}
+
+fn open_log_file_in(
+    logs_dir: &std::path::Path,
+    pid: u32,
+) -> Option<(std::fs::File, std::path::PathBuf)> {
+    std::fs::create_dir_all(logs_dir).ok()?;
+    let current = logs_dir.join("lisa.log");
+    let prev = logs_dir.join("lisa.1.log");
+    let rotated = if current.exists() {
+        let _ = std::fs::remove_file(&prev);
+        std::fs::rename(&current, &prev).is_ok()
+    } else {
+        true
+    };
+    if rotated
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&current)
+    {
+        return Some((file, current));
+    }
+    let fallback = logs_dir.join(format!("lisa-{pid}.log"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&fallback)
+        .ok()?;
+    Some((file, fallback))
+}
+
+/// 起動したらすぐ、版、OS、exe の場所、data_dir、ログファイル、選んだ描き方（backend、present_mode、update_mode、
+/// Windows なら管理者かどうかも）を 1 行出し、起動前に試した `ensure_sidecar` の結果も残す。
+fn log_startup(backend: &str, present_mode: &str, update_mode: &str) {
+    let version = env!("CARGO_PKG_VERSION");
+    let os = std::env::consts::OS;
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    let data = scan::data_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "?".into());
+    let log = LOG_FILE_PATH
+        .lock()
+        .ok()
+        .and_then(|s| s.clone())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "?".into());
+    #[cfg(windows)]
+    {
+        let admin = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 };
+        info!(
+            "Lisa {version} 起動: os={os}, exe={exe}, data_dir={data}, log={log}, admin={admin}, backend={backend}, present_mode={present_mode}, update_mode={update_mode}"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        info!(
+            "Lisa {version} 起動: os={os}, exe={exe}, data_dir={data}, log={log}, backend={backend}, present_mode={present_mode}, update_mode={update_mode}"
+        );
+    }
+    if let Some(sidecar) = lan::take_startup_sidecar_log() {
+        match sidecar {
+            Ok(msg) => info!("{msg}"),
+            Err(err) => warn!("{err}"),
+        }
+    }
+}
+
+/// 環境変数 `LISA_PRESENT_MODE` から `PresentMode` と起動ログ用の名前を決める。
+fn parse_present_mode(raw: Option<&str>) -> (PresentMode, &'static str, Option<String>) {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (PresentMode::AutoVsync, "auto_vsync (default)", None);
+    };
+    match s.to_ascii_lowercase().as_str() {
+        "auto_vsync" => (PresentMode::AutoVsync, "auto_vsync", None),
+        "auto_no_vsync" => (PresentMode::AutoNoVsync, "auto_no_vsync", None),
+        "fifo" => (PresentMode::Fifo, "fifo", None),
+        "fifo_relaxed" => (PresentMode::FifoRelaxed, "fifo_relaxed", None),
+        "mailbox" => (PresentMode::Mailbox, "mailbox", None),
+        "immediate" => (PresentMode::Immediate, "immediate", None),
+        _ => (
+            PresentMode::AutoVsync,
+            "auto_vsync (default)",
+            Some(s.to_string()),
+        ),
+    }
+}
+
+/// 起動ログに出す backend の表示（環境変数 `WGPU_BACKEND` の値か、既定のどちらか）。
+fn describe_wgpu_backend(raw: Option<&str>, is_windows: bool) -> String {
+    if let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) {
+        format!("{s} (env)")
+    } else if is_windows {
+        "dx12 (default)".into()
+    } else {
+        "auto (default)".into()
+    }
+}
+
+/// 描き方の設定。Windows は、`WGPU_BACKEND` が無ければ（または空文字列なら）Vulkan ではなく DirectX 12 で描く。
+/// Intel Iris Graphics 550 の PC で、Vulkan だと GPU の情報を出した直後に、panic もなく
+/// プロセスごと落ちていたため（ドライバーの中で落ちていると見ている）。
+fn render_plugin() -> bevy::render::RenderPlugin {
+    use bevy::render::settings::{Backends, RenderCreation, WgpuSettings};
+    let mut settings = WgpuSettings::default();
+    if cfg!(windows) && should_default_to_dx12(std::env::var_os("WGPU_BACKEND").as_deref()) {
+        settings.backends = Some(Backends::DX12);
+    }
+    bevy::render::RenderPlugin {
+        render_creation: RenderCreation::Automatic(Box::new(settings)),
+        ..default()
+    }
+}
+
+fn should_default_to_dx12(wgpu_backend: Option<&std::ffi::OsStr>) -> bool {
+    wgpu_backend.filter(|v| !v.is_empty()).is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dx12_default_handles_unset_and_empty_wgpu_backend() {
+        assert!(should_default_to_dx12(None));
+        assert!(should_default_to_dx12(Some(std::ffi::OsStr::new(""))));
+        assert!(!should_default_to_dx12(Some(std::ffi::OsStr::new(
+            "vulkan"
+        ))));
+        assert!(!should_default_to_dx12(Some(std::ffi::OsStr::new("dx12"))));
+
+        assert_eq!(describe_wgpu_backend(None, true), "dx12 (default)");
+        assert_eq!(describe_wgpu_backend(Some(""), false), "auto (default)");
+        assert_eq!(describe_wgpu_backend(Some("vulkan"), true), "vulkan (env)");
+    }
+
+    #[test]
+    fn parse_present_mode_values() {
+        assert_eq!(
+            parse_present_mode(None),
+            (PresentMode::AutoVsync, "auto_vsync (default)", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("")),
+            (PresentMode::AutoVsync, "auto_vsync (default)", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("auto_vsync")),
+            (PresentMode::AutoVsync, "auto_vsync", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("auto_no_vsync")),
+            (PresentMode::AutoNoVsync, "auto_no_vsync", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("fifo")),
+            (PresentMode::Fifo, "fifo", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("fifo_relaxed")),
+            (PresentMode::FifoRelaxed, "fifo_relaxed", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("MAILBOX")),
+            (PresentMode::Mailbox, "mailbox", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("immediate")),
+            (PresentMode::Immediate, "immediate", None)
+        );
+        assert_eq!(
+            parse_present_mode(Some("unknown_mode")),
+            (
+                PresentMode::AutoVsync,
+                "auto_vsync (default)",
+                Some("unknown_mode".into())
+            )
+        );
+    }
+
+    #[test]
+    fn open_log_file_rotates_and_falls_back_when_locked() {
+        let dir = std::env::temp_dir().join(format!("lisa-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (mut f1, p1) = open_log_file_in(&dir, 1111).unwrap();
+        assert_eq!(p1, dir.join("lisa.log"));
+        use std::io::Write;
+        writeln!(f1, "first").unwrap();
+        drop(f1);
+
+        let (_f2, p2) = open_log_file_in(&dir, 2222).unwrap();
+        assert_eq!(p2, dir.join("lisa.log"));
+        assert!(dir.join("lisa.1.log").exists());
+
+        // lisa.1.log をフォルダにして rename が失敗する状態を作ると、lisa-<pid>.log にフォールバックする。
+        let _ = std::fs::remove_file(dir.join("lisa.1.log"));
+        std::fs::create_dir_all(dir.join("lisa.1.log").join("keep")).unwrap();
+        let (_f3, p3) = open_log_file_in(&dir, 3333).unwrap();
+        assert_eq!(p3, dir.join("lisa-3333.log"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

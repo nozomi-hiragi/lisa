@@ -77,7 +77,7 @@ pub enum Found {
 
 /// キャッシュの場所。
 fn cache_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("", "", "Lisa").map(|d| d.cache_dir().join("duplicates.json"))
+    crate::scan::cache_dir().map(|d| d.join("duplicates.json"))
 }
 
 /// DB の状態を確かめ、キャッシュが使えればそれを、使えなければ作り直したものを送る。
@@ -113,6 +113,9 @@ fn find(sender: std::sync::mpsc::Sender<Found>) {
             groups: groups.clone(),
         };
         if let Ok(bytes) = serde_json::to_vec(&cached) {
+            if let Some(parent) = cache.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let tmp = cache.with_extension("json.tmp");
             if std::fs::write(&tmp, bytes).is_ok() {
                 let _ = std::fs::rename(&tmp, &cache);

@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{OptionalExtension, params};
 
+use serde::{Deserialize, Serialize};
+
 use crate::db::{Db, Result};
 use crate::hash::Hash;
 use crate::listing::Kind;
 
 /// DB にあるドライブ。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Drive {
     pub id: String,
     pub label: String,
@@ -24,6 +26,9 @@ pub struct Drive {
     pub mount: Option<PathBuf>,
     /// 最後に見た日時（UTC の Unix 時刻、ミリ秒）。
     pub last_seen_at: i64,
+    /// 一番上のフォルダの `entry.id`。無ければ None。
+    #[serde(default)]
+    pub root_id: Option<i64>,
     /// 一番上のフォルダのハッシュ（16 進）。ハッシュの途中なら None。
     pub root_hash: Option<String>,
 }
@@ -32,7 +37,7 @@ pub struct Drive {
 pub fn drives(db: &Db) -> Result<Vec<Drive>> {
     db.conn()
         .prepare(
-            "SELECT d.id, d.label, d.fs, d.capacity, d.last_mount_path, d.last_seen_at, e.hash
+            "SELECT d.id, d.label, d.fs, d.capacity, d.last_mount_path, d.last_seen_at, e.id, e.hash
              FROM drive d LEFT JOIN entry e ON e.drive_id = d.id AND e.parent_id IS NULL
              ORDER BY d.id",
         )?
@@ -44,10 +49,24 @@ pub fn drives(db: &Db) -> Result<Vec<Drive>> {
                 capacity: r.get::<_, Option<i64>>(3)?.map(|c| c as u64),
                 mount: r.get::<_, Option<String>>(4)?.map(PathBuf::from),
                 last_seen_at: r.get(5)?,
-                root_hash: r.get::<_, Option<Vec<u8>>>(6)?.map(|h| hex(&h)),
+                root_id: r.get(6)?,
+                root_hash: r.get::<_, Option<Vec<u8>>>(7)?.map(|h| hex(&h)),
             })
         })?
         .collect()
+}
+
+/// この DB の端末の（名前, ホスト名）。`meta.this_device` と `device` の表から引く。無ければ None。
+pub fn this_device(db: &Db) -> Result<Option<(String, String)>> {
+    db.conn()
+        .query_row(
+            "SELECT d.name, d.hostname FROM meta m
+             JOIN device d ON d.id = m.value
+             WHERE m.key = 'this_device'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
 }
 
 /// パスを DB の中で見つけたもの。
@@ -175,11 +194,11 @@ pub fn path_of(db: &Db, id: i64) -> Result<Option<Located>> {
 }
 
 /// 1 つのファイルかフォルダ（外に見せる形）。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Item {
     pub id: i64,
     pub name: String,
-    pub kind: &'static str,
+    pub kind: String,
     /// ファイルの大きさ。フォルダは 0（`folder_total` で足す）。
     pub size: u64,
     /// 更新日時（UTC の Unix 時刻、ミリ秒）。
@@ -198,7 +217,7 @@ impl From<crate::db::Stored> for Item {
         Self {
             id: s.id,
             name: s.name_nfc,
-            kind: kind_str(s.kind),
+            kind: kind_str(s.kind).to_string(),
             size: s.size,
             mtime: s.mtime,
             hash: s.hash.map(|h| hex(&h)),
