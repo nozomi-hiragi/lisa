@@ -3,8 +3,18 @@
 //! DB や画面には依存しない純粋なロジックだけを持つ。
 
 mod content;
+pub mod db;
 mod eval;
 mod pattern;
+
+mod builtin_catalogs {
+    include!(concat!(env!("OUT_DIR"), "/builtin_catalogs.rs"));
+}
+
+/// ビルド時に埋め込んだ組み込みのカタログ（`(ファイル名, TOML 文字列)`）。
+pub fn builtin() -> &'static [(&'static str, &'static str)] {
+    builtin_catalogs::BUILTIN
+}
 
 use std::fs;
 use std::path::PathBuf;
@@ -56,6 +66,31 @@ pub enum Role {
     Cache,
     Install,
     Log,
+}
+
+impl Role {
+    /// TOML や DB での書き方（`data` など）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Data => "data",
+            Role::Config => "config",
+            Role::Cache => "cache",
+            Role::Install => "install",
+            Role::Log => "log",
+        }
+    }
+
+    /// `as_str` の逆。知らない文字なら None。
+    pub fn from_name(name: &str) -> Option<Role> {
+        Some(match name {
+            "data" => Role::Data,
+            "config" => Role::Config,
+            "cache" => Role::Cache,
+            "install" => Role::Install,
+            "log" => Role::Log,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,13 +267,50 @@ impl Catalog {
             let b = u8::from_str_radix(&color[5..7], 16).unwrap_or(0);
             return [r, g, b];
         }
-
-        let hash = blake3::hash(self.app.as_bytes());
-        let bytes = hash.as_bytes();
-        let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let hue = (raw as f64 / (u32::MAX as f64 + 1.0)) * 360.0;
-        hsl_to_rgb(hue, 0.55, 0.65)
+        app_color(&self.app)
     }
+}
+
+/// アプリ名から決める色（型に `color` が無いときと、1 か所の仕分けの札に使う）。
+pub fn app_color(app: &str) -> [u8; 3] {
+    let hash = blake3::hash(app.as_bytes());
+    let bytes = hash.as_bytes();
+    let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let hue = (raw as f64 / (u32::MAX as f64 + 1.0)) * 360.0;
+    hsl_to_rgb(hue, 0.55, 0.65)
+}
+
+/// アプリの設定（`settings.json`）のうち、カタログに関わるもの。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct CatalogSettings {
+    /// カタログを読むフォルダを足す（後のものほど優先）。
+    pub catalog_dirs: Vec<PathBuf>,
+    /// この型の中は、重複の一覧に出さない（型の ID）。
+    pub catalog_hide_duplicates: Vec<String>,
+}
+
+impl CatalogSettings {
+    /// `settings.json` から読む。無い・壊れているときは空。
+    pub fn from_file(path: &std::path::Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// ユーザー用のカタログのフォルダ（`lisa_catalog_save` の既定の書き先）。
+pub fn user_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("catalogs")
+}
+
+/// カタログを読むフォルダ（組み込みは別）。ユーザー用のフォルダ、そのあと設定の `catalog_dirs`。
+/// `CatalogSet::load_with_builtin` に渡すと、組み込み → ここの順に読み、後のものほど優先する。
+pub fn dirs(data_dir: &std::path::Path, settings: &CatalogSettings) -> Vec<PathBuf> {
+    let mut dirs = vec![user_dir(data_dir)];
+    dirs.extend(settings.catalog_dirs.iter().cloned());
+    dirs
 }
 
 fn hsl_to_rgb(hue: f64, sat: f64, light: f64) -> [u8; 3] {
@@ -284,15 +356,31 @@ impl CatalogSet {
     /// 同じ `id` は後に読んだ方で置き換える。
     /// 読めないフォルダは `errors` に入れて続ける。存在しないフォルダは黙って飛ばす。
     pub fn load(dirs: &[PathBuf]) -> CatalogSet {
-        let mut catalogs: Vec<Loaded> = Vec::new();
-        let mut errors: Vec<(PathBuf, String)> = Vec::new();
+        let mut set = CatalogSet::default();
+        set.load_dirs(dirs);
+        set
+    }
 
+    /// 組み込みの型を先に読み、続いて `dirs` を順に読む。
+    /// 同じ `id` は後に読んだ方で置き換える。
+    pub fn load_with_builtin(dirs: &[PathBuf]) -> CatalogSet {
+        let mut set = CatalogSet::default();
+        for &(name, text) in builtin() {
+            let source = PathBuf::from(format!("builtin:{name}"));
+            set.push_parsed(source, parse(text));
+        }
+        set.load_dirs(dirs);
+        set
+    }
+
+    fn load_dirs(&mut self, dirs: &[PathBuf]) {
         for dir in dirs {
             let entries = match fs::read_dir(dir) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    errors.push((dir.clone(), format!("フォルダを読めません: {e}")));
+                    self.errors
+                        .push((dir.clone(), format!("フォルダを読めません: {e}")));
                     continue;
                 }
             };
@@ -316,7 +404,7 @@ impl CatalogSet {
                 }
             }
             if let Some(msg) = dir_err {
-                errors.push((dir.clone(), msg));
+                self.errors.push((dir.clone(), msg));
                 continue;
             }
 
@@ -326,31 +414,32 @@ impl CatalogSet {
                 let text = match fs::read_to_string(&path) {
                     Ok(t) => t,
                     Err(e) => {
-                        errors.push((path, format!("ファイルを読めません: {e}")));
+                        self.errors
+                            .push((path, format!("ファイルを読めません: {e}")));
                         continue;
                     }
                 };
-                match parse(&text) {
-                    Ok(catalog) => {
-                        let loaded = Loaded {
-                            catalog,
-                            source: path,
-                        };
-                        if let Some(existing) = catalogs
-                            .iter_mut()
-                            .find(|c| c.catalog.id == loaded.catalog.id)
-                        {
-                            *existing = loaded;
-                        } else {
-                            catalogs.push(loaded);
-                        }
-                    }
-                    Err(e) => errors.push((path, e)),
-                }
+                self.push_parsed(path, parse(&text));
             }
         }
+    }
 
-        CatalogSet { catalogs, errors }
+    fn push_parsed(&mut self, source: PathBuf, result: Result<Catalog, String>) {
+        match result {
+            Ok(catalog) => {
+                let loaded = Loaded { catalog, source };
+                if let Some(existing) = self
+                    .catalogs
+                    .iter_mut()
+                    .find(|c| c.catalog.id == loaded.catalog.id)
+                {
+                    *existing = loaded;
+                } else {
+                    self.catalogs.push(loaded);
+                }
+            }
+            Err(e) => self.errors.push((source, e)),
+        }
     }
 
     /// `id` が一致するカタログを返す。

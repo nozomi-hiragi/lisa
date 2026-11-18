@@ -6,6 +6,8 @@
 //! cargo run -p lisa-scan -- drives                              つながっているドライブの一覧
 //! cargo run -p lisa-scan -- dups [件数]                         アプリの DB から重複の一覧を出す
 //! cargo run -p lisa-scan -- snapshots                           アプリの DB からスナップショットの一覧を出す
+//! cargo run -p lisa-scan -- catalog [--dir <フォルダ>]... [--drive <drive_id>] [--only <型の id>] [--near]
+//!                                                               アプリの DB にカタログを当てて結果を出す
 //! cargo run -p lisa-scan -- share <ファイル>... [--port N | N]  LAN の他の PC へファイルを HTTP で渡す
 //! cargo run -p lisa-scan -- remote-logs [名前か device_id] [行数]  ペアリング済みの相手のログを読む
 //! cargo run -p lisa-scan -- remote-update [名前か device_id] [--target lisa|lisa-mcp|both] [--no-restart]
@@ -29,6 +31,8 @@ const USAGE: &str = "使い方:
   lisa-scan drives                              つながっているドライブの一覧
   lisa-scan dups [件数]                         アプリの DB から重複の一覧を出す（空く大きさの順）
   lisa-scan snapshots                           アプリの DB からスナップショットの一覧を出す
+  lisa-scan catalog [--dir <フォルダ>]... [--drive <drive_id>] [--only <型の id>] [--near]
+                                                アプリの DB にカタログを当てて結果を出す
   lisa-scan share <ファイル>... [--port N | N]  LAN の他の PC へファイルを HTTP で渡す（ポートは既定で 8765）
   lisa-scan remote-logs [名前か device_id] [行数]  ペアリング済みの相手のログ（lisa.log と crash.log）を読む
   lisa-scan remote-update [名前か device_id] [--target lisa|lisa-mcp|both] [--no-restart]
@@ -58,6 +62,7 @@ fn main() -> ExitCode {
             Err(_) => Err(format!("深さは数で: {depth}")),
         },
         ["snapshots"] => snapshots(),
+        ["catalog", rest @ ..] => catalog(rest),
         ["share", rest @ ..] => {
             share::parse_args(rest).and_then(|(paths, port)| share::share(&paths, port))
         }
@@ -1349,6 +1354,188 @@ fn dups(count: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// `lisa-scan catalog` の引数。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CatalogArgs {
+    dirs: Vec<PathBuf>,
+    drive: Option<String>,
+    only: Option<String>,
+    near: bool,
+}
+
+fn parse_catalog_args(args: &[&str]) -> Result<CatalogArgs, String> {
+    const USAGE_CATALOG: &str = "使い方: lisa-scan catalog [--dir <フォルダ>]... [--drive <drive_id>] [--only <型の id>] [--near]";
+    let mut parsed = CatalogArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "--near" {
+            parsed.near = true;
+            i += 1;
+        } else if arg == "--dir" {
+            let Some(&val) = args.get(i + 1) else {
+                return Err(format!("--dir にフォルダが要ります\n{USAGE_CATALOG}"));
+            };
+            if val.is_empty() {
+                return Err("--dir が空です".into());
+            }
+            parsed.dirs.push(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--dir=") {
+            if val.is_empty() {
+                return Err("--dir が空です".into());
+            }
+            parsed.dirs.push(PathBuf::from(val));
+            i += 1;
+        } else if arg == "--drive" {
+            let Some(&val) = args.get(i + 1) else {
+                return Err(format!("--drive に drive_id が要ります\n{USAGE_CATALOG}"));
+            };
+            set_single_opt(&mut parsed.drive, "--drive", val)?;
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--drive=") {
+            set_single_opt(&mut parsed.drive, "--drive", val)?;
+            i += 1;
+        } else if arg == "--only" {
+            let Some(&val) = args.get(i + 1) else {
+                return Err(format!("--only に型の id が要ります\n{USAGE_CATALOG}"));
+            };
+            set_single_opt(&mut parsed.only, "--only", val)?;
+            i += 2;
+        } else if let Some(val) = arg.strip_prefix("--only=") {
+            set_single_opt(&mut parsed.only, "--only", val)?;
+            i += 1;
+        } else {
+            return Err(format!("知らない引数: {arg}\n{USAGE_CATALOG}"));
+        }
+    }
+    Ok(parsed)
+}
+
+fn set_single_opt(slot: &mut Option<String>, name: &str, val: &str) -> Result<(), String> {
+    if val.is_empty() {
+        return Err(format!("{name} が空です"));
+    }
+    if slot.is_some() {
+        return Err(format!("{name} は 1 回だけ指定してください"));
+    }
+    *slot = Some(val.to_string());
+    Ok(())
+}
+
+/// `settings.json` の場所（アプリと同じ。`LISA_DATA_DIR` があればその中）。
+fn settings_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("LISA_DATA_DIR").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(dir).join("settings.json"));
+    }
+    directories::ProjectDirs::from("", "", "Lisa").map(|d| d.config_dir().join("settings.json"))
+}
+
+fn state_label(state: lisa_core::catalog::State) -> &'static str {
+    match state {
+        lisa_core::catalog::State::Match => "match",
+        lisa_core::catalog::State::Maybe => "maybe",
+        lisa_core::catalog::State::Pending => "pending",
+        lisa_core::catalog::State::Miss => "miss",
+    }
+}
+
+/// アプリの DB にカタログを当てて結果を出す（DB には書かない）。
+fn catalog(args: &[&str]) -> Result<(), String> {
+    let parsed = parse_catalog_args(args)?;
+
+    let settings = settings_path()
+        .map(|p| lisa_core::catalog::CatalogSettings::from_file(&p))
+        .unwrap_or_default();
+    let mut dirs = lisa_core::catalog::dirs(&app_data_dir()?, &settings);
+    dirs.extend(parsed.dirs);
+
+    let mut set = lisa_core::catalog::CatalogSet::load_with_builtin(&dirs);
+    for (path, reason) in &set.errors {
+        println!("読めないカタログ  {}: {reason}", path.display());
+    }
+    if let Some(only_id) = &parsed.only {
+        set.catalogs.retain(|l| l.catalog.id == *only_id);
+        if set.catalogs.is_empty() {
+            return Err(format!("カタログが見つかりません: {only_id}"));
+        }
+    }
+
+    let db = app_db()?;
+    let start = Instant::now();
+    let (found, progress) =
+        lisa_core::catalog::db::find(&db, &set, parsed.drive.as_deref(), false, &|| true)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "途中で中断されました".to_string())?;
+
+    for loaded in &set.catalogs {
+        let cat = &loaded.catalog;
+        let items: Vec<_> = found.iter().filter(|f| f.catalog_id == cat.id).collect();
+        if items.is_empty() && parsed.only.is_none() {
+            continue;
+        }
+        println!("{}（{}）  {} か所", cat.name, cat.id, items.len());
+        for item in items {
+            let path = lisa_core::query::path_of(&db, item.entry_id)
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || format!("entry#{}", item.entry_id),
+                    |l| l.path.display().to_string(),
+                );
+            let size = lisa_core::query::folder_total(&db, item.entry_id)
+                .map(|(_, _, bytes)| human(bytes))
+                .unwrap_or_else(|_| "-".to_string());
+            let label = cat.label_text(&item.captures);
+            println!("  {:<7}  {label}  {path}  {size}", state_label(item.state));
+        }
+    }
+
+    if parsed.near {
+        let nears = lisa_core::catalog::db::find_near_misses(
+            &db,
+            &set,
+            parsed.drive.as_deref(),
+            false,
+            &|| true,
+        )
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+        if !nears.is_empty() {
+            println!("惜しい候補（外れた match が 1 つだけ）:");
+            for n in &nears {
+                let path = lisa_core::query::path_of(&db, n.entry_id)
+                    .ok()
+                    .flatten()
+                    .map_or_else(
+                        || format!("entry#{}", n.entry_id),
+                        |l| l.path.display().to_string(),
+                    );
+                let pat = set
+                    .get(&n.catalog_id)
+                    .and_then(|l| l.catalog.matches.get(n.failed_match))
+                    .map(|r| lisa_core::catalog::db::pattern_text(&r.path))
+                    .unwrap_or_else(|| format!("match #{}", n.failed_match));
+                println!(
+                    "  {}  {path}  (外れた match #{}: {pat})",
+                    n.catalog_id,
+                    n.failed_match + 1
+                );
+            }
+        }
+    }
+
+    println!(
+        "--\n{} か所（候補 {}、確かめたフォルダ {}、読んだ {}、{:.2} 秒）",
+        found.len(),
+        progress.candidates,
+        progress.folders_checked,
+        human(progress.bytes_read),
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// 読みやすい大きさ（1024 区切り）。
 fn human(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
@@ -1634,5 +1821,39 @@ mod tests {
             assert_eq!(&png_bytes[0..8], b"\x89PNG\r\n\x1a\n");
         }
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn parse_catalog_arguments() {
+        assert_eq!(parse_catalog_args(&[]).unwrap(), CatalogArgs::default());
+        assert_eq!(
+            parse_catalog_args(&[
+                "--dir",
+                "/tmp/c1",
+                "--dir=/tmp/c2",
+                "--drive",
+                "mac:1",
+                "--only=unity-project",
+                "--near",
+            ])
+            .unwrap(),
+            CatalogArgs {
+                dirs: vec![PathBuf::from("/tmp/c1"), PathBuf::from("/tmp/c2")],
+                drive: Some("mac:1".into()),
+                only: Some("unity-project".into()),
+                near: true,
+            }
+        );
+        for bad in [
+            &["--dir"][..],
+            &["--dir="][..],
+            &["--drive"][..],
+            &["--drive", "a", "--drive", "b"][..],
+            &["--only"][..],
+            &["--unknown"][..],
+            &["extra"][..],
+        ] {
+            assert!(parse_catalog_args(bad).is_err(), "args {bad:?} should fail");
+        }
     }
 }

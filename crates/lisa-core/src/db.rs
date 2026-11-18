@@ -77,6 +77,37 @@ CREATE INDEX IF NOT EXISTS snapshot_drive ON snapshot(drive_id, id);
 CREATE UNIQUE INDEX IF NOT EXISTS entry_child ON entry(parent_id, name);
 CREATE UNIQUE INDEX IF NOT EXISTS entry_root ON entry(drive_id) WHERE parent_id IS NULL;
 CREATE INDEX IF NOT EXISTS entry_drive ON entry(drive_id);
+CREATE TABLE IF NOT EXISTS catalog_match (
+    entry_id    INTEGER NOT NULL REFERENCES entry(id) ON DELETE CASCADE,
+    catalog_id  TEXT NOT NULL,
+    catalog_rev TEXT NOT NULL,
+    state       TEXT NOT NULL,      -- 'match' / 'maybe' / 'pending'
+    captures    TEXT NOT NULL,      -- JSON のオブジェクト
+    matched_at  INTEGER NOT NULL,
+    PRIMARY KEY (entry_id, catalog_id)
+);
+CREATE INDEX IF NOT EXISTS catalog_match_catalog ON catalog_match(catalog_id);
+CREATE TABLE IF NOT EXISTS content_check (
+    hash     BLOB NOT NULL,
+    algo     TEXT NOT NULL,
+    rule     BLOB NOT NULL,         -- Content::rule_key() の blake3（32 バイト）
+    hit      INTEGER NOT NULL,
+    captures TEXT NOT NULL,
+    PRIMARY KEY (hash, algo, rule)
+);
+CREATE TABLE IF NOT EXISTS assignment (
+    id         INTEGER PRIMARY KEY,
+    drive_id   TEXT NOT NULL,
+    path       TEXT NOT NULL,       -- ドライブの一番上から見たパス（NFC、区切りは /、一番上は ''）
+    file_id    INTEGER,
+    app        TEXT NOT NULL,
+    role       TEXT,
+    note       TEXT,
+    by         TEXT NOT NULL,       -- 'user' / 'mcp'
+    created_at INTEGER NOT NULL,
+    lost_at    INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS assignment_place ON assignment(drive_id, path);
 ";
 
 /// `Stored` に読む列（`row_to_stored` と同じ順）。
@@ -156,6 +187,11 @@ impl Db {
     /// 中のつなぎ（同じ crate の読み出し用）。
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// 中のつなぎ（同じ crate の書き込み用）。
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 
     /// メモリの中だけの DB（テスト用）。
@@ -746,7 +782,7 @@ fn kind_from(name: &str) -> Kind {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
