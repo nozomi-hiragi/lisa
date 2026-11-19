@@ -39,6 +39,15 @@ pub enum Command {
         #[serde(default)]
         select: Option<String>,
     },
+    /// カタログのパネルを開け閉めする。`select` は当たったフォルダの `entry.id`（パネルで選ぶ）。
+    Catalog {
+        open: bool,
+        #[serde(default)]
+        select: Option<i64>,
+    },
+    /// アプリの窓をアプリ自身で撮って、データのフォルダの `screenshots/<name>.png` に残す（画面収録の
+    /// 許可が無くても撮れる）。`name` は英数字・`-`・`_` だけ。
+    Capture { name: String },
     /// フォルダを先に読み直して（ハッシュして）もらう。
     Rescan { path: PathBuf },
     /// 裏の読み込みを一時停止する・再開する。

@@ -1,0 +1,30 @@
+# Steam ライブラリ
+# Steam のインストール先またはライブラリフォルダ。steamapps/ の中の common/ で見分ける
+# （libraryfolder.vdf は版によって名前が違うので使わない）。
+id    = "steam-library"
+name  = "Steam ライブラリ"
+app   = "Steam"
+color = "#66c0f4"
+
+[[match]]
+path = "steamapps/common/"
+
+[[part]]
+path = "steamapps/common/"
+role = "install"
+
+[[part]]
+path = "steamapps/downloading/"
+role = "cache"
+
+[[part]]
+path = "steamapps/shadercache/"
+role = "cache"
+
+[[part]]
+path = "steamapps/temp/"
+role = "cache"
+
+[[part]]
+path = "steamapps/workshop/"
+role = "install"

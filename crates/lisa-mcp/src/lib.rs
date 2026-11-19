@@ -1,10 +1,14 @@
 //! Lisa を MCP（Model Context Protocol）で使うためのサーバーの中身。
 //!
-//! - DB を読む道具（ドライブ、フォルダの中身、名前で探す、重複、同じ中身の場所、スナップショット）は、
-//!   アプリが起動していなくても使える。DB は書き換えない。
+//! - DB を読む道具（ドライブ、フォルダの中身、名前で探す、重複、同じ中身の場所、スナップショット、
+//!   カタログの一覧・当たり・要約・テスト）は、アプリが起動していなくても使える。書き込むのは
+//!   カタログの TOML ファイル（`lisa_catalog_save`）と DB の `assignment` の表（`lisa_assign` /
+//!   `lisa_unassign`）だけ。
 //! - アプリの画面を動かす道具（`lisa_app_*`）は、起動中のアプリに `lisa_core::remote` で頼む。
 //! - ユーザーのファイルやフォルダは何も動かさない（ペアリングした端末から sidecar に頼む `lisa_update` だけ、
 //!   `lisa` / `lisa-mcp` の実行ファイルを入れ替える）。
+
+mod catalog;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -259,6 +263,14 @@ impl Server {
                 .and_then(|_| require_sidecar(sidecar, name))
                 .and_then(|_| self.screenshot(args)),
             "lisa_app_alive" => self.app_alive(),
+            "lisa_catalogs" => self.catalogs(args),
+            "lisa_catalog_matches" => self.catalog_matches(args),
+            "lisa_unclassified" => self.unclassified(args),
+            "lisa_outline" => self.outline(args),
+            "lisa_catalog_test" => self.catalog_test(args),
+            "lisa_catalog_save" => self.catalog_save(args),
+            "lisa_assign" => self.assign(args),
+            "lisa_unassign" => self.unassign(args),
             _ => Err(format!("知らない道具: {name}")),
         };
         match result {
@@ -2206,6 +2218,8 @@ fn read_log_tail(path: &Path, max_lines: usize) -> Value {
 pub const INSTRUCTIONS: &str = "Lisa は、複数の PC やドライブのファイルを読んでハッシュし、重複を見つけるファイラーです。\
 DB を読む道具（lisa_drives, lisa_list, lisa_info, lisa_search, lisa_duplicates, lisa_copies, lisa_snapshots）と\
 ログや生死を見る道具（lisa_logs, lisa_app_alive）はアプリが起動していなくても使えます。lisa_app_* は起動中のアプリの画面や起動・終了を扱います。\
+カタログの道具（lisa_catalogs, lisa_catalog_matches, lisa_unclassified, lisa_outline, lisa_catalog_test）でアプリのフォルダを見分けたり形を調べたりできます。\
+書き込むのはカタログの型ファイル（lisa_catalog_save）と 1 か所の仕分け（lisa_assign, lisa_unassign）だけです。\
 ユーザーのファイルは何も動かしません（ペアリングした端末から sidecar に頼む lisa_update だけ実行ファイルを入れ替えます）。\
 大きさはバイト、日時は UTC の Unix 時刻（ミリ秒）、ハッシュは BLAKE3 の 16 進です。";
 
@@ -2369,6 +2383,90 @@ pub fn tools() -> Value {
                 "scale": {"type": "integer", "description": "縦横をこの数で割って小さくする（1〜4 の整数、既定 2）"},
             }},
             "annotations": read_only,
+        },
+        {
+            "name": "lisa_catalogs",
+            "description": "読んでいるカタログ（型）の一覧（ID、名前、アプリ、在りか、当たった数、読めなかったときの理由）。include_text: true で TOML の本文も返す。",
+            "inputSchema": {"type": "object", "properties": {
+                "include_text": {"type": "boolean", "description": "true なら各型の TOML 本文も返す"},
+            }},
+            "annotations": read_only,
+        },
+        {
+            "name": "lisa_catalog_matches",
+            "description": "型や 1 か所の仕分けに当たったフォルダの一覧と、型ごと・アプリごとの合計。parts: true で中の役割も付ける。",
+            "inputSchema": {"type": "object", "properties": {
+                "catalog": {"type": "string", "description": "型の ID で絞る"},
+                "app": {"type": "string", "description": "アプリ名で絞る"},
+                "drive_id": {"type": "string", "description": "ドライブ ID で絞る"},
+                "limit": {"type": "integer", "description": "出す数（既定 100、最大 1000）"},
+                "totals": {"type": "boolean", "description": "各フォルダの大きさを足すか（既定 true）"},
+                "parts": {"type": "boolean", "description": "true なら中の役割（parts）も付ける"},
+            }},
+            "annotations": read_only,
+        },
+        {
+            "name": "lisa_unclassified",
+            "description": "どの型にも仕分けにも当たらない大きなフォルダ（大きさの順、大きな子を含まない一番深いフォルダ）。",
+            "inputSchema": {"type": "object", "properties": {
+                "under": {"type": "string", "description": "このフォルダの下だけ調べる"},
+                "min_size": {"type": "integer", "description": "最小の大きさ（バイト、既定 1 GiB）"},
+                "limit": {"type": "integer", "description": "出す数（既定 30、最大 1000）"},
+            }},
+            "annotations": read_only,
+        },
+        {
+            "name": "lisa_outline",
+            "description": "フォルダの形の要約（上から depth 段の木、拡張子ごとの数と大きさ、よく出る名前、小さなテキストファイルの先頭、当たっている型と仕分け）。",
+            "inputSchema": with(json!({
+                "depth": {"type": "integer", "description": "木を出す段数（既定 3、最大 6）"},
+                "text_bytes": {"type": "integer", "description": "小さなテキストの先頭を読むバイト数（既定 400、最大 4000）"},
+            })),
+            "annotations": read_only,
+        },
+        {
+            "name": "lisa_catalog_test",
+            "description": "書きかけのカタログ（TOML 文字列）を保存せずに DB に当て、当たったフォルダと惜しい候補（外れた match が 1 つだけ）を返す。",
+            "inputSchema": {"type": "object", "properties": {
+                "toml": {"type": "string", "description": "試すカタログの TOML 文字列"},
+                "under": {"type": "string", "description": "このフォルダの下だけ調べる"},
+                "limit": {"type": "integer", "description": "出す数（既定 50、最大 1000）"},
+            }, "required": ["toml"]},
+            "annotations": read_only,
+        },
+        {
+            "name": "lisa_catalog_save",
+            "description": "カタログの TOML ファイルをユーザーのカタログのフォルダに保存する（新規・上書き）。保存前に形を確かめ、当たりの数も返す。",
+            "inputSchema": {"type": "object", "properties": {
+                "toml": {"type": "string", "description": "保存するカタログの TOML 文字列"},
+                "dir": {"type": "string", "description": "書く先のフォルダ（既定はユーザーのカタログのフォルダ）"},
+                "overwrite": {"type": "boolean", "description": "同じ名前があれば上書きするか（既定 false）"},
+            }, "required": ["toml"]},
+            "annotations": app_hint,
+        },
+        {
+            "name": "lisa_assign",
+            "description": "1 か所のフォルダをアプリ用として DB の assignment に仕分ける（同じ場所があれば上書き）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "フォルダの絶対パス"},
+                    "id": {"type": "integer", "description": "DB の entry.id（path の代わりに）"},
+                    "app": {"type": "string", "description": "アプリ名"},
+                    "role": {"type": "string", "enum": ["data", "config", "cache", "install", "log"], "description": "役割（任意）"},
+                    "note": {"type": "string", "description": "メモ（任意）"},
+                },
+                "required": ["app"],
+            },
+            "annotations": app_hint,
+        },
+        {
+            "name": "lisa_unassign",
+            "description": "1 か所の仕分けを DB の assignment から外す（ユーザーのファイルは触らない）。",
+            "inputSchema": with(json!({
+                "assignment_id": {"type": "integer", "description": "仕分けの行 ID（path / id の代わりに）"},
+            })),
+            "annotations": app_hint,
         },
     ])
 }

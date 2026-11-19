@@ -1,0 +1,30 @@
+# Rust クレート
+# Cargo.toml と target/ フォルダの存在で見分け、Cargo.toml の name からクレート名をラベルに取得する。
+id    = "rust-crate"
+name  = "Rust クレート"
+app   = "Rust"
+color = "#f78c6c"
+label = "{name}"
+
+[[match]]
+path = "Cargo.toml"
+content = 're:(?m)^name\s*=\s*"(?<name>[^"]+)"'
+
+[[match]]
+path = "target/"
+
+[[part]]
+path = "target/"
+role = "cache"
+
+[[part]]
+path = "Cargo.toml"
+role = "config"
+
+[[part]]
+path = "Cargo.lock"
+role = "config"
+
+[[part]]
+path = "src/"
+role = "data"

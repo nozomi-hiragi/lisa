@@ -1,0 +1,31 @@
+# Xcode DerivedData プロジェクト
+# DerivedData 直下にある個別プロジェクトのビルド出力フォルダ。Build/、info.plist、Index または Logs の存在で見分ける。
+id    = "xcode-derived-data-project"
+name  = "Xcode ビルドデータ"
+app   = "Xcode"
+color = "#5ac8fa"
+
+[[match]]
+path = "Build/"
+
+[[match]]
+path = "info.plist"
+
+[[match]]
+path = "{Index.noindex,Logs}/"
+
+[[part]]
+path = "Build/"
+role = "cache"
+
+[[part]]
+path = "Index.noindex/"
+role = "cache"
+
+[[part]]
+path = "Logs/"
+role = "log"
+
+[[part]]
+path = "info.plist"
+role = "cache"

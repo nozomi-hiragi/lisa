@@ -123,6 +123,20 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                 buttons
                     .spawn((
                         button(),
+                        children![(
+                            Text::new("カタログ"),
+                            text_font.clone(),
+                            TextColor(TEXT_COLOR)
+                        )],
+                    ))
+                    .observe(
+                        |_: On<PointerClick>, mut view: ResMut<crate::catalog::CatalogView>| {
+                            view.open = !view.open;
+                        },
+                    );
+                buttons
+                    .spawn((
+                        button(),
                         children![(Text::new("設定"), text_font.clone(), TextColor(TEXT_COLOR))],
                     ))
                     .observe(|_: On<PointerClick>, mut popup: ResMut<Popup>| {

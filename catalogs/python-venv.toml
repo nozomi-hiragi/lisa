@@ -1,0 +1,38 @@
+# Python 仮想環境
+# pyvenv.cfg と実行バイナリフォルダ（bin/ または Windows の Scripts/）の存在で見分け、バージョンを取得する。
+id    = "python-venv"
+name  = "Python 仮想環境"
+app   = "Python"
+color = "#4b90cd"
+label = "Python {ver}"
+
+[[match]]
+path = "pyvenv.cfg"
+content = 're:version(_info)?\s*=\s*(?<ver>\S+)'
+
+[[match]]
+path = "{bin,Scripts}/"
+
+[[part]]
+path = "bin/"
+role = "install"
+
+[[part]]
+path = "Scripts/"
+role = "install"
+
+[[part]]
+path = "lib/"
+role = "install"
+
+[[part]]
+path = "Lib/"
+role = "install"
+
+[[part]]
+path = "include/"
+role = "install"
+
+[[part]]
+path = "pyvenv.cfg"
+role = "config"

@@ -87,6 +87,7 @@ fn handle(
     nav: Res<Nav>,
     tree: Res<FileTree>,
     mut dups: ResMut<Dups>,
+    mut catalog: ResMut<crate::catalog::CatalogView>,
     control: Option<Res<ScanControl>>,
     progress: Option<Res<ScanProgress>>,
     mut redraw: MessageWriter<RequestRedraw>,
@@ -123,6 +124,45 @@ fn handle(
                     }
                 }
                 Ok(())
+            }
+            Command::Catalog { open, select } => {
+                catalog.open = open;
+                if let Some(entry) = select {
+                    let index = catalog
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.hits.iter().position(|h| h.entry_id() == entry));
+                    catalog.selected = index;
+                }
+                if catalog.selected.is_some() || select.is_none() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "entry {} はカタログに当たっていません",
+                        select.unwrap_or(0)
+                    ))
+                }
+            }
+            Command::Capture { name } => {
+                let valid = !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                match crate::scan::data_dir() {
+                    Some(dir) if valid => {
+                        let dir = dir.join("screenshots");
+                        let _ = std::fs::create_dir_all(&dir);
+                        commands
+                            .spawn(bevy::render::view::screenshot::Screenshot::primary_window())
+                            .observe(bevy::render::view::screenshot::save_to_disk(
+                                dir.join(format!("{name}.png")),
+                            ));
+                        Ok(())
+                    }
+                    Some(_) => Err("name は英数字・-・_ だけで 64 文字まで".into()),
+                    None => Err("データのフォルダが分かりません".into()),
+                }
             }
             Command::Rescan { path } => match &control {
                 Some(control) if path.is_dir() => {

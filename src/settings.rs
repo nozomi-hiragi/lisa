@@ -31,6 +31,10 @@ pub struct Settings {
     pub rest_disk_mb_per_sec: f32,
     /// LAN の他の PC にこの端末の DB を公開する（1 なら公開する、0 なら公開しない）。
     pub lan_share: f32,
+    /// カタログを読むフォルダを足す（後のものほど優先。`docs/catalog.md`）。ポップアップには出さない。
+    pub catalog_dirs: Vec<String>,
+    /// この型（ID）の中は、重複の一覧に出さない。ポップアップには出さない。
+    pub catalog_hide_duplicates: Vec<String>,
 }
 
 impl Default for Settings {
@@ -43,6 +47,8 @@ impl Default for Settings {
             rest_cpu_percent: 80.0,
             rest_disk_mb_per_sec: 100.0,
             lan_share: 0.0,
+            catalog_dirs: Vec::new(),
+            catalog_hide_duplicates: Vec::new(),
         }
     }
 }
@@ -171,7 +177,7 @@ impl Plugin for SettingsPlugin {
     }
 }
 
-fn settings_path() -> Option<PathBuf> {
+pub(crate) fn settings_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("LISA_DATA_DIR").filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(dir).join("settings.json"));
     }

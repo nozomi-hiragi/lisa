@@ -1,6 +1,7 @@
 // Windows のリリースビルドでは、起動したときに黒いコンソールの窓を出さない。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod catalog;
 mod crash;
 #[cfg(debug_assertions)]
 mod debug;
@@ -67,6 +68,8 @@ fn main() {
         ui::progress::ProgressPlugin,
         ui::dups::DupsPanelPlugin,
         dups::DupsPlugin,
+        catalog::CatalogPlugin,
+        ui::catalog::CatalogPanelPlugin,
         remote::RemotePlugin,
     ));
     #[cfg(debug_assertions)]

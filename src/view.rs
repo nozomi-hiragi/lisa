@@ -31,7 +31,7 @@ mod title;
 pub use camera::Busy;
 pub(crate) use camera::{
     Animating, Ease, MainCamera, ZOOM_SECONDS, animate_camera, fit, keep_redrawing,
-    refit_on_resize, set_side_px, side_px, view_width,
+    refit_on_resize, set_catalog_side_px, set_side_px, side_px, view_width,
 };
 pub(crate) use fade::{Fade, fade_scenes};
 pub use title::TitleSuffix;
@@ -131,6 +131,7 @@ pub(crate) struct SceneMaker<'w, 's> {
     pub(crate) font: Res<'w, LabelFont>,
     pub(crate) ears: Res<'w, EarSizes>,
     pub(crate) highlight: Res<'w, crate::dups::DupHighlight>,
+    pub(crate) catalog: Res<'w, crate::catalog::CatalogMarks>,
 }
 
 impl SceneMaker<'_, '_> {
@@ -156,6 +157,7 @@ impl SceneMaker<'_, '_> {
             font: &self.font.0,
             ears: &self.ears,
             highlight: Some(&self.highlight),
+            catalog: Some(&self.catalog),
         };
         scene::spawn(
             &mut self.commands,
@@ -225,6 +227,7 @@ fn setup(
         font: &font,
         ears: &ears,
         highlight: None,
+        catalog: None,
     };
     let root_scene = scene::spawn(
         &mut commands,
