@@ -16,11 +16,13 @@ src/
   render/scene.rs          1 つのフォルダの「場面」を描く（タイル、子の枠）
   render/ear.rs            フォルダの耳とファイルの名前（ズームに合わせて大きさを変える）
   render/shapes.rs         四角・三角・円・画像・文字を描く道具、見えないほど小さいものを省く
-  render/preview.rs        ファイルの仮のプレビュー（拡張子ごとの絵）
   render/cache.rs          開いたフォルダの中身を画像に撮って残すキャッシュ（`CONTENT_LAYER` のみ 1 枚撮影・WebP 保存）
   render/diag.rs           描画状態の診断ログ（`LISA_RENDER_DIAG=1` で 1 秒ごとにカメラ・スワップチェーン等を記録）
   render/status.rs         読み込みの状態ごとのタイルの見た目（枠だけ、脈打つ光、暗い膜、×）
   render/tag.rs            カタログの札、役割で暗くする膜、パネルで選んだ当たりの枠（本物の場面だけ）
+  preview.rs               ファイルのプレビューの仕組み（Cartridge トレイト、PreviewRegistry、紙の背景）
+  preview/cartridges.rs    組み込みカートリッジの一覧（1 行足す・消すだけで有効・無効）
+  preview/cartridges/      種類ごとのカートリッジ（image、text、video、other）
   scan.rs                  本物のフォルダを裏のスレッドで読んで木に足す（DB からの出し入れと監視）
   scan/worker.rs           裏のスレッドでフォルダの読み取りとハッシュを進める係
   dups.rs                  重複の一覧を裏で作り、選んだ組のコピーを木の上で光らせる
