@@ -108,6 +108,36 @@ CREATE TABLE IF NOT EXISTS assignment (
     lost_at    INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS assignment_place ON assignment(drive_id, path);
+CREATE TABLE IF NOT EXISTS plan (
+    id          INTEGER PRIMARY KEY,
+    state       TEXT NOT NULL,     -- pending / approved / running / done / partial / rejected / cancelled / expired / undone
+    by          TEXT NOT NULL,     -- 'mcp:<クライアント名>' / 'user' / 'cli'
+    note        TEXT,              -- LLM が付けた説明
+    summary     TEXT NOT NULL,     -- JSON（件数、大きさ、危ないものの数など。作ったときのもの）
+    skip_risky  INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    decided_at  INTEGER,
+    finished_at INTEGER,
+    purged_at   INTEGER            -- 隔離から OS のゴミ箱へ送った時刻
+);
+CREATE INDEX IF NOT EXISTS plan_state ON plan(state, id);
+CREATE TABLE IF NOT EXISTS plan_op (
+    plan_id   INTEGER NOT NULL REFERENCES plan(id) ON DELETE CASCADE,
+    seq       INTEGER NOT NULL,
+    op        TEXT NOT NULL,       -- mkdir / move / trash
+    drive_id  TEXT,
+    src       TEXT NOT NULL,       -- 元の絶対パス（mkdir は作るパス）
+    dst       TEXT,                -- move の行き先、trash は隔離した場所（済んでから）
+    keep      TEXT,
+    size      INTEGER,             -- 作ったときの大きさ（フォルダは中の合計）
+    mtime     INTEGER,
+    hash      BLOB,
+    risky     TEXT,                -- 危ない理由（無ければ NULL）
+    state     TEXT NOT NULL,       -- pending / running / done / skipped / failed / undone
+    reason    TEXT,                -- skipped・failed の理由
+    done_at   INTEGER,
+    PRIMARY KEY (plan_id, seq)
+);
 ";
 
 /// `Stored` に読む列（`row_to_stored` と同じ順）。

@@ -12,6 +12,7 @@ pub mod fsevents;
 pub mod hash;
 pub mod listing;
 pub mod name;
+pub mod organize;
 pub mod pace;
 pub mod query;
 pub mod remote;

@@ -104,6 +104,9 @@ pub fn read_dir(dir: &Path) -> io::Result<Listing> {
             listing.junk += 1;
             continue;
         }
+        if name::is_quarantine_dir(&file_name) {
+            continue;
+        }
         // シンボリックリンクをたどらない情報（Unix は lstat、Windows は一覧のときに取れた値）。
         let meta = match item.metadata() {
             Ok(meta) => meta,
@@ -178,7 +181,7 @@ fn kind_of(meta: &Metadata) -> Kind {
     }
 }
 
-fn mtime_ms(meta: &Metadata) -> Option<i64> {
+pub(crate) fn mtime_ms(meta: &Metadata) -> Option<i64> {
     let time = meta.modified().ok()?;
     Some(match time.duration_since(UNIX_EPOCH) {
         Ok(after) => after.as_millis() as i64,
@@ -225,7 +228,7 @@ fn other_volume(_dir: &Metadata, _child: &Metadata) -> bool {
 
 /// Mac: ダウンロードしていないファイル（とフォルダ）に付く印。
 #[cfg(target_os = "macos")]
-fn cloud_only(meta: &Metadata) -> bool {
+pub(crate) fn cloud_only(meta: &Metadata) -> bool {
     use std::os::macos::fs::MetadataExt;
     const SF_DATALESS: u32 = 0x4000_0000;
     meta.st_flags() & SF_DATALESS != 0
@@ -233,7 +236,7 @@ fn cloud_only(meta: &Metadata) -> bool {
 
 /// Windows: クラウドのプレースホルダの属性。
 #[cfg(windows)]
-fn cloud_only(meta: &Metadata) -> bool {
+pub(crate) fn cloud_only(meta: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
     const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
@@ -246,7 +249,7 @@ fn cloud_only(meta: &Metadata) -> bool {
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn cloud_only(_meta: &Metadata) -> bool {
+pub(crate) fn cloud_only(_meta: &Metadata) -> bool {
     false
 }
 
@@ -348,5 +351,21 @@ mod tests {
         let tmp = TempDir::new("missing");
         let error = read_dir(&tmp.0.join("nope")).unwrap_err();
         assert_eq!(Failure::of(&error), Failure::NotFound);
+    }
+
+    #[test]
+    fn quarantine_dir_is_skipped() {
+        let tmp = TempDir::new("quarantine-skip");
+        fs::create_dir(tmp.0.join(name::QUARANTINE_DIR_NAME)).unwrap();
+        fs::write(tmp.0.join(name::QUARANTINE_DIR_NAME).join("x.txt"), b"x").unwrap();
+        fs::write(tmp.0.join("keep.txt"), b"ok").unwrap();
+
+        let listing = read_dir(&tmp.0).unwrap();
+        let names: Vec<_> = listing
+            .entries
+            .iter()
+            .map(|e| e.name_nfc.as_str())
+            .collect();
+        assert_eq!(names, ["keep.txt"]);
     }
 }
