@@ -494,8 +494,15 @@ fn scroll_panel(
     view: Res<CatalogView>,
     mut wheel: MessageReader<MouseWheel>,
     window: Single<&Window>,
-    mut list: Single<&mut ScrollPosition, With<List>>,
+    list: Single<(&mut ScrollPosition, &ComputedNode), With<List>>,
 ) {
+    let (mut scroll, node) = list.into_inner();
+    // 一番下より先へは進めない（進めた分が溜まると、戻すときに動かなくなる）。中身をまだ並べていない
+    // フレーム（作り直した直後）は、下の端が分からないので上だけ止める。
+    let bottom = ((node.content_size.y - node.size.y + node.padding.max_inset.y).max(0.0)
+        * node.inverse_scale_factor)
+        .max(0.0);
+    let laid_out = node.content_size.y > 0.0;
     let over = view.open
         && window
             .cursor_position()
@@ -508,7 +515,8 @@ fn scroll_panel(
             MouseScrollUnit::Line => event.y * LINE_PX,
             MouseScrollUnit::Pixel => event.y,
         };
-        list.y = (list.y - dy).max(0.0);
+        let y = (scroll.y - dy).max(0.0);
+        scroll.y = if laid_out { y.min(bottom) } else { y };
     }
 }
 

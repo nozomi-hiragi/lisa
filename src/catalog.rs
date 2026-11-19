@@ -30,6 +30,9 @@ use crate::render::cache::BakeFinished;
 const CHECK_EVERY: Duration = Duration::from_secs(5);
 /// ハッシュの途中（DB の状態が決まらない）ときに当て直す間隔。
 const WHILE_HASHING: Duration = Duration::from_secs(60);
+/// DB の状態が変わっただけ（カタログのファイルや仕分けは変わっていない）なら、これより短い間隔では当て
+/// 直さない。動いている PC では一番上のハッシュがいつも変わるので、続けて当て直さないように。
+const MIN_INTERVAL: Duration = Duration::from_secs(180);
 /// 「どれにも当たらない大きなフォルダ」の下限と数。
 const UNCLASSIFIED_MIN: u64 = 1 << 30;
 const UNCLASSIFIED_LIMIT: usize = 30;
@@ -50,7 +53,7 @@ impl Plugin for CatalogPlugin {
 }
 
 /// 型か仕分けに当たった 1 か所。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
     /// ドライブの一番上からの `entry.id`（最後が当たったフォルダ）。
     pub chain: Vec<i64>,
@@ -77,7 +80,7 @@ impl Hit {
 }
 
 /// どの型にも仕分けにも当たらない大きなフォルダ。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Big {
     pub chain: Vec<i64>,
     pub path: PathBuf,
@@ -85,7 +88,7 @@ pub struct Big {
 }
 
 /// 裏のスレッドが当てた結果。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     /// 仕分けを先に、そのあと型の当たり（アプリ、型、大きさの順）。同じフォルダは 1 回だけ。
     pub hits: Vec<Hit>,
@@ -230,8 +233,11 @@ fn run(tx: Sender<Snapshot>, wake: Receiver<()>) {
         let due = forced
             || last_files.as_ref() != Some(&files)
             || match &signature {
-                Some(_) => signature != last_signature,
-                None => last_run.is_none_or(|t| t.elapsed() >= WHILE_HASHING),
+                Some(_) => {
+                    signature != last_signature
+                        && last_run.is_none_or(|t| t.elapsed() >= MIN_INTERVAL)
+                }
+                None => last_run.is_none_or(|t| t.elapsed() >= WHILE_HASHING.max(MIN_INTERVAL)),
             };
         if due {
             forced = false;
@@ -396,7 +402,8 @@ fn receive(mut view: ResMut<CatalogView>, mut redraw: MessageWriter<RequestRedra
         };
         receiver.try_iter().last()
     };
-    if let Some(snapshot) = next {
+    // 前と同じなら入れ替えない（パネルを作り直さない）。
+    if let Some(snapshot) = next.filter(|s| view.snapshot.as_ref() != Some(s)) {
         // 選んでいたものは、同じフォルダがあれば選び直す。
         let selected = view
             .selected
