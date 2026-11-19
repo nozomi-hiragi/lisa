@@ -10,6 +10,7 @@ mod input;
 mod lan;
 mod layout;
 mod model;
+mod organize;
 mod remote;
 mod render;
 mod scan;
@@ -33,31 +34,41 @@ fn main() {
     let backend_label =
         describe_wgpu_backend(std::env::var("WGPU_BACKEND").ok().as_deref(), cfg!(windows));
     let mut app = App::new();
-    app.add_plugins(
-        DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Lisa — Root".into(),
-                    present_mode,
-                    ..default()
-                }),
-                ..default()
-            })
-            .set(LogPlugin {
-                // TODO: 日本語・中国語の改行位置データ（ICU4X のセグメンテーションモデル）を同梱して
-                // いないため、その警告（icu_provider::error）を止めている。ラベルを折り返すように
-                // なったら、Bevy の `complex_script_segmentation` 機能でデータを入れ、この絞り込みと
-                // Cargo.toml の icu_provider の logging 機能を外す（README の「既知の課題」を参照）。
-                filter: format!("{DEFAULT_FILTER},icu_provider=off"),
-                custom_layer: file_log_layer,
-                ..default()
-            })
-            // 音とゲームパッドは使わない。どちらも作るときに OS の機器を開くので、Windows で
-            // 起動の途中で止まることがあった（GPU の情報のあとで止まり、Lisa の処理まで来なかった）。
-            .set(render_plugin())
-            .disable::<bevy::audio::AudioPlugin>()
-            .disable::<bevy::gilrs::GilrsPlugin>(),
-    );
+    let mut primary = Window {
+        title: "Lisa — Root".into(),
+        present_mode,
+        ..default()
+    };
+    if let Some((w, h)) = parse_window_size(std::env::var("LISA_WINDOW_SIZE").ok().as_deref()) {
+        primary.resolution = bevy::window::WindowResolution::new(w, h);
+    }
+    let default_plugins = DefaultPlugins
+        .set(WindowPlugin {
+            primary_window: Some(primary),
+            ..default()
+        })
+        .set(LogPlugin {
+            // TODO: 日本語・中国語の改行位置データ（ICU4X のセグメンテーションモデル）を同梱して
+            // いないため、その警告（icu_provider::error）を止めている。ラベルを折り返すように
+            // なったら、Bevy の `complex_script_segmentation` 機能でデータを入れ、この絞り込みと
+            // Cargo.toml の icu_provider の logging 機能を外す（README の「既知の課題」を参照）。
+            filter: format!("{DEFAULT_FILTER},icu_provider=off"),
+            custom_layer: file_log_layer,
+            ..default()
+        })
+        // 音とゲームパッドは使わない。どちらも作るときに OS の機器を開くので、Windows で
+        // 起動の途中で止まることがあった（GPU の情報のあとで止まり、Lisa の処理まで来なかった）。
+        .set(render_plugin())
+        .disable::<bevy::audio::AudioPlugin>()
+        .disable::<bevy::gilrs::GilrsPlugin>();
+    // macOS では wgpu-hal 30.0.2（src/metal/surface.rs）が acquire_texture の中で
+    // NSWindow.occlusionState を参照する。PipelinedRenderingPlugin が有効だと prepare_windows が
+    // メインスレッド外の Render thread から実行され、AppKit のメインスレッド制約に反する未定義動作
+    // （可視状態でも Occluded 扱いになる等）を起こし得るため、macOS だけ無効にしてメインスレッドで描く。
+    #[cfg(target_os = "macos")]
+    let default_plugins =
+        default_plugins.disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>();
+    app.add_plugins(default_plugins);
     info!("Bevy の準備ができました");
     app.add_plugins((
         settings::SettingsPlugin,
@@ -72,8 +83,11 @@ fn main() {
         dups::DupsPlugin,
         catalog::CatalogPlugin,
         ui::catalog::CatalogPanelPlugin,
+        organize::OrganizePlugin,
+        ui::organize::OrganizePanelPlugin,
         remote::RemotePlugin,
     ));
+    app.add_plugins(render::diag::RenderDiagPlugin);
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);
     if let Some(bad) = bad_present {
@@ -170,6 +184,15 @@ fn log_startup(backend: &str, present_mode: &str, update_mode: &str) {
             Err(err) => warn!("{err}"),
         }
     }
+}
+
+/// 環境変数 `LISA_WINDOW_SIZE`（例: `960x600`）からウィンドウの大きさ（論理ピクセル）を読む。
+fn parse_window_size(raw: Option<&str>) -> Option<(u32, u32)> {
+    let s = raw?.trim();
+    let (w, h) = s.split_once('x').or_else(|| s.split_once('X'))?;
+    let w: u32 = w.trim().parse().ok()?;
+    let h: u32 = h.trim().parse().ok()?;
+    Some((w.clamp(640, 3840), h.clamp(400, 2160)))
 }
 
 /// 環境変数 `LISA_PRESENT_MODE` から `PresentMode` と起動ログ用の名前を決める。

@@ -105,6 +105,18 @@ mod imp {
         PINCH_TOUCHING.load(Ordering::Relaxed)
     }
 
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: ピンチの指の状態を上書きする。
+    pub(crate) fn set_pinch_touching(touching: bool) {
+        PINCH_TOUCHING.store(touching, Ordering::Relaxed);
+    }
+
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: スクロール 1 件をキューへ積む。
+    pub(crate) fn inject_scroll(record: RawScroll) {
+        if let Ok(mut queue) = QUEUE.lock() {
+            queue.push(record);
+        }
+    }
+
     pub fn drain() -> Vec<RawScroll> {
         QUEUE
             .lock()
@@ -128,6 +140,11 @@ mod imp {
     pub fn pinch_touching() -> bool {
         false
     }
+
+    pub(crate) fn set_pinch_touching(_touching: bool) {}
+
+    pub(crate) fn inject_scroll(_record: RawScroll) {}
 }
 
 pub use imp::{drain, install, pinch_touching};
+pub(crate) use imp::{inject_scroll, set_pinch_touching};

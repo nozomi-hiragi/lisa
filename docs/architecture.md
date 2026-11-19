@@ -17,7 +17,8 @@ src/
   render/ear.rs            フォルダの耳とファイルの名前（ズームに合わせて大きさを変える）
   render/shapes.rs         四角・三角・円・画像・文字を描く道具、見えないほど小さいものを省く
   render/preview.rs        ファイルの仮のプレビュー（拡張子ごとの絵）
-  render/cache.rs          フォルダの中身を画像に焼くキャッシュ（render to texture）
+  render/cache.rs          開いたフォルダの中身を画像に撮って残すキャッシュ（`CONTENT_LAYER` のみ 1 枚撮影・WebP 保存）
+  render/diag.rs           描画状態の診断ログ（`LISA_RENDER_DIAG=1` で 1 秒ごとにカメラ・スワップチェーン等を記録）
   render/status.rs         読み込みの状態ごとのタイルの見た目（枠だけ、脈打つ光、暗い膜、×）
   render/tag.rs            カタログの札、役割で暗くする膜、パネルで選んだ当たりの枠（本物の場面だけ）
   scan.rs                  本物のフォルダを裏のスレッドで読んで木に足す（DB からの出し入れと監視）
@@ -25,6 +26,7 @@ src/
   dups.rs                  重複の一覧を裏で作り、選んだ組のコピーを木の上で光らせる
   catalog.rs               カタログを裏で DB に当て、札と役割の印を決める、仕分けを書く、重複の一覧を並べ直す
   catalog/lan.rs           LAN の相手のカタログの当たりを読み、相手の木に印を付ける、相手の型を取り込む
+  organize.rs              整理の計画を裏で 2 秒ごとに見張り、許可された計画を実行・取り消し・期限切れの掃除をする
   view.rs                  開いている場所（Nav）、場面の切り替え、クリック、飛ぶ、並べ直し
   view/camera.rs           枠に合わせる位置と倍率、ズームのアニメーション、描画頻度
   view/fade.rs             場面のフェード
@@ -40,8 +42,9 @@ src/
   ui/progress.rs           読み込み中・ハッシュ中のリスト（画面左下）
   ui/dups.rs               重複の一覧のパネル（画面右側）
   ui/catalog.rs            カタログのパネル（画面右側。当たり、今のフォルダの仕分け、大きな未分類、LAN の相手）
+  ui/organize.rs           整理の許可ポップアップ、移動先選びの案内、履歴のパネル（画面右側）
   ui/tooltip.rs            タイルにカーソルを止めると出す情報（ツールチップ）
-  ui/context_menu.rs       タイルを右クリックしたときのメニュー
+  ui/context_menu.rs       タイルを右クリックしたときのメニュー（開く、親へ戻る、コピー、表示、移動、削除）
   settings.rs              設定（settings.json への保存と、ポップアップの項目）
   debug.rs                 デバッグビルドで FPS をタイトルに出す
   remote.rs                外（lisa-mcp）からの頼みを受けて画面を動かす（飛ぶ、重複の一覧、読み直し、一時停止）
@@ -62,14 +65,17 @@ crates/lisa-core/          スキャンの中身（Bevy に依存しない）
   src/catalog/content.rs   中身の条件（content、content_bytes、hash、size、head）
   src/catalog/eval.rs      木（Tree）と中身の読み方（Reader）に対する当てはめと役割
   src/catalog/db.rs        DB の木への当てはめ、catalog_match、content_check、assignment、大きな未分類
+  src/organize.rs          整理の計画・確かめ・隔離・実行・取り消し（organize/{plan,check,quarantine,apply}.rs）
   src/remote.rs            起動中のアプリを外から動かす口（127.0.0.1 と control.json、1 行の JSON）
 crates/lisa-scan/          lisa-core を Bevy なしで試す CLI
-  src/main.rs              ls、tree、drives、dups、snapshots、catalog、remote-logs、remote-update、remote-app
+  src/main.rs              ls、tree、drives、dups、snapshots、catalog、plan、remote-logs、remote-update、remote-app
+  src/plan.rs              整理の計画の CLI（create、list、show、approve、reject、undo、purge）
   src/share.rs             LAN の他の PC へファイルを HTTP で渡す簡易サーバー
 crates/lisa-mcp/           MCP のサーバー（標準入出力と Streamable HTTP。DB を読む道具と、アプリを動かす・更新する道具）
   src/main.rs              起動オプション（--listen、--token、--parent、--linger）と待ち受け
   src/lib.rs               MCP の道具一式、認証、ペアリング、sidecar 管理、バイナリ更新
   src/catalog.rs           カタログの道具（一覧、当たり、未分類、形の要約、試す、保存、仕分け）
+  src/organize.rs          整理の道具（計画作成、状態・待機、一覧、取り下げ、取り消し。許可は作らない）
 docs/                      このドキュメント
 assets/fonts/              Noto Sans JP と、そのライセンス
 ```
@@ -81,20 +87,48 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 
 `view.rs` の `TreeViewPlugin` が、毎フレーム次の順に動かします（`.chain()`）。
 
-1. `cache::bake` — フォルダの画像を作る（鍵が変わったものだけ。ディスクにあれば読み、無ければ焼く）
-2. `show_baked` / `jump` / `relayout` / `reanchor` / `show_relayout` — 焼き上がりや一覧からのジャンプ、並べ直し、基準の付け替えに
-   合わせて、今の場面を作り直す
-3. `navigate` — クリック、Esc、メニューの「開く」「親へ戻る」
-4. `gesture` — トラックパッドとマウスのジェスチャー、離したあとの動き
-5. `refit_on_resize` / `follow_side_panel` — ウィンドウの大きさや右の一覧の幅が変わったら合わせ直す
-6. `animate_camera` — クリックや Esc で移るときのズームのアニメーション
-7. `update_ears` — カメラの倍率に合わせて耳の大きさを直す
-8. `fade_scenes` — 場面のフェード
-9. `pulse_loading` — 読み込み中のタイルの光を脈打たせる（光があるあいだは描き続ける）
-10. `keep_redrawing` — 動いている間だけ、次のフレームを頼む
-11. `update_title` — タイトルの書き換え（変わったときだけ）
+1. `check_sync_triggers` — 耳の高さ設定変更・木の増分変化・孤立検知を調べて `SyncRequest` を立て、開いたフォルダが変わったら `SceneVisit` を進める
+2. `sync_view` — コア主導・GUI 主導の同期口（`Reset` / `RelayoutKeepView` / `RedrawScene`）。`Location` から `Nav`・`Layouts`・`CurrentScene`・`MainCamera`・パンくずを一括でそろえる（操作中は保留）
+3. `reanchor` — 開いている場面のフォルダが `Layouts::anchor` と違うまま止まったら、そのフォルダを基準にして座標・カメラ・場面をそろえ直す
+4. `navigate` — クリック、Esc、メニューの「開く」「親へ戻る」（`Location` と `Nav` を同時に書き換え、`Animating` を始める）
+5. `gesture` — トラックパッドとマウスのジェスチャー、離したあとの動き（`refocus` / `focus_node` で `Location` と `Nav` を同時に書き換える）
+6. `refit_on_resize` / `follow_side_panel` — ウィンドウの大きさや右の一覧の幅が変わったら合わせ直す
+7. `animate_camera` — クリックや Esc で移るときのズームのアニメーション
+8. `update_ears` — カメラの倍率に合わせて耳の大きさを直す
+9. `fade_scenes` — 場面のフェード
+10. `cache::update_thumbnails` — 読み戻し結果・ディスク読込の反映、見えている子フォルダの WebP 読み込み、開いたフォルダが落ち着いたら `CONTENT_LAYER` を 1 枚撮って保存
+11. `pulse_loading` — 読み込み中のタイルの光を脈打たせる（光があるあいだは描き続ける）
+12. `keep_redrawing` — 動いている間だけ、次のフレームを頼む
+13. `update_title` — タイトルの書き換え（変わったときだけ）
 
-メニューの処理（`MenuSystems`）、木を読む処理（`scan.rs`）、LAN の処理（`lan.rs` の `sync_share_listener`、`poll_discovery`、`poll_incoming_pairs`、`poll_worker_events`、`request_remote_nodes`、`update_lan_ui`）は、これより先に動きます。
+メニューの処理（`MenuSystems`）、木を読む処理（`scan.rs`）、LAN の処理（`lan.rs` の `sync_share_listener`、`poll_discovery`、`poll_incoming_pairs`、`poll_worker_events`、`request_remote_nodes`、`update_lan_ui`）は、これより先に動きます。ただし操作中（`Animating` / `Fade` / `Gesture::active`）は、`scan.rs` と `lan.rs` の木への反映・読み込み要求・`JumpTo` を保留し、操作が止まってから木に当てて `sync_view` でそろえます。
+
+## 状態の正と不変条件（書き換え箇所と同期の決まり）
+
+開いている場所の「正」は `view::Location`（手元は DB の `entry.id` の道のり `Local(Vec<i64>)`、それ以外は Root からの名前の道のり `Named(Vec<String>)`）の 1 つだけです。`Nav.stack`（`NodeId` の列）は、`Location` を現在の `FileTree` に解決した派生ビューとして扱います。
+
+### 書き換え箇所の一覧
+
+| 状態 | 書き換える場所 |
+| --- | --- |
+| `FileTree`（構造変更） | `scan.rs` の `receive`（`Changed` で `reset_children`）・`load_visible`、`lan.rs` の `poll_discovery`・`poll_worker_events`（401 時の `reset_unauthorized_device`）・`request_remote_nodes`。いずれも操作中（`Animating` / `Fade` / `Gesture::active`）は受け取りを保留する。 |
+| `Location`（正の場所） | コア主導: `scan.rs` の `resolve_jump`（`JumpTo` → `Location::Local`＋`SyncMode::Reset`）、`view.rs` の `sync_view`（解決後の最深ノードへ補正）。GUI 主導: `view.rs` の `navigate`、`input/settle.rs` の `switch_focus`・`focus_node`。 |
+| `Nav` | `view.rs` の `setup`・`sync_view`（`Reset`）・`navigate`、`input/settle.rs` の `switch_focus`・`focus_node`。`scan.rs` は `Nav` を直接切り詰めない。 |
+| `Layouts` | `view.rs` の `setup`・`sync_view`（`Reset` / `RelayoutKeepView`）・`reanchor`。 |
+| `CurrentScene`（レイヤー 0） | `view.rs` の `setup`・`sync_view`・`reanchor`・`change_scene`、`view/camera.rs` の `animate_camera`（`then_show` 時のフェードイン）、`input/settle.rs` の `show_parent_if_zoomed_out`・`switch_focus`・`focus_node`。 |
+| `Gesture::parent_scene` | `input/settle.rs` の `show_parent_if_zoomed_out`・`switch_focus`・`focus_node`・`coast_step`、`view.rs` の `navigate`・`sync_view`（`Reset` / `RelayoutKeepView` / `RedrawScene`）。`Gesture` の外へ漏らさない。 |
+| `Fade` | 付与: `view.rs` の `change_scene`（`fade_in: false`）・`view/camera.rs` の `animate_camera`（`fade_in: true, replaces: Some(old)`）。終了・破棄: `view/fade.rs` の `fade_scenes`（完了時に `replaces` または自身を despawn）、`input/gesture.rs`（割り込み時に即完了扱いにして同フレームの `fade_scenes` で片付け）、`view.rs` の `sync_view(Reset)`（全レイヤー 0 `SceneRoot` 一括掃除）。`Fade` 中は `RedrawScene` / `RelayoutKeepView` を走らせず、`replaces` の孤立を防ぐ。 |
+| `MainCamera` | `view.rs` の `setup`・`sync_view`・`reanchor`・`follow_side_panel`、`view/camera.rs` の `refit_on_resize`・`animate_camera`、`input/gesture.rs`・`input/settle.rs`。すべて `scale > 0 && is_finite()` を守る。 |
+| `Breadcrumb` / `MenuBreadcrumb` | `view.rs` の `sync_view`・`reanchor`・`navigate`、`input/settle.rs` の `switch_focus`・`focus_node`（すべて `show_breadcrumb` 経由）。 |
+
+### 守るべき不変条件
+
+1. **木と正の場所の整合**: `nav.stack` の先頭から末尾まですべて `FileTree::ROOT` につながっている（`tree.is_attached`）。`layouts.anchor` も `ROOT` につながっており、`nav.top()` は常に `layouts` に含まれ、枠の大きさが正で有限である。
+2. **パンくずの一致**: 止まったあと、`Breadcrumb` と `MenuBreadcrumb` は常に `nav.stack` の名前列（`" / "` 区切り）と一致する。
+3. **レイヤー 0 の `SceneRoot` の数**: 止まったあと、`CONTENT_LAYER`（レイヤー 0）の `SceneRoot` は 1 個（親の場面を下に敷いているときは 2 個）、動作中（ズーム中・フェード中）も 1〜2 個に限られる。座標系を替えるとき（`sync_view(Reset)`・`reanchor`）は既存のレイヤー 0 `SceneRoot` をすべて消してから作り直す。
+4. **カメラの有限性と範囲**: `MainCamera` の位置と倍率は常に有限かつ倍率 > 0。止まったあとの倍率は開いているものの `fit` 倍率と見合う範囲（`fit / MAX_ZOOM_IN ..= root_fit`）に収まる。
+5. **操作中の木の不変性**: `Animating` / `Fade` / `Gesture::active` のあいだは裏の読み直し・LAN イベント・`JumpTo` を保留し、操作完了後に木へ当てて `sync_view` で 1 回そろえる。
+6. **サムネの色とレイヤー分離**: `CONTENT_LAYER`（0）に中身、`OVERLAY_LAYER`（1）に重複の印・カタログの札と暗い膜・読み込み中の光を分け、`MainCamera` は両方を、サムネ撮影カメラは `CONTENT_LAYER` のみを映す。撮影・読み込みともに `TextureFormat::Rgba8UnormSrgb`（`view_formats` 不使用）に統一する。
 
 ## 本物のフォルダを読む
 
@@ -273,23 +307,13 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 
 ## 画像キャッシュ
 
-- フォルダごとに 1 枚の画像（本体だけ、1024×724 px）を持ち、画面に映らない専用のカメラで焼きます
-  （`RenderLayers` で分け、深いフォルダほど先に描く）。親の画像には、焼き上がった子の画像が
-  入ります。
-- 画像ごとに鍵（`cache::Key`、blake3）を持ちます。鍵は、その画像に描かれるものから作ります:
-  見た目の設定（画像の大きさ、耳の大きさ、描き方の版 `DRAW_VERSION`）、端末、子の種類・名前・状態、
-  画像を持つ子はその子の鍵。鍵が変わったものだけを作り直します。いずれフォルダのハッシュ
-  （[schema.md](schema.md) の `folder_image`）に置き換えます。
-- 焼いた画像は GPU から読み戻して（`ReadbackOnce`）、裏のスレッドで WebP（非可逆、品質 85）にして
-  `~/Library/Caches/Lisa/folder-images/<鍵>.webp` に残します。作り直すとき、同じ鍵のファイルが
-  あれば焼かずに裏のスレッドで読んで貼ります（読み終えるまで待ってから、残りを焼く）。
-  画像を読むたびにファイルの更新日時を付け直し（最後に使った日時）、起動したときに裏のスレッドで、
-  30 日使っていないものと、全部で 1 GiB を超える分の古いものから消します（`cache::sweep`）。鍵は見た目の
-  状態からも作るので、どの鍵がもう要らないかは決められず、使った日時で決めます。
-- 作るのは、並べてあるもの（下の「基準のフォルダ」）だけです。並ばなくなったものは捨てます。
-  作り直している間は、前の画像をそのまま見せます。
-- 半透明の色を画像に焼くと色が変わるので、枠や紙の色は「下の色に重ねた結果」を不透明な色として
-  計算して描いています（`render/shapes.rs` の `over`）。
+- 先読みで焼く仕組みは持たず、**フォルダを開いて本物の場面が描かれたタイミング**で、そのフォルダの本体の範囲（`layouts[folder].frame`）だけを 1024×724 px の画像として 1 枚撮り、ディスクとメモリに保存します（`render/cache.rs` の `update_thumbnails`）。
+- 本物の場面は `CONTENT_LAYER`（レイヤー 0: 枠・中身・耳・プレビュー）と `OVERLAY_LAYER`（レイヤー 1: 重複の印・カタログの札と暗い膜・読み込み中の光）に分けてあり、`MainCamera` は両方を、サムネ撮影用の一時カメラは `CONTENT_LAYER` のみを映します。そのため、重複の印・カタログの印・パルス・UI やツールチップはサムネに入りません。
+- もう一度同じフォルダを開き直したら、その時点の見た目で撮り直して上書きします。まだ一度も開いていないフォルダは、ディスクに前回の画像があれば裏スレッドで読んで貼り、無ければ画像なし（空の枠）で描きます。サムネ撮影・読み込みは `sync_view` や `reanchor` を一切ブロックしません。
+- フォルダごとの鍵（`cache::Key`、blake3）は、描き方の版 `DRAW_VERSION`（現在 `2`）・画像幅と、手元のフォルダならディスク上のパス、LAN の相手のフォルダなら端末 ID ＋端末以下の名前の道のり（その他は Root からの名前の道のり）から作ります。`FolderImages` も `NodeId` ではなく `Key` で持つため、読み直し（`reset_children`）でノード番号が変わっても画像が消えません。中身が変わったフォルダも、開き直すまでは前回のサムネのまま見せます。
+- 撮った画像は GPU から読み戻し（`ReadbackOnce`）、裏のスレッドで WebP（非可逆、品質 85）にして `~/Library/Caches/Lisa/folder-images/<鍵>.webp` に残します。撮影用の描画先（`target_image`）も、読み戻し・ディスク読込から作るテクスチャ（`loaded_image`）も同じ `TextureFormat::Rgba8UnormSrgb`（`view_formats` 不使用、OpenGL 安全）にそろえているため、撮影直後と再読込後で色が一致します。
+- 画像を読むたびにファイルの更新日時を付け直し、起動時に裏スレッドで 30 日使っていないものと全部で 1 GiB を超える分の古いものから消します（`cache::sweep`）。
+- 半透明の色を画像に撮ると色が変わるので、枠や紙の色は「下の色に重ねた結果」を不透明な色として計算して描いています（`render/shapes.rs` の `over`）。
 
 ## LAN の他の PC の Lisa を見る（`lan.rs`）
 
@@ -307,6 +331,21 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 - ズーム、ばね、フェード、ジェスチャーの最中だけ、毎フレーム `RequestRedraw` を送ります。
   垂直同期でディスプレイのリフレッシュレートになります。
 - デバッグビルドでは、タイトルの FPS とフレーム数で確かめられます（F3）。
+- **macOS でのパイプライン描画の無効化と隠れ時の制御**:
+  - macOS では `PipelinedRenderingPlugin` を外してメインスレッドで描画します（`main.rs`）。
+    `wgpu-hal` 30.0.2 の Metal バックエンドが `acquire_texture` 内で `NSWindow.occlusionState`
+    を参照しており、パイプライン描画が有効だとメインスレッド外の Render thread から AppKit の
+    `NSWindow` に触れる未定義動作（可視状態でも `Occluded` と誤認される等）になり得るためです。
+  - ウィンドウが最小化・他の窓の裏・別スペース等で完全に隠れている（`WindowOccluded(true)`）
+    あいだは、macOS の `wgpu-hal` が `SurfaceError::Occluded` を返して `present()` が飛ばされ、
+    垂直同期が効かなくなります。そのため隠れている間はサムネ撮影や `pulse_loading`・`keep_redrawing`・
+    重複計算の `RequestRedraw` を止めて CPU 暴走を防ぎ、再び見えたとき（`WindowOccluded(false)` /
+    `WindowFocused(true)`）に 1 回描き直します。
+  - 同じく隠れている間はスワップチェーンが取れず Bevy 0.20 の `Screenshot::primary_window()` が
+    全画素 `(0,0,0)` の画像を保存してしまうため、`Command::Capture`（`remote.rs`）は理由付きの
+    エラーを返します。
+  - 環境変数 `LISA_RENDER_DIAG=1` を付けると、デバッグ・リリースを問わず 1 秒ごとにカメラや
+    スワップチェーンの状態をログへ出します（`render/diag.rs`）。
 
 ## 今後
 

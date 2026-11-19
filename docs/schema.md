@@ -143,6 +143,44 @@ Lisa が SQLite に残すものと、残さないものをまとめます。
 カタログの当たり、中身の条件の結果、1 か所の仕分けです。列は [catalog.md](catalog.md) の
 「保存するデータ（DB）」にあります。
 
+## plan・plan_op（整理の計画）
+
+ファイルの移動・フォルダの作成・隔離フォルダへの退避・取り消しの計画と、1 件ごとの記録です。
+詳しくは [organize.md](organize.md) を見てください。
+
+### plan（計画）
+
+| 列 | 中身 |
+|---|---|
+| `id` | 計画の番号 |
+| `state` | `pending` / `approved` / `running` / `done` / `partial` / `rejected` / `cancelled` / `expired` / `undone` |
+| `by` | 作った人（`mcp:stdio`・`mcp:http`・`mcp:<相手名>`・`user`・`cli`） |
+| `note` | 計画の説明（任意） |
+| `summary` | 作ったときの要約（JSON: 件数、動く大きさ、空く大きさ、危ないものの数など） |
+| `skip_risky` | 危ないものを除いて許可したか（0 / 1） |
+| `created_at` | 作った日時 |
+| `decided_at` | 許可・拒否・取り下げ・期限切れが決まった日時 |
+| `finished_at` | 実行が終わった日時 |
+| `purged_at` | 隔離フォルダから OS のゴミ箱へ送った日時 |
+
+### plan_op（計画の中の 1 件の操作）
+
+| 列 | 中身 |
+|---|---|
+| `plan_id` / `seq` | 計画の番号と、計画の中の順番（0 始まり） |
+| `op` | `mkdir` / `move` / `trash` |
+| `drive_id` | 対象のドライブ ID |
+| `src` | 元の絶対パス（`mkdir` は作るパス） |
+| `dst` | `move` は行き先、`trash` は隔離した場所（実行後）、`mkdir` は新しく作った一番上のフォルダ（すでにあったときは空） |
+| `keep` | `trash` で残す方のパス（任意） |
+| `size` | 作ったときの大きさ（フォルダは中の合計） |
+| `mtime` | 作ったときの更新日時 |
+| `hash` | 作ったときのハッシュ（blake3） |
+| `risky` | 危ない理由（無ければ空） |
+| `state` | `pending` / `running` / `done` / `skipped` / `failed` / `undone` |
+| `reason` | `skipped`・`failed` の理由 |
+| `done_at` | 終わった日時 |
+
 ## 残さないもの
 
 権限、所有者、作成日時、拡張属性、Finder のタグ、ACL。今の使い方（重複を見つけて整理する）には

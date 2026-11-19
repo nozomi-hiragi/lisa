@@ -7,7 +7,7 @@
 //! 選んだ組のコピーは、木にあれば太い枠（`DupHighlight::copies`）、まだ木に出していなければ、
 //! 出してある一番深い祖先に細い枠（`around`）を付ける（`render/scene.rs` の `mark_duplicate`）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, channel};
 
@@ -16,7 +16,7 @@ use bevy::window::RequestRedraw;
 use lisa_core::dups::Group;
 
 use crate::model::tree::{FileTree, NodeId};
-use crate::render::cache::BakeFinished;
+use crate::view::SyncRequest;
 
 /// 一覧に出す組の数の上限。
 const MAX_GROUPS: usize = 300;
@@ -138,6 +138,7 @@ pub struct DupHighlight {
 fn compute(
     mut dups: ResMut<Dups>,
     mut was_open: Local<bool>,
+    occluded: Res<crate::view::WindowOccludedState>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     let opened = dups.open && !*was_open;
@@ -161,8 +162,10 @@ fn compute(
     let DupsState::Computing { receiver, .. } = &dups.state else {
         return;
     };
-    // 止まっている間も、できたかを見に来られるようにする。
-    redraw.write(RequestRedraw);
+    // 止まっている間も、できたかを見に来られるようにする（窓が隠れている間は 1 秒周期に任せる）。
+    if !occluded.0 {
+        redraw.write(RequestRedraw);
+    }
     let found = receiver.lock().ok().and_then(|r| r.try_recv().ok());
     match found {
         Some(Found::Previous(groups)) => {
@@ -188,35 +191,35 @@ fn compute(
     }
 }
 
-/// 選んだ組と木から、印を付けるノードを決める。変わったら、本物の場面を作り直す。
+/// 選んだ組（または整理の計画の対象）と木から、印を付けるノードを決める。変わったら、本物の場面を作り直す。
 fn update_highlight(
-    mut commands: Commands,
     dups: Res<Dups>,
+    plan_hl: Option<Res<crate::organize::PlanHighlightChains>>,
     tree: Res<FileTree>,
     mut highlight: ResMut<DupHighlight>,
+    mut sync: ResMut<SyncRequest>,
 ) {
-    if !dups.is_changed() && !tree.is_changed() {
+    let plan_changed = plan_hl.as_ref().is_some_and(|p| p.is_changed());
+    if !dups.is_changed() && !tree.is_changed() && !plan_changed {
         return;
     }
-    let mut next = DupHighlight::default();
+    let mut chains: Vec<&[i64]> = Vec::new();
     if let (true, Some(group)) = (dups.open, dups.selected.and_then(|i| dups.groups().get(i))) {
-        let by_entry: HashMap<i64, NodeId> = tree
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(id, node)| node.entry.map(|e| (e, id)))
-            .collect();
-        for copy in &group.copies {
+        chains.extend(group.copies.iter().map(|c| c.chain.as_slice()));
+    }
+    if let Some(plan_hl) = &plan_hl {
+        chains.extend(plan_hl.0.iter().map(Vec::as_slice));
+    }
+
+    let mut next = DupHighlight::default();
+    if !chains.is_empty() {
+        for chain in chains {
             // 木に出ている一番深いところまでたどる。
-            let found: Vec<NodeId> = copy
-                .chain
-                .iter()
-                .map_while(|e| by_entry.get(e).copied())
-                .collect();
+            let found: Vec<NodeId> = chain.iter().map_while(|&e| tree.node_by_entry(e)).collect();
             let Some(&deepest) = found.last() else {
                 continue;
             };
-            if found.len() == copy.chain.len() {
+            if found.len() == chain.len() {
                 next.copies.insert(deepest);
             } else {
                 next.around.insert(deepest);
@@ -244,7 +247,7 @@ fn update_highlight(
     }
     if *highlight != next {
         *highlight = next;
-        // 印は本物の場面にだけ描くので、場面を作り直す。
-        commands.insert_resource(BakeFinished);
+        // 印は本物の場面にだけ描くので、操作が止まったタイミングで場面を作り直す。
+        sync.request_redraw();
     }
 }

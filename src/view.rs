@@ -12,14 +12,16 @@ use bevy::ecs::system::SystemParam;
 use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
-use bevy::window::{PrimaryWindow, RequestRedraw, WindowResized};
+use bevy::window::{PrimaryWindow, RequestRedraw, WindowFocused, WindowOccluded, WindowResized};
 use bevy::winit::{UpdateMode, WinitSettings};
 
 use crate::layout::{EarSpec, Layouts, anchor_body, fitted_size, layout};
 use crate::model::tree::{FileTree, NodeId};
-use crate::render::cache::{self, Bake, BakeFinished, FolderImages};
+use crate::render::cache::{self, FolderImages, ThumbnailCapture};
 use crate::render::ear::{EarSizes, update_ears};
-use crate::render::scene::{self, BACKGROUND, LabelFont, SceneRoot, SceneSource};
+use crate::render::scene::{
+    self, BACKGROUND, CONTENT_LAYER, LabelFont, OVERLAY_LAYER, SceneRoot, SceneSource,
+};
 use crate::render::shapes::BaseAlpha;
 use crate::settings::Settings;
 use crate::ui::menu::{BAR_PX, MenuBreadcrumb, MenuSystems, Popup};
@@ -31,13 +33,22 @@ mod title;
 pub use camera::Busy;
 pub(crate) use camera::{
     Animating, Ease, MainCamera, ZOOM_SECONDS, animate_camera, fit, keep_redrawing,
-    refit_on_resize, set_catalog_side_px, set_side_px, side_px, view_width,
+    refit_on_resize, set_catalog_side_px, set_organize_side_px, set_side_px, side_px, view_width,
 };
 pub(crate) use fade::{Fade, fade_scenes};
 pub use title::TitleSuffix;
 pub(crate) use title::{Breadcrumb, show_breadcrumb, update_title};
 
 pub struct TreeViewPlugin;
+
+/// 画面のウィンドウが最小化・他の窓の裏・別スペース等で完全に隠れているか。
+///
+/// 隠れているあいだは macOS の wgpu-hal が `SurfaceError::Occluded` を返して `present()` が
+/// 飛ばされるため、`RequestRedraw` を出し続けると VSync 無しで CPU が暴走する。
+/// また Bevy 0.20 の `Screenshot::primary_window()` はスワップチェーンが無いと全画素 (0,0,0) の
+/// PNG を保存するため、この状態で隠れ中を検知して防ぐ。
+#[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowOccludedState(pub bool);
 
 /// 画面の処理（木を読む処理 `scan.rs` は、この前に動く）。
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
@@ -47,16 +58,21 @@ impl Plugin for TreeViewPlugin {
     fn build(&self, app: &mut App) {
         let (update_settings, _) = update_settings_from_env();
         app.insert_resource(update_settings)
-            .insert_resource(ClearColor(BACKGROUND))
+            .insert_resource(Location::root())
             .insert_resource(Nav {
                 stack: vec![Level {
                     node: FileTree::ROOT,
                 }],
             })
-            .insert_resource(Bake::Waiting)
+            .init_resource::<SyncRequest>()
+            .insert_resource(SceneVisit(1))
+            .init_resource::<LastSceneKey>()
+            .init_resource::<ThumbnailCapture>()
             .insert_resource(cache::ImageCache::new())
+            .insert_resource(ClearColor(BACKGROUND))
             .insert_resource(Breadcrumb("Root".into()))
             .init_resource::<Busy>()
+            .init_resource::<WindowOccludedState>()
             .init_resource::<crate::render::status::PulseClock>()
             .init_resource::<crate::input::gesture::Gesture>()
             .init_resource::<crate::input::gesture::TrackpadInput>()
@@ -64,15 +80,13 @@ impl Plugin for TreeViewPlugin {
                 Startup,
                 (setup, crate::input::gesture::install_scroll_monitor),
             )
+            .add_systems(PreUpdate, track_window_occlusion)
             .add_systems(
                 Update,
                 (
-                    cache::bake,
-                    show_baked,
-                    jump,
-                    relayout,
+                    check_sync_triggers,
+                    sync_view,
                     reanchor,
-                    show_relayout,
                     navigate,
                     crate::input::gesture::gesture,
                     refit_on_resize,
@@ -80,6 +94,7 @@ impl Plugin for TreeViewPlugin {
                     animate_camera,
                     update_ears,
                     fade_scenes,
+                    cache::update_thumbnails,
                     crate::render::status::pulse_loading,
                     keep_redrawing,
                     update_title,
@@ -91,7 +106,133 @@ impl Plugin for TreeViewPlugin {
     }
 }
 
-/// 開いてきた道のり。最後が今フィーチャーしている（枠が画面いっぱいに映っている）もの。
+/// ウィンドウの隠れ・復帰を追う。再び見えるようになったとき（またはフォーカスが戻ったとき）は
+/// 明示的に 1 回描き直しを頼む。
+fn track_window_occlusion(
+    mut occluded_events: MessageReader<WindowOccluded>,
+    mut focused_events: MessageReader<WindowFocused>,
+    primary: Query<Entity, With<PrimaryWindow>>,
+    mut state: ResMut<WindowOccludedState>,
+    mut redraw: MessageWriter<RequestRedraw>,
+) {
+    let primary_entity = primary.iter().next();
+    let mut need_redraw = false;
+    for ev in occluded_events.read() {
+        if primary_entity.is_some_and(|p| p != ev.window) {
+            continue;
+        }
+        state.0 = ev.occluded;
+        if !ev.occluded {
+            need_redraw = true;
+        }
+    }
+    for ev in focused_events.read() {
+        if primary_entity.is_some_and(|p| p != ev.window) {
+            continue;
+        }
+        if ev.focused {
+            need_redraw = true;
+        }
+    }
+    if need_redraw {
+        redraw.write(RequestRedraw);
+    }
+}
+
+/// 開いている場所の「正」。木のノード番号（`NodeId`）は読み直し（`reset_children`）で別物に
+/// なるため、読み直しをまたいで変わらない道のりで持つ。
+#[derive(Resource, Clone, Debug, PartialEq, Eq)]
+pub enum Location {
+    /// 手元の DB にあるドライブ以下: ドライブ先頭からの `entry.id` 列。
+    Local(Vec<i64>),
+    /// それ以外（Root、端末、ダミーの木、DB 無しドライブ、LAN の相手）: Root からの名前列。
+    Named(Vec<String>),
+}
+
+impl Location {
+    pub fn root() -> Self {
+        Self::Named(vec!["Root".into()])
+    }
+
+    /// 木のノード `node` から正の場所を作る。ドライブ以下がすべて DB の `entry.id` を持てば
+    /// `Local`、そうでなければ Root からの名前列 `Named`。
+    pub fn from_tree(tree: &FileTree, node: NodeId) -> Self {
+        let Some(path) = tree.path_from_root(node) else {
+            return Self::root();
+        };
+        if let Some(first_entry) = path.iter().position(|&id| tree.nodes[id].entry.is_some())
+            && path[first_entry..]
+                .iter()
+                .all(|&id| tree.nodes[id].entry.is_some())
+        {
+            let chain: Vec<i64> = path[first_entry..]
+                .iter()
+                .filter_map(|&id| tree.nodes[id].entry)
+                .collect();
+            if !chain.is_empty() {
+                return Self::Local(chain);
+            }
+        }
+        Self::Named(
+            path.into_iter()
+                .map(|id| tree.nodes[id].name.clone())
+                .collect(),
+        )
+    }
+}
+
+/// 画面（配置・場面・カメラ・パンくず）を正の場所からそろえ直す頼み。
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncRequest {
+    pub mode: Option<SyncMode>,
+    /// `RelayoutKeepView` 時にカメラを今の枠へ合わせ直す（耳の高さ設定変更など）。
+    pub refit: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SyncMode {
+    /// 今の場面だけ描き直す（重複・カタログの印、ディスクからサムネを読めたとき）。操作中は待つ。
+    RedrawScene = 1,
+    /// 木に子が足された・設定が変わった: 今の基準で並べ直し、場面を作り直す。操作中は待つ。
+    RelayoutKeepView = 2,
+    /// 構造リセット（`reset_children`）・外部ジャンプ（`JumpTo`）・孤立復旧:
+    /// `Location` から `Nav`・`Layouts`・`CurrentScene`・`MainCamera`・パンくずを一括で作り直す。
+    Reset = 3,
+}
+
+impl SyncRequest {
+    fn upgrade(&mut self, mode: SyncMode) {
+        if self.mode.is_none_or(|cur| mode > cur) {
+            self.mode = Some(mode);
+        }
+    }
+
+    pub fn request_redraw(&mut self) {
+        self.upgrade(SyncMode::RedrawScene);
+    }
+
+    pub fn request_relayout(&mut self, refit: bool) {
+        self.upgrade(SyncMode::RelayoutKeepView);
+        if refit {
+            self.refit = true;
+        }
+    }
+
+    pub fn request_reset(&mut self) {
+        self.upgrade(SyncMode::Reset);
+    }
+}
+
+/// 今開いているフォルダへの訪問番号。別のフォルダへ移る／開き直す／リセットするたびに進み、
+/// `cache::update_thumbnails` が「この訪問をまだ撮っていない」と判断してサムネを撮り直す。
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct SceneVisit(pub u64);
+
+/// 直前に見ていた場面フォルダのサムネ鍵（開き直し検知用）。
+#[derive(Resource, Default)]
+struct LastSceneKey(Option<cache::Key>);
+
+/// 開いてきた道のり（`Location` を現在の木へ解決した派生ビュー）。最後が今フィーチャーしているもの。
 #[derive(Resource)]
 pub(crate) struct Nav {
     pub(crate) stack: Vec<Level>,
@@ -165,7 +306,7 @@ impl SceneMaker<'_, '_> {
             &mut self.materials,
             &source,
             level.node,
-            RenderLayers::layer(0),
+            RenderLayers::layer(CONTENT_LAYER),
             scale,
             true,
             &ancestors,
@@ -180,7 +321,6 @@ fn setup(
     tree: Res<FileTree>,
     settings: Res<Settings>,
     mut fonts: ResMut<Assets<Font>>,
-    mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -193,8 +333,7 @@ fn setup(
     // 最初は Root を基準にして並べる。
     let (spec, ears) = ear_spec(&settings, &window);
     let layouts = layout(&tree, FileTree::ROOT, anchor_body(), spec);
-    let mut folder_images = FolderImages::default();
-    folder_images.prepare(&tree, &layouts, &mut images);
+    let folder_images = FolderImages::default();
 
     let (pos, scale) = fit(layouts[FileTree::ROOT].frame, &window);
     // UI（メニューバーや一覧）は、木を映すカメラとは別のカメラで、ウィンドウ全体に描く
@@ -217,9 +356,11 @@ fn setup(
             ..OrthographicProjection::default_2d()
         }),
         Transform::from_translation(pos.extend(0.0)),
+        // 画面にはレイヤー 0（中身）とレイヤー 1（重複・カタログ印・パルス）の両方を映す。
+        // サムネ撮影カメラはレイヤー 0 のみを映す。
+        RenderLayers::from_layers(&[CONTENT_LAYER, OVERLAY_LAYER]),
     ));
 
-    // 画像が焼き上がるまでは、子フォルダは空の枠で見せる。
     let source = SceneSource {
         tree: &tree,
         layouts: &layouts,
@@ -235,7 +376,7 @@ fn setup(
         &mut materials,
         &source,
         FileTree::ROOT,
-        RenderLayers::layer(0),
+        RenderLayers::layer(CONTENT_LAYER),
         scale,
         true,
         &[],
@@ -261,13 +402,6 @@ fn ear_spec(settings: &Settings, window: &Window) -> (EarSpec, EarSizes) {
         preview_px: settings.ear_preview_px,
     };
     (EarSpec::new(settings, fitted.y), ears)
-}
-
-/// 配置し直したので、今の場面を作り直す。`refit` なら、カメラも開いているものに合わせ直す
-/// （基準を付け替えただけのときは、カメラはもう新しい座標に移してあるので合わせ直さない）。
-#[derive(Resource)]
-struct Relaid {
-    refit: bool,
 }
 
 /// 右の一覧が開け閉めされたら、木を映す領域（カメラの viewport）を狭め、今のものを収め直す。
@@ -306,116 +440,362 @@ fn follow_side_panel(
         return;
     }
     let (pos, scale) = fit(nav.top().frame(&layouts), &window);
+    if !(scale > 0.0 && scale.is_finite() && pos.is_finite()) {
+        return;
+    }
     transform.translation = pos.extend(0.0);
     if let Projection::Orthographic(ortho) = projection.as_mut() {
         ortho.scale = scale;
     }
 }
 
-/// 一覧から選んだ場所（`scan::JumpPath`）へ飛ぶ。その場所を含むフォルダを基準に並べ直し、
-/// カメラをその場所に合わせる（ズームの動きはしない）。動いている最中は、終わるまで待つ。
+/// 同期が必要なきっかけ（耳の高さ設定変更・木の増分変化・孤立検知）と、開いたフォルダの訪問番号を調べる。
 #[allow(clippy::too_many_arguments)]
-fn jump(
-    mut commands: Commands,
-    jump: Option<Res<crate::scan::JumpPath>>,
+fn check_sync_triggers(
     settings: Res<Settings>,
     tree: Res<FileTree>,
-    mut nav: ResMut<Nav>,
-    mut layouts: ResMut<Layouts>,
-    mut folder_images: ResMut<FolderImages>,
-    mut images: ResMut<Assets<Image>>,
-    mut bake: ResMut<Bake>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    animating: Option<Res<Animating>>,
-    fades: Query<(), With<Fade>>,
-    gesture: Res<crate::input::gesture::Gesture>,
-) {
-    let Some(jump) = jump else {
-        return;
-    };
-    if animating.is_some()
-        || !fades.is_empty()
-        || gesture.active()
-        || gesture.has_parent_scene()
-        || !matches!(*bake, Bake::Done)
-    {
-        return;
-    }
-    commands.remove_resource::<crate::scan::JumpPath>();
-    let Some(&target) = jump.0.last() else {
-        return;
-    };
-    nav.stack = jump.0.iter().map(|&node| Level { node }).collect();
-    let scene = scene_path(&nav, &tree);
-    let anchor = scene[scene.len() - 1].node;
-    let (spec, ears) = ear_spec(&settings, &window);
-    *layouts = layout(&tree, anchor, anchor_body(), spec);
-    folder_images.prepare(&tree, &layouts, &mut images);
-    commands.insert_resource(ears);
-    show_breadcrumb(&mut commands, &tree, target);
-    *bake = Bake::Waiting;
-    commands.insert_resource(Relaid { refit: true });
-}
-
-/// 大きさの設定が変わったら、木を配置し直し、画像を焼き直す。
-#[allow(clippy::too_many_arguments)]
-fn relayout(
-    mut commands: Commands,
-    settings: Res<Settings>,
-    tree: Res<FileTree>,
-    mut layouts: ResMut<Layouts>,
-    mut folder_images: ResMut<FolderImages>,
-    mut images: ResMut<Assets<Image>>,
-    mut bake: ResMut<Bake>,
-    mut pending: Local<bool>,
+    layouts: Res<Layouts>,
+    nav: Res<Nav>,
+    tree_changed: Option<Res<crate::scan::TreeChanged>>,
+    mut sync: ResMut<SyncRequest>,
+    mut visit: ResMut<SceneVisit>,
+    mut last_key: ResMut<LastSceneKey>,
     mut laid_out_with: Local<Option<[f32; 2]>>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    animating: Option<Res<Animating>>,
-    fades: Query<(), With<Fade>>,
-    gesture: Res<crate::input::gesture::Gesture>,
-    tree_changed: Option<ResMut<crate::scan::TreeChanged>>,
+    mut last_scene_node: Local<Option<NodeId>>,
 ) {
-    // 耳の高さが変わったとき（ほかの設定では配置は変わらない）か、木が変わったとき。
     let ears = [settings.ear_selected_px, settings.ear_preview_px];
     if laid_out_with.is_some_and(|h| h != ears) {
-        *pending = true;
+        sync.request_relayout(true);
     }
     *laid_out_with = Some(ears);
-    let mut tree_changed = tree_changed;
-    let tree_due = tree_changed.as_ref().is_some_and(|c| c.due());
-    // ズームや画像を焼いている途中、指で動かしている途中なら、終わってからやる。
-    let busy = animating.is_some()
-        || !fades.is_empty()
-        || gesture.active()
-        || gesture.has_parent_scene()
-        || !matches!(*bake, Bake::Done);
-    if !(*pending || tree_due) || busy {
+
+    if tree_changed.as_ref().is_some_and(|c| c.due()) {
+        sync.request_relayout(false);
+    }
+
+    if !tree.is_attached(nav.top().node)
+        || !tree.is_attached(layouts.anchor)
+        || !layouts.contains(nav.top().node)
+    {
+        sync.request_reset();
+    }
+
+    let path = scene_path(&nav, &tree);
+    let scene_node = path[path.len() - 1].node;
+    if *last_scene_node != Some(scene_node) {
+        *last_scene_node = Some(scene_node);
+        let key = cache::folder_key(&tree, scene_node);
+        if last_key.0 != key {
+            last_key.0 = key;
+            visit.0 += 1;
+        }
+    }
+}
+
+/// `sync_view` で場面を組み立てるために借りるアセット・印の束。
+#[derive(SystemParam)]
+struct SyncDrawAssets<'w> {
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<ColorMaterial>>,
+    images: Res<'w, FolderImages>,
+    font: Res<'w, LabelFont>,
+    ears: ResMut<'w, EarSizes>,
+    highlight: Res<'w, crate::dups::DupHighlight>,
+    catalog: Res<'w, crate::catalog::CatalogMarks>,
+}
+
+/// `sync_view` で参照する操作状態・木・DB の束。
+#[derive(SystemParam)]
+struct SyncCore<'w, 's> {
+    tree: ResMut<'w, FileTree>,
+    layouts: ResMut<'w, Layouts>,
+    location: ResMut<'w, Location>,
+    nav: ResMut<'w, Nav>,
+    current: ResMut<'w, CurrentScene>,
+    store: Option<Res<'w, crate::scan::Store>>,
+    scanner: Option<ResMut<'w, crate::scan::Scanner>>,
+    tree_changed: Option<ResMut<'w, crate::scan::TreeChanged>>,
+    visit: ResMut<'w, SceneVisit>,
+    last_key: ResMut<'w, LastSceneKey>,
+    _marker: std::marker::PhantomData<&'s ()>,
+}
+
+/// 画面の同期口（コア主導・GUI 主導の双方から 1 つの道筋で配置・場面・カメラ・パンくずをそろえる）。
+#[allow(clippy::too_many_arguments)]
+fn sync_view(
+    mut commands: Commands,
+    mut sync: ResMut<SyncRequest>,
+    settings: Res<Settings>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
+    animating: Option<Res<Animating>>,
+    fades: Query<(), With<Fade>>,
+    mut gesture: ResMut<crate::input::gesture::Gesture>,
+    scenes: Query<(Entity, &RenderLayers), With<SceneRoot>>,
+    mut core: SyncCore,
+    mut draw: SyncDrawAssets,
+) {
+    let Some(mut mode) = sync.mode else {
+        return;
+    };
+    let interacting = animating.is_some() || !fades.is_empty() || gesture.active();
+    let broken = !core.tree.is_attached(core.nav.top().node)
+        || !core.tree.is_attached(core.layouts.anchor)
+        || !core.layouts.contains(core.nav.top().node);
+    // 操作中は木・場面を壊さないよう保留する。万一ノードが孤立している場合だけ復旧を優先する。
+    if interacting && !(mode == SyncMode::Reset && broken) {
         return;
     }
-    // 耳の高さを変えたときは、開いているものに合わせ直す。木が変わっただけなら、見え方はそのまま。
-    let refit = *pending;
-    *pending = false;
-    if let Some(changed) = tree_changed.as_mut() {
-        changed.pending = false;
-        changed.last = Some(Instant::now());
+    sync.mode = None;
+    let refit = std::mem::take(&mut sync.refit);
+    if mode == SyncMode::RelayoutKeepView && broken {
+        mode = SyncMode::Reset;
     }
 
-    let (spec, ears) = ear_spec(&settings, &window);
-    // 基準のフォルダは同じ場所に置いたまま、耳の大きさだけ変えて並べ直す。
-    let anchor = layouts.anchor;
-    *layouts = layout(&tree, anchor, layouts[anchor].frame, spec);
-    folder_images.prepare(&tree, &layouts, &mut images);
-    commands.insert_resource(ears);
+    let main_layer = RenderLayers::layer(CONTENT_LAYER);
+    let despawn_all_main = |commands: &mut Commands, warn_expected: Option<&[Entity]>| {
+        let mut stray = 0usize;
+        for (entity, layers) in &scenes {
+            if !layers.intersects(&main_layer) {
+                continue;
+            }
+            if let Some(expected) = warn_expected
+                && !expected.contains(&entity)
+            {
+                stray += 1;
+            }
+            commands.entity(entity).despawn();
+        }
+        if stray > 0 {
+            warn!("並べ直しで想定外の場面が {stray} 個残っていたため消しました");
+        }
+    };
 
-    *bake = Bake::Waiting;
-    commands.insert_resource(Relaid { refit });
+    let (mut cam_tf, mut cam_proj) = camera.into_inner();
+    match mode {
+        SyncMode::Reset => {
+            if animating.is_some() {
+                commands.remove_resource::<Animating>();
+            }
+            let _ = gesture.clear_and_take_parent_scene();
+
+            let resolved = crate::scan::resolve_location(
+                &mut core.tree,
+                core.store.as_deref(),
+                core.scanner.as_deref_mut(),
+                &core.location,
+            );
+            core.nav.stack = resolved.into_iter().map(|node| Level { node }).collect();
+            let top_node = core.nav.top().node;
+            *core.location = Location::from_tree(&core.tree, top_node);
+
+            let path = scene_path(&core.nav, &core.tree).to_vec();
+            let folder = path[path.len() - 1].node;
+            let (spec, ears) = ear_spec(&settings, &window);
+            *core.layouts = layout(&core.tree, folder, anchor_body(), spec);
+            *draw.ears = ears;
+
+            let (cam_pos, cam_scale) = fit(core.nav.top().frame(&core.layouts), &window);
+            if cam_pos.is_finite() && cam_scale > 0.0 && cam_scale.is_finite() {
+                cam_tf.translation = cam_pos.extend(0.0);
+                if let Projection::Orthographic(ortho) = cam_proj.as_mut() {
+                    ortho.scale = cam_scale;
+                }
+            }
+
+            despawn_all_main(&mut commands, None);
+            let (_, scene_scale) = fit(path[path.len() - 1].frame(&core.layouts), &window);
+            core.current.0 = spawn_scene_raw(
+                &mut commands,
+                &mut draw,
+                &core.tree,
+                &core.layouts,
+                &path,
+                scene_scale,
+                None,
+            );
+            show_breadcrumb(&mut commands, &core.tree, top_node);
+            core.last_key.0 = cache::folder_key(&core.tree, folder);
+            core.visit.0 += 1;
+            if let Some(changed) = core.tree_changed.as_mut() {
+                changed.pending = false;
+                changed.last = Some(Instant::now());
+            }
+        }
+        SyncMode::RelayoutKeepView => {
+            if let Some(changed) = core.tree_changed.as_mut() {
+                changed.pending = false;
+                changed.last = Some(Instant::now());
+            }
+            let (spec, ears) = ear_spec(&settings, &window);
+            let anchor = core.layouts.anchor;
+            *core.layouts = layout(&core.tree, anchor, core.layouts[anchor].frame, spec);
+            *draw.ears = ears;
+
+            if refit {
+                let (cam_pos, cam_scale) = fit(core.nav.top().frame(&core.layouts), &window);
+                if cam_pos.is_finite() && cam_scale > 0.0 && cam_scale.is_finite() {
+                    cam_tf.translation = cam_pos.extend(0.0);
+                    if let Projection::Orthographic(ortho) = cam_proj.as_mut() {
+                        ortho.scale = cam_scale;
+                    }
+                }
+                core.visit.0 += 1;
+            }
+
+            let mut expected = vec![core.current.0];
+            if let Some(p) = gesture.parent_scene_entity() {
+                expected.push(p);
+            }
+            despawn_all_main(&mut commands, Some(&expected));
+
+            let keep_parent = gesture.has_parent_scene()
+                && core.nav.stack.len() >= 2
+                && core.tree.nodes[core.nav.top().node].is_dir;
+            let path = scene_path(&core.nav, &core.tree).to_vec();
+            let (_, scene_scale) = fit(path[path.len() - 1].frame(&core.layouts), &window);
+            if keep_parent {
+                let parent_path = &core.nav.stack[..core.nav.stack.len() - 1];
+                let (_, parent_scale) = fit(
+                    parent_path[parent_path.len() - 1].frame(&core.layouts),
+                    &window,
+                );
+                let parent_entity = spawn_scene_raw(
+                    &mut commands,
+                    &mut draw,
+                    &core.tree,
+                    &core.layouts,
+                    parent_path,
+                    parent_scale,
+                    Some(core.nav.top().node),
+                );
+                gesture.set_parent_scene(Some(parent_entity));
+                core.current.0 = spawn_scene_raw(
+                    &mut commands,
+                    &mut draw,
+                    &core.tree,
+                    &core.layouts,
+                    &path,
+                    scene_scale,
+                    None,
+                );
+                commands
+                    .entity(core.current.0)
+                    .insert(Transform::from_xyz(0.0, 0.0, 0.5));
+            } else {
+                let _ = gesture.take_parent_scene();
+                core.current.0 = spawn_scene_raw(
+                    &mut commands,
+                    &mut draw,
+                    &core.tree,
+                    &core.layouts,
+                    &path,
+                    scene_scale,
+                    None,
+                );
+            }
+            show_breadcrumb(&mut commands, &core.tree, core.nav.top().node);
+        }
+        SyncMode::RedrawScene => {
+            let mut expected = vec![core.current.0];
+            if let Some(p) = gesture.parent_scene_entity() {
+                expected.push(p);
+            }
+            despawn_all_main(&mut commands, Some(&expected));
+
+            let keep_parent = gesture.has_parent_scene()
+                && core.nav.stack.len() >= 2
+                && core.tree.nodes[core.nav.top().node].is_dir;
+            let path = scene_path(&core.nav, &core.tree).to_vec();
+            let (_, scene_scale) = fit(path[path.len() - 1].frame(&core.layouts), &window);
+            if keep_parent {
+                let parent_path = &core.nav.stack[..core.nav.stack.len() - 1];
+                let (_, parent_scale) = fit(
+                    parent_path[parent_path.len() - 1].frame(&core.layouts),
+                    &window,
+                );
+                let parent_entity = spawn_scene_raw(
+                    &mut commands,
+                    &mut draw,
+                    &core.tree,
+                    &core.layouts,
+                    parent_path,
+                    parent_scale,
+                    Some(core.nav.top().node),
+                );
+                gesture.set_parent_scene(Some(parent_entity));
+                core.current.0 = spawn_scene_raw(
+                    &mut commands,
+                    &mut draw,
+                    &core.tree,
+                    &core.layouts,
+                    &path,
+                    scene_scale,
+                    None,
+                );
+                commands
+                    .entity(core.current.0)
+                    .insert(Transform::from_xyz(0.0, 0.0, 0.5));
+            } else {
+                let _ = gesture.take_parent_scene();
+                core.current.0 = spawn_scene_raw(
+                    &mut commands,
+                    &mut draw,
+                    &core.tree,
+                    &core.layouts,
+                    &path,
+                    scene_scale,
+                    None,
+                );
+            }
+        }
+    }
+}
+
+fn spawn_scene_raw(
+    commands: &mut Commands,
+    draw: &mut SyncDrawAssets,
+    tree: &FileTree,
+    layouts: &Layouts,
+    path: &[Level],
+    scale: f32,
+    focus: Option<NodeId>,
+) -> Entity {
+    let (level, outer) = path.split_last().expect("場面がある");
+    let ancestors: Vec<NodeId> = outer.iter().map(|l| l.node).collect();
+    let source = SceneSource {
+        tree,
+        layouts,
+        images: &draw.images,
+        font: &draw.font.0,
+        ears: &draw.ears,
+        highlight: Some(&draw.highlight),
+        catalog: Some(&draw.catalog),
+    };
+    scene::spawn(
+        commands,
+        &mut draw.meshes,
+        &mut draw.materials,
+        &source,
+        level.node,
+        RenderLayers::layer(CONTENT_LAYER),
+        scale,
+        true,
+        &ancestors,
+        focus,
+    )
+}
+
+/// ノードが Root までつながっているか（読み直しで親から外されたノードは、つながっていない）。
+pub(crate) fn is_attached(tree: &FileTree, id: NodeId) -> bool {
+    tree.is_attached(id)
 }
 
 /// 開いている場面のフォルダが基準から外れたまま止まったら、そのフォルダを基準にして並べ直す。
 /// 深く潜っても座標が小さくなりすぎない（f32 の精度が尽きない）ようにするため。
 ///
-/// 動いている最中（ズーム、フェード、ジェスチャー、画像を焼いている途中、親の場面を下に敷いて
-/// いるとき）は待つ。カメラは同じ見え方のまま新しい座標に移し、場面を作り直して画像を焼き直す。
+/// 動いている最中（ズーム、フェード、ジェスチャー、親の場面を下に敷いているとき）は待つ。
+/// カメラは同じ見え方のまま新しい座標に移し、レイヤー 0 の場面を 1 つにそろえ直す。
 #[allow(clippy::too_many_arguments)]
 fn reanchor(
     mut commands: Commands,
@@ -423,71 +803,96 @@ fn reanchor(
     tree: Res<FileTree>,
     nav: Res<Nav>,
     mut layouts: ResMut<Layouts>,
-    mut folder_images: ResMut<FolderImages>,
-    mut images: ResMut<Assets<Image>>,
-    mut bake: ResMut<Bake>,
+    mut current: ResMut<CurrentScene>,
+    mut sync: ResMut<SyncRequest>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
     animating: Option<Res<Animating>>,
-    relaid: Option<Res<Relaid>>,
     fades: Query<(), With<Fade>>,
     gesture: Res<crate::input::gesture::Gesture>,
+    scenes: Query<(Entity, &RenderLayers), With<SceneRoot>>,
+    mut draw: SyncDrawAssets,
 ) {
     let path = scene_path(&nav, &tree);
     let folder = path[path.len() - 1].node;
     if folder == layouts.anchor
         || animating.is_some()
-        || relaid.is_some()
         || !fades.is_empty()
         || gesture.active()
         || gesture.has_parent_scene()
-        || !matches!(*bake, Bake::Done)
+        || sync.mode.is_some()
     {
+        return;
+    }
+    if !tree.is_attached(folder) {
+        sync.request_reset();
         return;
     }
     // 古い座標での基準の本体 `old` が、新しい座標で `new` になる。
     let old = layouts[folder].frame;
     let new = anchor_body();
-    let k = new.height() / old.height();
-    let (spec, _) = ear_spec(&settings, &window);
+    let (spec, ears) = ear_spec(&settings, &window);
     *layouts = layout(&tree, folder, new, spec);
-    folder_images.prepare(&tree, &layouts, &mut images);
+    *draw.ears = ears;
 
     let (mut transform, mut projection) = camera.into_inner();
-    let pos = transform.translation.truncate();
-    transform.translation = (new.center() + (pos - old.center()) * k).extend(0.0);
-    if let Projection::Orthographic(ortho) = projection.as_mut() {
-        ortho.scale *= k;
-    }
-    *bake = Bake::Waiting;
-    commands.insert_resource(Relaid { refit: false });
-}
-
-/// 配置し直したあと、カメラを合わせ直して今の場面を作り直す。
-fn show_relayout(
-    relaid: Option<Res<Relaid>>,
-    mut current: ResMut<CurrentScene>,
-    mut maker: SceneMaker,
-    nav: Res<Nav>,
-    window: Single<&Window, With<PrimaryWindow>>,
-    camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
-) {
-    let Some(relaid) = relaid else {
-        return;
-    };
-    maker.commands.remove_resource::<Relaid>();
-    if relaid.refit {
-        let (pos, scale) = fit(nav.top().frame(&maker.layouts), &window);
-        let (mut transform, mut projection) = camera.into_inner();
-        transform.translation = pos.extend(0.0);
-        if let Projection::Orthographic(ortho) = projection.as_mut() {
-            ortho.scale = scale;
+    let mut refit = true;
+    if old.height() > 0.0 {
+        let k = new.height() / old.height();
+        let pos = transform.translation.truncate();
+        let next_pos = new.center() + (pos - old.center()) * k;
+        let next_scale = match projection.as_ref() {
+            Projection::Orthographic(ortho) => ortho.scale * k,
+            _ => -1.0,
+        };
+        if k.is_finite()
+            && k > 0.0
+            && next_pos.is_finite()
+            && next_scale.is_finite()
+            && next_scale > 0.0
+        {
+            transform.translation = next_pos.extend(0.0);
+            if let Projection::Orthographic(ortho) = projection.as_mut() {
+                ortho.scale = next_scale;
+            }
+            refit = false;
         }
     }
-    let path = scene_path(&nav, &maker.tree);
-    let (_, scene_scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
-    maker.commands.entity(current.0).despawn();
-    current.0 = maker.spawn(path, scene_scale);
+    if refit {
+        let (pos, scale) = fit(nav.top().frame(&layouts), &window);
+        if pos.is_finite() && scale > 0.0 && scale.is_finite() {
+            transform.translation = pos.extend(0.0);
+            if let Projection::Orthographic(ortho) = projection.as_mut() {
+                ortho.scale = scale;
+            }
+        }
+    }
+
+    let main_layer = RenderLayers::layer(CONTENT_LAYER);
+    let mut stray = 0usize;
+    for (entity, layers) in &scenes {
+        if !layers.intersects(&main_layer) {
+            continue;
+        }
+        if entity != current.0 {
+            stray += 1;
+        }
+        commands.entity(entity).despawn();
+    }
+    if stray > 0 {
+        warn!("基準の付け替えで想定外の場面が {stray} 個残っていたため消しました");
+    }
+    let (_, scene_scale) = fit(path[path.len() - 1].frame(&layouts), &window);
+    current.0 = spawn_scene_raw(
+        &mut commands,
+        &mut draw,
+        &tree,
+        &layouts,
+        path,
+        scene_scale,
+        None,
+    );
+    show_breadcrumb(&mut commands, &tree, nav.top().node);
 }
 
 /// 本物として描く場面までの道のり。開いているのがファイルなら、その親のフォルダまで。
@@ -513,32 +918,15 @@ pub(crate) fn ui_has_pointer(window: &Window, popup: &Popup, over_banner: bool) 
             .is_some_and(|p| p.y < BAR_PX || p.x > view_width(window))
 }
 
-/// 画像が焼き上がったら、今の場面を作り直して画像を使う。
-fn show_baked(
-    finished: Option<Res<BakeFinished>>,
-    mut current: ResMut<CurrentScene>,
-    mut maker: SceneMaker,
-    nav: Res<Nav>,
-    window: Single<&Window, With<PrimaryWindow>>,
-) {
-    if finished.is_none() {
-        return;
-    }
-    maker.commands.remove_resource::<BakeFinished>();
-    maker.commands.entity(current.0).despawn();
-    let path = scene_path(&nav, &maker.tree);
-    let (_, scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
-    current.0 = maker.spawn(path, scale);
-}
-
 /// 左クリックしたフォルダかファイルへズームイン、Esc で親へズームアウト（右クリックはメニュー、
 /// `ui/context_menu.rs`。そこで選んだ「開く」「親へ戻る」もここで動かす）。
 #[allow(clippy::too_many_arguments)]
 fn navigate(
     mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
     window: Single<&mut Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform, &Transform, &Projection), With<MainCamera>>,
+    mut location: ResMut<Location>,
     mut nav: ResMut<Nav>,
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
@@ -549,12 +937,27 @@ fn navigate(
     mut gesture: ResMut<crate::input::gesture::Gesture>,
     context_menu: Res<crate::ui::context_menu::ContextMenu>,
     request: Option<Res<crate::ui::context_menu::NavRequest>>,
+    mut organize: Option<ResMut<crate::organize::OrganizeState>>,
 ) {
     use crate::ui::context_menu::NavRequest;
     // 右クリックのメニューで選んだ「開く」「親へ戻る」。
     let request = request.map(|r| *r);
     if request.is_some() {
         maker.commands.remove_resource::<NavRequest>();
+    }
+    // 右クリック「移動…」の移動先を選んでいるか。`ResMut` は書き換えるまで借りない（借りるだけで「変わった」に
+    // なり、履歴パネルが毎フレーム作り直されてボタンが押せなくなるため）。
+    let picking_move = request.is_none()
+        && organize
+            .as_ref()
+            .is_some_and(|o| o.pick_move_source.is_some());
+    // 移動先選び中は、カーソルの位置によらず Esc でやめられるようにする。
+    if picking_move
+        && keys.clear_just_pressed(KeyCode::Escape)
+        && let Some(organize) = organize.as_deref_mut()
+    {
+        organize.pick_move_source = None;
+        return;
     }
     // 切り替えの途中や、メニューやジェスチャーを操作しているときは受け付けない。
     let over_banner = banners.iter().any(|h| h.get());
@@ -571,6 +974,36 @@ fn navigate(
     let Projection::Orthographic(ortho) = projection else {
         return;
     };
+
+    // 右クリック「移動…」の移動先を選んでいるあいだは、Esc でやめる・左クリックで移動先フォルダを確定する。
+    if picking_move && let Some(organize) = organize.as_deref_mut() {
+        if keys.just_pressed(KeyCode::Escape) {
+            organize.pick_move_source = None;
+            return;
+        }
+        if mouse.just_pressed(MouseButton::Left) {
+            if let Some(world) = window
+                .cursor_position()
+                .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
+            {
+                let path = hit_path(&maker, &nav, world);
+                let picked = *path.last().unwrap_or(&FileTree::ROOT);
+                let node = &maker.tree.nodes[picked];
+                if node.is_dir
+                    && node.remote.is_none()
+                    && node.depth >= 2
+                    && let Some(dest_dir) = crate::ui::tooltip::local_path(&maker.tree, picked)
+                    && let Some(from) = organize.pick_move_source.take()
+                {
+                    organize.user_move(from, dest_dir);
+                } else {
+                    organize.set_notice("移動先は手元のフォルダを押してください（Esc でやめる）");
+                }
+            }
+            return;
+        }
+        return;
+    }
     let old = nav.stack.clone();
     let click_at = match request {
         Some(NavRequest::ClickAt(world)) => Some(world),
@@ -598,15 +1031,24 @@ fn navigate(
         return;
     }
 
+    let next = *nav.top();
+    let (to_pos, to_scale) = fit(next.frame(&maker.layouts), &window);
+    if !(to_scale > 0.0 && to_scale.is_finite() && to_pos.is_finite()) {
+        // 行き先がまだ配置に無い（高さ 0）なら遷移を戻す。
+        nav.stack = old;
+        return;
+    }
+
+    // 正の場所を書き換える（GUI 主導の遷移）。
+    *location = Location::from_tree(&maker.tree, next.node);
+
     // 縮めたまま止まって下に敷いてあった親の場面は、もう要らない。
     if let Some(parent) = gesture.take_parent_scene() {
         maker.commands.entity(parent).despawn();
     }
     let then_show = change_scene(&old, &nav, &mut current, &mut maker, &window);
 
-    let next = *nav.top();
     show_breadcrumb(&mut maker.commands, &maker.tree, next.node);
-    let (to_pos, to_scale) = fit(next.frame(&maker.layouts), &window);
     maker.commands.insert_resource(Animating {
         from_pos: camera_transform.translation.truncate(),
         from_scale: ortho.scale,
@@ -762,5 +1204,102 @@ mod tests {
         assert_eq!(label, "reactive (default)");
         assert_eq!(bad, Some("weird"));
         assert!(matches!(s.focused_mode, UpdateMode::Reactive { .. }));
+    }
+
+    #[test]
+    fn track_window_occlusion_updates_state_and_requests_redraw_on_visible() {
+        let mut app = App::new();
+        app.init_resource::<WindowOccludedState>()
+            .add_message::<WindowOccluded>()
+            .add_message::<WindowFocused>()
+            .add_message::<RequestRedraw>()
+            .add_systems(Update, track_window_occlusion);
+
+        let win = app.world_mut().spawn(PrimaryWindow).id();
+
+        // 隠れたときは occluded=true になり、描き直しは頼まない。
+        app.world_mut().write_message(WindowOccluded {
+            window: win,
+            occluded: true,
+        });
+        app.update();
+        assert!(app.world().resource::<WindowOccludedState>().0);
+        let mut cursor = bevy::ecs::message::MessageCursor::<RequestRedraw>::default();
+        assert_eq!(
+            cursor
+                .read(app.world().resource::<Messages<RequestRedraw>>())
+                .count(),
+            0
+        );
+
+        // 再び見えたときは occluded=false になり、描き直しを 1 回頼む。
+        app.world_mut().write_message(WindowOccluded {
+            window: win,
+            occluded: false,
+        });
+        app.update();
+        assert!(!app.world().resource::<WindowOccludedState>().0);
+        assert_eq!(
+            cursor
+                .read(app.world().resource::<Messages<RequestRedraw>>())
+                .count(),
+            1
+        );
+
+        // フォーカスが戻ったときも 1 回描き直しを頼む。
+        app.world_mut().write_message(WindowFocused {
+            window: win,
+            focused: true,
+        });
+        app.update();
+        assert_eq!(
+            cursor
+                .read(app.world().resource::<Messages<RequestRedraw>>())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn location_from_tree_and_sync_request_priority() {
+        let mut tree = FileTree::dummy();
+        let dev = tree.nodes[FileTree::ROOT].children[0];
+        let dir = tree.nodes[dev].children[0];
+        // DB の entry が無い木では Named になる。
+        assert_eq!(
+            Location::from_tree(&tree, dir),
+            Location::Named(vec![
+                "Root".into(),
+                tree.nodes[dev].name.clone(),
+                tree.nodes[dir].name.clone()
+            ])
+        );
+        // entry がドライブ以下でそろっていれば Local になる。
+        tree.nodes[dev].entry = Some(10);
+        tree.nodes[dir].entry = Some(20);
+        assert_eq!(
+            Location::from_tree(&tree, dir),
+            Location::Local(vec![10, 20])
+        );
+
+        // 木から外れたノードでは Root にフォールバックする。
+        tree.reset_children(dev);
+        assert!(!tree.is_attached(dir));
+        assert!(tree.path_from_root(dir).is_none());
+        assert_eq!(Location::from_tree(&tree, dir), Location::root());
+
+        // SyncRequest は優先度の高いモードへ昇格し、低いモードで上書きされない。
+        let mut sync = SyncRequest::default();
+        sync.request_redraw();
+        assert_eq!(sync.mode, Some(SyncMode::RedrawScene));
+        sync.request_relayout(true);
+        assert_eq!(sync.mode, Some(SyncMode::RelayoutKeepView));
+        assert!(sync.refit);
+        sync.request_redraw();
+        assert_eq!(sync.mode, Some(SyncMode::RelayoutKeepView));
+        sync.request_reset();
+        assert_eq!(sync.mode, Some(SyncMode::Reset));
+        sync.request_relayout(false);
+        assert_eq!(sync.mode, Some(SyncMode::Reset));
     }
 }

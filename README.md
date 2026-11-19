@@ -42,6 +42,7 @@ cargo run -p lisa-scan -- tree ~ 3           # 3 段下までたどって数と�
 cargo run -p lisa-scan -- drives             # つながっているドライブの一覧と ID
 cargo run -p lisa-scan -- dups               # アプリの DB から重複の一覧を出す
 cargo run -p lisa-scan -- snapshots          # アプリの DB からスナップショットの一覧を出す
+cargo run -p lisa-scan -- plan list          # 整理の計画の一覧（create / show / approve / reject / undo / purge もある）
 ```
 
 - 初回のビルドは、依存している Bevy のコンパイルに十数分かかります。2 回目以降は数秒です。
@@ -78,11 +79,13 @@ scripts/share-windows.sh 9000   # ポートを変える
 | --- | --- | --- | --- |
 | 見えているフォルダ・ファイルへ移る（中の子でも、隣や親の隣でも） | 左クリック | クリック / ピンチで広げる | |
 | 親へ戻る（ズームアウト） | メニューの「親へ戻る」 | ピンチで縮める | Esc |
-| メニューを開く | 右クリック | 2本指クリックなど | |
+| メニューを開く（開く・コピー・表示・移動・削除） | 右クリック | 2本指クリックなど | |
+| 移動先を選ぶ・やめる（右クリック「移動…」のあと） | 移動先のフォルダを左クリック | クリック | Esc でやめる |
 | 拡大縮小（ポインタを中心に） | ホイール | ピンチ | |
 | 移動 | 中ボタンで引っぱる | 2本指で動かす | |
 | 同じ階層の隣のタイルへ | 中ボタンで引っぱる | 2本指で動かす（斜めも可） | |
 | 動きを止めてつかむ | | 2本指を置く | |
+| 重複・カタログ・整理のパネルを開く・閉じる | メニューバーの「重複」「カタログ」「整理」 | | |
 | 設定を開く・閉じる | メニューバーの「設定」 | | Esc で閉じる |
 | FPS 表示の切り替え（デバッグビルド） | | | F3 |
 
@@ -115,7 +118,7 @@ scripts/share-windows.sh 9000   # ポートを変える
 ## MCP で使う
 
 `lisa-mcp` は、Claude などの MCP クライアントから Lisa を使うためのサーバーです（標準入出力、または HTTP）。
-ユーザーのファイルやフォルダは何も動かしません（ペアリングした端末からだけ使える `lisa_update` で、`lisa` / `lisa-mcp` 自身の実行ファイルを入れ替えることはできます）。
+ユーザーのファイルやフォルダは、人が Lisa の画面か CLI（`lisa-scan plan approve`）で計画を許可したときだけ動かします（[docs/organize.md](docs/organize.md)。許可する MCP の道具はありません。また、ペアリングした端末からだけ使える `lisa_update` で、`lisa` / `lisa-mcp` 自身の実行ファイルを入れ替えることはできます）。
 
 ```sh
 cargo build --release -p lisa-mcp
@@ -159,6 +162,11 @@ claude mcp add --transport http lisa-<名前> http://<IP>:47800/mcp --header "Au
 | `lisa_app_stop` | アプリに終了を頼み、返事が無いときや `force: true` のときはプロセスを強制終了する | 要らない（ペアリングした端末からだけ） |
 | `lisa_app_alive` | アプリのプロセスが生きているかと、`control.json` に返事があるかを返す | 要らない（ペアリングした端末からだけ） |
 | `lisa_screenshot` | OS の画面（または Lisa の窓）を連続で撮って 24 ビット BMP（base64）で返す | 要らない（ペアリングした端末からだけ） |
+| `lisa_plan_create` | ファイルの移動・フォルダ作成・隔離の計画を確かめて作る（許可されるまで何も動かさない、`dry_run` 可） | 要らない |
+| `lisa_plan_status` | 計画の状態と操作ごとの結果を返す（`wait` 最大 60 秒で許可待ちが変わるまで待てる） | 要らない |
+| `lisa_plans` | 整理の計画の一覧（新しい順、状態で絞れる） | 要らない |
+| `lisa_plan_cancel` | 許可待ち（`pending`）の計画を取り下げる | 要らない |
+| `lisa_undo` | 実行済みの計画を逆の順で取り消す（許可不要、上書きしない） | 要らない |
 
 - DB を読む道具は、アプリの DB（`~/Library/Application Support/Lisa/lisa.db`）を読むだけです。
   アプリが起動していなくても使えます。パスは Mac の `/Users/…` のままで引けます。
@@ -294,7 +302,8 @@ cargo run -p lisa-scan -- remote-screenshot <名前か device_id> --count 8 --in
 - [docs/design.md](docs/design.md) — ハッシュでの管理の考え方と仕組み
 - [docs/schema.md](docs/schema.md) — 保存するデータの形（一部実装）
 - [docs/scan.md](docs/scan.md) — 実際のスキャンに要るものと、実装の順番（一部実装）
-- [docs/catalog.md](docs/catalog.md) — フォルダをアプリと結びつけるカタログ（計画）
+- [docs/catalog.md](docs/catalog.md) — フォルダをアプリと結びつけるカタログ
+- [docs/organize.md](docs/organize.md) — 整理（移動・フォルダ作成・隔離・取り消し）の設計と実装
 
 ## ライセンス
 

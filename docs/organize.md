@@ -1,0 +1,175 @@
+# 整理（ファイルを動かす）
+
+> 段階 2〜4（芯 `crates/lisa-core/src/organize.rs`・`organize/`、CLI `lisa-scan plan`、MCP `crates/lisa-mcp/src/organize.rs`、アプリ `src/organize.rs`・`src/ui/organize.rs`）を実装しました。LAN 越しの計画作成（段階 5）はまだです。保存するデータの形は [schema.md](schema.md) にもあります。
+
+LLM（MCP）や人が、ファイルの移動・名前の変更・フォルダ作り・消すことを Lisa に頼めるようにします。
+Lisa はこれまで「ユーザーのファイルを動かさない」としてきましたが、次の決まりに変えます。
+
+**Lisa がユーザーのファイルを動かすのは、計画を人が Lisa の画面（か CLI）で許可したときだけです。**
+
+- LLM が直接ファイルを動かす道具は作りません。LLM は計画を出し、結果を聞くだけです。
+- 消すときは、まず同じボリュームの「隔離フォルダ」へ移すだけです。取り消しは戻すだけで済みます。
+  隔離から OS のゴミ箱へ送るのは期限（既定 30 日）か、人が「ゴミ箱へ送る」を押したときです。
+- 上書きはしません。行き先に何かあれば、その 1 件は飛ばします。
+- 最初はこの PC のドライブだけです。LAN の相手の PC は最後の段で足します（許可は相手の画面）。
+
+## 流れ
+
+1. LLM が `lisa_plan_create` で計画（操作の並び）を出す。Lisa は確かめて（ドライラン）DB に残し、
+   要約（件数、動く大きさ、空く大きさ、危ないもの、飛ばすもの）を返す。何も動かさない。
+2. 起動中のアプリが、許可待ちの計画を見つけてポップアップを出し、対象を木の上で光らせる。
+   アプリが動いていなければ `lisa-scan plan approve <id>` でも許可できる。
+3. 人が「許可」「危ないものを除いて許可」「断る」のどれかを押す。
+4. 許可されたら、アプリ（か CLI）が順に実行し、1 件ずつ記録する。済んだら動いたフォルダを読み直す。
+5. LLM は `lisa_plan_status` で結果を聞く。取り消しは `lisa_undo` か画面の履歴から。
+
+## 操作
+
+| `op` | 引数 | 内容 |
+|---|---|---|
+| `mkdir` | `path` | フォルダを作る（親も。もうあれば何もしない） |
+| `move` | `from`, `to` | 移す・名前を変える（`to` は行き先の完全なパス）。同じボリュームなら rename、違えばコピー → blake3 で確かめる → 元を隔離 |
+| `trash` | `path`, `keep`? | 隔離フォルダへ移す。`keep` は「同じ中身で残す方」のパス（重複を消すとき） |
+
+- パスは他の道具と同じく、この PC の絶対パスで受けます（`query::locate` で DB の `entry` に引く）。
+  計画には `drive_id` とドライブの一番上から見たパスも残します。
+- 1 つの計画は 5000 件まで。同じパスを 2 回触る計画、`to` が他の `from` の中に入る計画は作りません。
+- 実行の順は `mkdir` → `move` → `trash`（それぞれ計画に書かれた順）。
+
+## 確かめ（作るときと、実行の直前の 2 回）
+
+作るとき（`plan_create`）に全部を確かめ、各操作に `check` を付けます。実行の直前にも同じことを 1 件ずつ確かめ、
+合わなければその 1 件を `skipped` にして先へ進みます（計画全体は止めない）。
+
+- **在るか・変わっていないか**: 元が DB にあり、ディスクにもあり、大きさと更新日時が DB と同じ。
+  `trash` のファイルは、実行の直前に中身をハッシュし直して DB のハッシュと同じか見る。
+- **行き先**: `to` が無い（上書きしない）。`to` の親があるか、同じ計画の `mkdir` で作られる。
+- **守る場所（断る）**: OS とアプリの場所（Mac の `/System`、`/Library`、`/Applications`、`~/Library`、
+  Windows の `Windows`、`Program Files*`、`ProgramData`、`AppData`）、Lisa のデータのフォルダ、隔離フォルダ、
+  ドライブの一番上そのもの、クラウドにだけあるもの（`cloud_only`）、別のボリューム（`other_volume`）の入口。
+- **危ない（`risky`、許可の画面で赤く出し、「危ないものを除いて許可」で外せる）**:
+  - `trash` で、同じハッシュの残りが他に無い（最後の 1 つ）。`keep` があれば、`keep` が DB にあり同じハッシュか見る。
+  - カタログの役割が `data` の中を `trash` する、または `data` のフォルダごと動かす。
+  - ハッシュがまだ無いファイルの `trash`（重複か分からない）。
+- `cache`・`install`・`log` の中の `trash` は危なくありません（作り直せる・入れ直せる）。
+
+## 隔離フォルダ
+
+- 置き場は、消すものと同じボリュームの中に取ります（rename で移せるように）。
+  1. データのフォルダの `trash/` が同じボリュームなら、そこ。
+  2. 違えば、ドライブの一番上の `.lisa-trash/`。
+  3. どちらも書けなければ、その 1 件は `skipped`（理由: 隔離できない）。
+- 中は `<置き場>/<plan_id>/<ドライブの一番上から見たパス>` です。`manifest.json` に元の場所を書きます
+  （DB が無くても手で戻せるように）。
+- 読む係は隔離フォルダを読みません（`name::is_os_junk` と同じところで飛ばし、データのフォルダの `trash/` も飛ばす）。
+  重複の一覧にも出ません。
+- 期限（設定 `trash_days`、既定 30 日）を過ぎた計画の分は、アプリが OS のゴミ箱へ送ります（`trash` クレート、MIT）。
+  そこから先の取り消しはできません。画面の履歴の「ゴミ箱へ送る」でもすぐ送れます。
+
+## 許可
+
+- 許可できるのは、アプリの画面と CLI（`lisa-scan plan approve <id> [--skip-risky]`、`plan reject <id>`）だけです。
+  MCP の道具には許可するものを作りません。
+- アプリは 2 秒ごとに `plan` の表の `pending` を見て、新しいものがあればポップアップを出します
+  （ペアリングのポップアップと同じ作り）。中身は、出した人（`by`、MCP のクライアント名）、LLM が付けた説明（`note`）、
+  件数と大きさ、危ないものの一覧（上から 20 件と残りの数）、飛ばすものの数です。ポップアップの「場所を見る」で
+  対象を木の上で光らせます（重複の組を光らせるのと同じ）。
+- 許可待ちは 24 時間で `expired` にします。許可のあと元が変わっていたら、確かめで飛ばすので、計画を作り直す必要はありません。
+
+## 実行と記録
+
+- 1 つの計画を 1 本のスレッドで順に実行します。同時に動く計画は 1 つだけです。
+- 1 件ごとに「始めた」を `plan_op` に書いて確定してから動かし、済んだら `done`（行き先、隔離した場所）にします。
+  途中で落ちたら、次の起動で `running` の操作を見て、元と行き先のどちらがあるかで `done` か `pending` に直してから続けます。
+- 動かしたものは `entry` に直接書きません（`entry` を書くのは読む係だけ）。済んだら、触ったフォルダ（元の親と行き先の親）を
+  読む係に `Request::Hint` で渡して読み直させます。CLI で実行したときは、アプリが起動していれば `Command::Rescan` を送ります。
+- 仕分け（`assignment`）は、今の `file_id` で追う仕組みのまま追いかけます。
+
+## 取り消し
+
+- 計画ごとに、`done` の操作を逆の順で戻します。`move` は `to` → `from`、`trash` は隔離 → 元、`mkdir` は空のときだけ消す。
+- 戻す先にもう何かある、戻す元が変わった（大きさ・更新日時）ものは飛ばして、理由を返します。
+- 取り消しは許可を要りません（許可して動かしたものを戻すだけで、上書きしないため）。MCP の `lisa_undo`、
+  画面の履歴、`lisa-scan plan undo <id>` のどれでもできます。
+- 隔離から OS のゴミ箱へ送った分は戻せません。
+
+## DB
+
+```sql
+CREATE TABLE IF NOT EXISTS plan (
+    id          INTEGER PRIMARY KEY,
+    state       TEXT NOT NULL,     -- pending / approved / running / done / partial / rejected / cancelled / expired / undone
+    by          TEXT NOT NULL,     -- 'mcp:<クライアント名>' / 'user' / 'cli'
+    note        TEXT,              -- LLM が付けた説明
+    summary     TEXT NOT NULL,     -- JSON（件数、大きさ、危ないものの数など。作ったときのもの）
+    skip_risky  INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL,
+    decided_at  INTEGER,
+    finished_at INTEGER,
+    purged_at   INTEGER            -- 隔離から OS のゴミ箱へ送った時刻
+);
+CREATE TABLE IF NOT EXISTS plan_op (
+    plan_id   INTEGER NOT NULL REFERENCES plan(id) ON DELETE CASCADE,
+    seq       INTEGER NOT NULL,
+    op        TEXT NOT NULL,       -- mkdir / move / trash
+    drive_id  TEXT,
+    src       TEXT NOT NULL,       -- 元の絶対パス（mkdir は作るパス）
+    dst       TEXT,                -- move の行き先、trash は隔離した場所（済んでから）
+    keep      TEXT,
+    size      INTEGER,             -- 作ったときの大きさ（フォルダは中の合計）
+    mtime     INTEGER,
+    hash      BLOB,
+    risky     TEXT,                -- 危ない理由（無ければ NULL）
+    state     TEXT NOT NULL,       -- pending / running / done / skipped / failed / undone
+    reason    TEXT,                -- skipped・failed の理由
+    done_at   INTEGER,
+    PRIMARY KEY (plan_id, seq)
+);
+```
+
+- `plan` と `plan_op` は lisa-mcp（作る）、アプリと CLI（許可・実行・取り消し）が書きます。どれも別の行を
+  短く書くだけなので、SQLite の待ち合わせ（busy timeout）で足ります。
+
+## MCP の道具
+
+| 道具 | 中身 |
+|---|---|
+| `lisa_plan_create` | `ops`（上の表の形の配列）と `note` を受け、確かめて計画を作る。`id`、`summary`、各操作の `check`（`ok` / `risky:<理由>` / `refused:<理由>`）を返す。`refused` が 1 つでもあれば計画を作らず、理由だけ返す（`dry_run: true` なら作らずに確かめだけ） |
+| `lisa_plan_status` | 計画の状態と、操作ごとの結果。`wait`（秒、最大 60）を付けると、許可待ちが変わるまで待つ |
+| `lisa_plans` | 計画の一覧（新しい順、状態で絞れる） |
+| `lisa_plan_cancel` | 許可待ちの計画を取り下げる |
+| `lisa_undo` | 計画を取り消す。戻した数と飛ばした理由を返す |
+
+- 道具の説明に「許可は人が画面で押す。押されるまで何も動かない」と書き、LLM が待ち方を分かるようにします。
+- 合言葉 token・標準入出力・ペアリングの鍵のどれでも使えます（許可は画面なので）。
+
+## 画面
+
+- 許可のポップアップ（上）。
+- メニューバーに「整理」を足し、右のパネル（重複・カタログと同じ出方、同時には開かない）に計画の履歴を出す。
+  状態、件数、日時、「取り消す」「ゴミ箱へ送る」。
+- 右クリックメニューの「移動…」「削除…」を同じ芯につなぐ。人が自分で選んだ操作なので、許可のポップアップは出さず、
+  そのまま 1 件の計画として実行し、履歴に残す（取り消せる）。「削除…」は隔離へ送る。「移動…」の行き先は、
+  メニューを出したあとに木の上でフォルダを押して選ぶ。名前の変更は文字の入力が要るので後回し。
+
+## 段階
+
+1. この文書（と catalog.md・README の「動かさない」の書き換え）。
+2. 芯（`crates/lisa-core/src/organize.rs` と `organize/`）と CLI（`lisa-scan plan create|show|approve|reject|undo`）。
+   一時フォルダのテスト: 同じボリュームと別のボリューム（無ければ飛ばす）、上書きしない、最後の 1 つ、
+   変わっていたファイル、途中で落ちたときの続き、取り消しで飛ばすもの。
+3. MCP の道具（`crates/lisa-mcp/src/organize.rs`）。
+4. アプリ（`src/organize.rs` で見張りと実行、`src/ui/organize.rs` でポップアップとパネル、右クリック）。
+5. LAN の相手の PC: ペアリングの鍵で相手の `lisa_plan_create` を呼ぶ。許可と実行は相手の PC。
+
+## 実装で決めたこと
+
+- **`lisa_plan_cancel` の状態は `cancelled`** にしました（人が断った `rejected` と見分けやすくするため）。
+- **`plan_op` の `dst` を `mkdir` の取り消しにも使います。** `mkdir` で新しく作った一番浅いフォルダを `dst` に残し（すでにあったときは `NULL`）、取り消しでは元からあった親を消さずに、新しく作った空のフォルダだけを戻します。
+- **`plan_op` に相対パス専用の列は増やさず**、`drive_id` と `drive.last_mount_path` から必要なときに計算します（隔離の `manifest.json` には `src` と `rel_path` の両方を残します）。
+- **同時に 1 つだけ動かす仕組み**として、プロセス内のロックに加えてデータのフォルダに `organize.lock`（PID と計画 ID）を置きます。実行中に落ちた場合は PID が消えているので、次の起動や再開でロックを引き継げます。
+- **別ボリュームの `move` は一時名（`.lisa-moving-...`）へコピーして blake3 を確かめてから行き先へ rename** し、そのあと元を隔離します（途中で落ちても不完全なファイルが行き先に残らないように）。
+- **MCP の `by`** は、標準入出力なら `mcp:stdio`、合言葉なら `mcp:http`、ペアリングの鍵なら `mcp:<端末名>` とします。`lisa_plan_status` の `wait` は計画が終端の状態（`done` / `partial` / `rejected` / `cancelled` / `expired` / `undone`）になるか、指定秒数（最大 60 秒）が過ぎるまで待ちます。
+- **右クリックの「削除…」「移動…」**は 1 件の計画を `by = "user"` で作り、安全なら許可ポップアップを出さずそのまま実行します。危ない判定（最後の 1 つ・`data` の中・ハッシュ無し、`data` フォルダごとの移動）のときだけ確認ポップアップを 1 回出します。LAN の相手の木とドライブの一番上では押せません。
+- **「危ないものを除いて許可」**は、危ない操作が 1 件以上ある計画で出します（右クリック 1 件の確認のときは省きます）。
+- **アプリの裏のスレッド（`src/organize.rs`）**は 2 秒ごとに `plan` を見て、起動時に `recover_running_plans`、1 日 1 回 `purge_expired`（`settings.json` の `trash_days`、既定 30 日）を動かします。実行・取り消しで触ったフォルダは `Request::Hint` で読む係へ渡します。`lisa_core::remote::Command` に許可は足しません。

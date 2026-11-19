@@ -38,8 +38,9 @@ pub(crate) fn side_px() -> f32 {
     f32::from_bits(SIDE_PX.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// 右の一覧ごとの幅（0: 重複、1: カタログ）。木を映す領域は、そのうち広い方だけ狭める。
-static PANEL_PX: [std::sync::atomic::AtomicU32; 2] = [
+/// 右の一覧ごとの幅（0: 重複、1: カタログ、2: 整理）。木を映す領域は、そのうち広い方だけ狭める。
+static PANEL_PX: [std::sync::atomic::AtomicU32; 3] = [
+    std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
     std::sync::atomic::AtomicU32::new(0),
 ];
@@ -52,6 +53,11 @@ pub(crate) fn set_side_px(px: f32) {
 /// カタログの一覧の幅を変える（`ui/catalog.rs` が呼ぶ）。
 pub(crate) fn set_catalog_side_px(px: f32) {
     set_panel_px(1, px);
+}
+
+/// 整理の履歴パネルの幅を変える（`ui/organize.rs` が呼ぶ）。
+pub(crate) fn set_organize_side_px(px: f32) {
+    set_panel_px(2, px);
 }
 
 fn set_panel_px(panel: usize, px: f32) {
@@ -87,12 +93,16 @@ pub(crate) fn refit_on_resize(
     layouts: Res<Layouts>,
     nav: Res<Nav>,
     animating: Option<Res<Animating>>,
+    gesture: Res<crate::input::gesture::Gesture>,
 ) {
-    if resized.read().last().is_none() || animating.is_some() {
+    if resized.read().last().is_none() || animating.is_some() || gesture.active() {
+        return;
+    }
+    let (pos, scale) = fit(nav.top().frame(&layouts), &window);
+    if !(scale > 0.0 && scale.is_finite() && pos.is_finite()) {
         return;
     }
     let (mut transform, mut projection) = camera.into_inner();
-    let (pos, scale) = fit(nav.top().frame(&layouts), &window);
     transform.translation = pos.extend(0.0);
     if let Projection::Orthographic(ortho) = projection.as_mut() {
         ortho.scale = scale;
@@ -105,10 +115,19 @@ pub(crate) fn animate_camera(
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
     nav: Res<Nav>,
+    window: Single<&Window, With<PrimaryWindow>>,
 ) {
     let Some(anim) = animating else {
         return;
     };
+    if !(anim.from_scale > 0.0
+        && anim.to_scale > 0.0
+        && anim.from_scale.is_finite()
+        && anim.to_scale.is_finite())
+    {
+        maker.commands.remove_resource::<Animating>();
+        return;
+    }
     let t = (anim.started.elapsed().as_secs_f32() / anim.seconds).min(1.0);
     let e = anim.ease.apply(t);
 
@@ -117,9 +136,11 @@ pub(crate) fn animate_camera(
     let pos = zoom_position(&anim, scale, e);
 
     let (mut transform, mut projection) = camera.into_inner();
-    transform.translation = pos.extend(0.0);
-    if let Projection::Orthographic(ortho) = projection.as_mut() {
-        ortho.scale = scale;
+    if pos.is_finite() && scale > 0.0 && scale.is_finite() {
+        transform.translation = pos.extend(0.0);
+        if let Projection::Orthographic(ortho) = projection.as_mut() {
+            ortho.scale = scale;
+        }
     }
 
     if t < 1.0 {
@@ -128,8 +149,15 @@ pub(crate) fn animate_camera(
     maker.commands.remove_resource::<Animating>();
     if anim.then_show {
         // 画像の上に本物の場面を重ねてフェードインし、終わったら古い場面を消す。
+        let path = scene_path(&nav, &maker.tree);
+        let (_, scene_scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
+        let scene_scale = if scene_scale > 0.0 && scene_scale.is_finite() {
+            scene_scale
+        } else {
+            anim.to_scale
+        };
         let old = current.0;
-        current.0 = maker.spawn(&nav.stack, anim.to_scale);
+        current.0 = maker.spawn(path, scene_scale);
         maker.commands.entity(current.0).insert((
             Fade {
                 started: Instant::now(),
@@ -180,16 +208,18 @@ fn ease_in_out(t: f32) -> f32 {
 }
 
 /// ズームやフェードの最中は毎フレーム次の描画を頼む。垂直同期でディスプレイの FPS になる。
+/// ウィンドウが隠れているあいだは VSync が効かなくなるため、描き直しを頼まない。
 pub(crate) fn keep_redrawing(
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
     gesture: Res<crate::input::gesture::Gesture>,
+    occluded: Res<WindowOccludedState>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut busy: ResMut<Busy>,
 ) {
     // ジェスチャーの最中も、指を離したのを（入力が止まったことで）見分けるために回し続ける。
     busy.0 = animating.is_some() || !fades.is_empty() || gesture.active();
-    if busy.0 {
+    if busy.0 && !occluded.0 {
         redraw.write(RequestRedraw);
     }
 }

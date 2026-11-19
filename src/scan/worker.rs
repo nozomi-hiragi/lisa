@@ -43,6 +43,8 @@ pub enum Request {
     Visible(PathBuf),
     /// このフォルダの中が変わったらしい（監視からの知らせ。裏の分として読み直す）。
     Hint(PathBuf),
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 1 段読み直し、DB と同じでも `Changed -> Listed -> Committed` を送る。
+    DebugForceChanged(PathBuf),
 }
 
 /// 休んでいる理由（`Control::resting`）。
@@ -213,6 +215,8 @@ pub(super) struct Worker {
     pub dirty: bool,
     /// 監視から知らされた、読み直すフォルダ（同じものは 1 つにまとめる）。
     pub hints: std::collections::BTreeSet<PathBuf>,
+    /// 隔離フォルダなど、読む係が飛ばすフォルダの絶対パス。
+    pub skip_dirs: Vec<PathBuf>,
 }
 
 impl Worker {
@@ -227,6 +231,9 @@ impl Worker {
         // 1. 深さ優先で読む。
         let mut last_commit = Instant::now();
         while let Some((index, path)) = stack.pop() {
+            if self.is_skipped(&path) {
+                continue;
+            }
             if !self.wait_turn(&background) {
                 return;
             }
@@ -235,7 +242,7 @@ impl Worker {
                 p.current = Some(path.clone());
                 p.queued = stack.len();
             });
-            let result = listing::read_dir(&path).map_err(|e| e.to_string());
+            let result = self.read_dir_filtered(&path);
             if let Ok(listing) = &result {
                 for entry in listing.entries.iter().rev().filter(|e| readable(e)) {
                     stack.push((index, path.join(&entry.name)));
@@ -246,7 +253,7 @@ impl Worker {
                 last_commit = Instant::now();
             }
             let failed = result.is_err();
-            let (alive, _) = self.store(index, path, result, due);
+            let (alive, _) = self.store(index, path, result, due, false);
             report(&self.progress, |p| {
                 p.done += 1;
                 p.failed += failed as u64;
@@ -354,7 +361,9 @@ impl Worker {
                         }
                         let before = self.hints.len();
                         for folder in history.folders {
-                            if let Some(path) = self.locate(&folder) {
+                            if let Some(path) = self.locate(&folder)
+                                && !self.is_skipped(&path)
+                            {
                                 self.hints.insert(path);
                             }
                         }
@@ -494,10 +503,17 @@ impl Worker {
                 alive
             }
             Request::Hint(path) => {
-                if let Some(path) = self.locate(&path) {
+                if let Some(path) = self.locate(&path)
+                    && !self.is_skipped(&path)
+                {
                     self.hints.insert(path);
                 }
                 true
+            }
+            Request::DebugForceChanged(path) => {
+                let alive = self.reread_forced(&path);
+                self.control.urgent.fetch_sub(1, Ordering::Relaxed);
+                alive
             }
         }
     }
@@ -519,14 +535,17 @@ impl Worker {
     fn reread(&mut self, path: &Path, background: bool) -> bool {
         lisa_core::pace::set_thread_background(background);
         bevy::log::debug!("読み直し: {}", path.display());
+        if self.is_skipped(path) {
+            return true;
+        }
         let Some(index) = self.root_of(path) else {
             return true;
         };
         if self.roots[index].drive_id.is_none() || self.db.is_none() || !path.is_dir() {
             return true;
         }
-        let result = listing::read_dir(path).map_err(|e| e.to_string());
-        let (alive, changed) = self.store(index, path.to_path_buf(), result, true);
+        let result = self.read_dir_filtered(path);
+        let (alive, changed) = self.store(index, path.to_path_buf(), result, true, false);
         if !alive {
             return false;
         }
@@ -537,6 +556,27 @@ impl Worker {
             }
         }
         true
+    }
+
+    /// 検証用: `reread` と同じ経路で読み直し、`changed = true` として `Changed -> Listed -> Committed` を流す。
+    fn reread_forced(&mut self, path: &Path) -> bool {
+        lisa_core::pace::set_thread_background(false);
+        let Some(path) = self.locate(path) else {
+            warn!(
+                "DebugForceChanged: ドライブが見つかりません ({})",
+                path.display()
+            );
+            return true;
+        };
+        let Some(index) = self.root_of(&path) else {
+            return true;
+        };
+        if !path.is_dir() {
+            return true;
+        }
+        let result = self.read_dir_filtered(&path);
+        let (alive, _) = self.store(index, path, result, true, true);
+        alive
     }
 
     /// `path` の下の、まだ読んでいないフォルダ（読み直しで新しくできたもの）を深さ優先で読む。
@@ -566,9 +606,12 @@ impl Worker {
                     continue;
                 }
                 let child_path = folder.join(lisa_core::name::from_raw_bytes(&child.name_raw));
+                if self.is_skipped(&child_path) {
+                    continue;
+                }
                 if !child.listed {
-                    let result = listing::read_dir(&child_path).map_err(|e| e.to_string());
-                    if !self.store(index, child_path.clone(), result, true).0 {
+                    let result = self.read_dir_filtered(&child_path);
+                    if !self.store(index, child_path.clone(), result, true, false).0 {
                         return false;
                     }
                     stack.push(child_path);
@@ -637,11 +680,12 @@ impl Worker {
         path: PathBuf,
         result: Result<listing::Listing, String>,
         commit: bool,
+        force_changed: bool,
     ) -> (bool, bool) {
         let root = &self.roots[index];
         let mut stored = false;
         let mut committed = false;
-        let mut changed = false;
+        let mut changed = force_changed;
         if let (Some(db), Some(drive_id)) = (self.db.as_mut(), &root.drive_id) {
             match db
                 .begin()
@@ -649,7 +693,7 @@ impl Worker {
             {
                 Ok(c) => {
                     stored = true;
-                    changed = c;
+                    changed |= c;
                 }
                 Err(error) => warn!("DB に書けませんでした（{}）: {error}", path.display()),
             }
@@ -695,6 +739,30 @@ impl Worker {
             .filter(|(_, r)| path.starts_with(&r.mount))
             .max_by_key(|(_, r)| r.mount.components().count())
             .map(|(i, _)| i)
+    }
+
+    /// 隔離フォルダ（`.lisa-trash` と、データのフォルダの `trash/`）か。
+    fn is_skipped(&self, path: &Path) -> bool {
+        if path
+            .components()
+            .any(|c| lisa_core::name::is_quarantine_dir(c.as_os_str()))
+        {
+            return true;
+        }
+        self.skip_dirs
+            .iter()
+            .any(|s| path == s || path.starts_with(s))
+    }
+
+    /// フォルダを 1 段読み、飛ばす対象（隔離フォルダ）を除いて返す。
+    fn read_dir_filtered(&self, path: &Path) -> Result<listing::Listing, String> {
+        let mut listing = listing::read_dir(path).map_err(|e| e.to_string())?;
+        if !self.skip_dirs.is_empty() {
+            listing
+                .entries
+                .retain(|e| !self.is_skipped(&path.join(&e.name)));
+        }
+        Ok(listing)
     }
 
     fn send(&self, message: Message) -> bool {

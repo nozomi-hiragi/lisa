@@ -8,6 +8,8 @@
 //! cargo run -p lisa-scan -- snapshots                           アプリの DB からスナップショットの一覧を出す
 //! cargo run -p lisa-scan -- catalog [--dir <フォルダ>]... [--drive <drive_id>] [--only <型の id>] [--near]
 //!                                                               アプリの DB にカタログを当てて結果を出す
+//! cargo run -p lisa-scan -- plan create|list|show|approve|reject|undo|purge ...
+//!                                                               整理の計画を作る・見る・許可して実行する・取り消す
 //! cargo run -p lisa-scan -- share <ファイル>... [--port N | N]  LAN の他の PC へファイルを HTTP で渡す
 //! cargo run -p lisa-scan -- remote-logs [名前か device_id] [行数]  ペアリング済みの相手のログを読む
 //! cargo run -p lisa-scan -- remote-update [名前か device_id] [--target lisa|lisa-mcp|both] [--no-restart]
@@ -15,6 +17,7 @@
 //! cargo run -p lisa-scan -- remote-screenshot [名前か device_id] [--count N] [--interval MS] [--full] [--scale N] [--out フォルダ]
 //! ```
 
+mod plan;
 mod share;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -33,6 +36,8 @@ const USAGE: &str = "使い方:
   lisa-scan snapshots                           アプリの DB からスナップショットの一覧を出す
   lisa-scan catalog [--dir <フォルダ>]... [--drive <drive_id>] [--only <型の id>] [--near]
                                                 アプリの DB にカタログを当てて結果を出す
+  lisa-scan plan create <ops.json> [--note <説明>] [--dry-run]
+                                                整理の計画を作る（list / show / approve / reject / undo / purge もある）
   lisa-scan share <ファイル>... [--port N | N]  LAN の他の PC へファイルを HTTP で渡す（ポートは既定で 8765）
   lisa-scan remote-logs [名前か device_id] [行数]  ペアリング済みの相手のログ（lisa.log と crash.log）を読む
   lisa-scan remote-update [名前か device_id] [--target lisa|lisa-mcp|both] [--no-restart]
@@ -63,6 +68,7 @@ fn main() -> ExitCode {
         },
         ["snapshots"] => snapshots(),
         ["catalog", rest @ ..] => catalog(rest),
+        ["plan", rest @ ..] => plan::run(rest),
         ["share", rest @ ..] => {
             share::parse_args(rest).and_then(|(paths, port)| share::share(&paths, port))
         }

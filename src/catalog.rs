@@ -24,7 +24,7 @@ use lisa_core::db::Db;
 use lisa_core::query;
 
 use crate::model::tree::{FileTree, NodeId};
-use crate::render::cache::BakeFinished;
+use crate::view::SyncRequest;
 
 /// 当て直すかを見る間隔。
 const CHECK_EVERY: Duration = Duration::from_secs(5);
@@ -416,11 +416,11 @@ fn receive(mut view: ResMut<CatalogView>, mut redraw: MessageWriter<RequestRedra
 
 /// 当たりと木から、印を付けるノードを決める。変わったら、本物の場面を作り直す。
 fn update_marks(
-    mut commands: Commands,
     view: Res<CatalogView>,
     remote: Res<RemoteCatalogs>,
     tree: Res<FileTree>,
     mut marks: ResMut<CatalogMarks>,
+    mut sync: ResMut<SyncRequest>,
 ) {
     if !view.is_changed() && !tree.is_changed() && !remote.is_changed() {
         return;
@@ -448,18 +448,13 @@ fn update_marks(
         }
     }
     if let Some(snapshot) = &view.snapshot {
-        let by_entry: HashMap<i64, NodeId> = tree
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| node.remote.is_none())
-            .filter_map(|(id, node)| node.entry.map(|e| (e, id)))
-            .collect();
         // 同じフォルダに 2 つ当たったら、仕分けを先に、次に中身から札の文字を取った型（Rust の
         // クレート名など）を、型の名前だけの札（Git リポジトリなど）より先にする。
         let mut best: HashMap<NodeId, (u8, &Hit)> = HashMap::new();
         for hit in &snapshot.hits {
-            if let Some(&node) = by_entry.get(&hit.entry_id()) {
+            if let Some(node) = tree.node_by_entry(hit.entry_id())
+                && tree.nodes[node].remote.is_none()
+            {
                 let rank = if hit.assignment.is_some() {
                     0
                 } else if hit.label != hit.name {
@@ -476,15 +471,17 @@ fn update_marks(
         for (node, (_, hit)) in best {
             next.tags.insert(node, (hit.label.clone(), hit.color));
         }
-        for (entry, role) in &snapshot.roles {
+        for (&entry, role) in &snapshot.roles {
             if matches!(role, Role::Cache | Role::Install | Role::Log)
-                && let Some(&node) = by_entry.get(entry)
+                && let Some(node) = tree.node_by_entry(entry)
+                && tree.nodes[node].remote.is_none()
             {
                 next.dim.insert(node);
             }
         }
         if let Some(hit) = view.selected.and_then(|i| snapshot.hits.get(i))
-            && let Some(&node) = by_entry.get(&hit.entry_id())
+            && let Some(node) = tree.node_by_entry(hit.entry_id())
+            && tree.nodes[node].remote.is_none()
         {
             next.selected = Some((node, hit.color));
         }
@@ -496,8 +493,8 @@ fn update_marks(
             next.dim.len()
         );
         *marks = next;
-        // 印は本物の場面にだけ描くので、場面を作り直す。
-        commands.insert_resource(BakeFinished);
+        // 印は本物の場面にだけ描くので、操作が止まったタイミングで場面を作り直す。
+        sync.request_redraw();
     }
 }
 

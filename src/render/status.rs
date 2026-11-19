@@ -15,7 +15,7 @@ use bevy::window::RequestRedraw;
 
 use crate::model::tree::LoadState;
 use crate::render::preview;
-use crate::render::scene::BACKGROUND;
+use crate::render::scene::{BACKGROUND, OVERLAY_LAYER};
 use crate::render::shapes::{BaseAlpha, Painter, over};
 
 /// 失敗の赤（パレットの error）。
@@ -121,10 +121,10 @@ fn outline(painter: &mut Painter, frame: Rect, background: Color, z: f32) {
     }
 }
 
-/// 脈打つ光。最初は透明で、`pulse` が濃さを変える。
+/// 脈打つ光。最初は透明で、`pulse` が濃さを変える（`OVERLAY_LAYER` に描き、サムネには入れない）。
 fn pulse(painter: &mut Painter, frame: Rect, z: f32) {
     let parent = painter.parent;
-    let layer = painter.layer.clone();
+    let layer = bevy::camera::visibility::RenderLayers::layer(OVERLAY_LAYER);
     let mut entity = painter.commands.spawn((
         ChildOf(parent),
         layer,
@@ -159,13 +159,14 @@ fn failed(painter: &mut Painter, frame: Rect, background: Color, z: f32) {
     );
 }
 
-/// 読み込み中の光を脈打たせる。光があるあいだは描き続ける。
+/// 読み込み中の光を脈打たせる。光があるあいだは描き続ける（ウィンドウが隠れている間は止める）。
 pub fn pulse_loading(
     clock: Res<PulseClock>,
     mut pulses: Query<&mut Sprite, With<Pulse>>,
+    occluded: Res<crate::view::WindowOccludedState>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    if pulses.is_empty() {
+    if occluded.0 || pulses.is_empty() {
         return;
     }
     let t = clock.0.elapsed().as_secs_f32() / PULSE_SECONDS;

@@ -615,15 +615,21 @@ fn stop_on_exit(mut exit: MessageReader<AppExit>, lan: Option<ResMut<LanState>>)
     }
 }
 
-/// 起動時と 30 秒ごとに UDP で `hello` を送り、見つけた相手を木に反映する。
+/// 起動時と 30 秒ごとに UDP で `hello` を送り、見つけた相手を木に反映する（操作中は保留）。
 fn poll_discovery(
     lan: Option<ResMut<LanState>>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
+    animating: Option<Res<crate::view::Animating>>,
+    fades: Query<(), With<crate::view::Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
 ) {
     let Some(mut lan) = lan else {
         return;
     };
+    if animating.is_some() || !fades.is_empty() || gesture.active() {
+        return;
+    }
     let lan = &mut *lan;
     if let Ok(rx) = lan.discover_rx.lock() {
         while let Ok(found) = rx.try_recv() {
@@ -845,16 +851,24 @@ fn reset_unauthorized_device(
     }
 }
 
-/// 裏のスレッドから届いたペアリング・ドライブ・フォルダの結果を木に反映する。
+/// 裏のスレッドから届いたペアリング・ドライブ・フォルダの結果を木に反映する（操作中は保留）。
+#[allow(clippy::too_many_arguments)]
 fn poll_worker_events(
     lan: Option<ResMut<LanState>>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
+    mut sync: ResMut<crate::view::SyncRequest>,
+    animating: Option<Res<crate::view::Animating>>,
+    fades: Query<(), With<crate::view::Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     let Some(mut lan) = lan else {
         return;
     };
+    if animating.is_some() || !fades.is_empty() || gesture.active() {
+        return;
+    }
     let lan = &mut *lan;
     let events: Vec<WorkerEvent> = match lan.worker_rx.lock() {
         Ok(rx) => rx.try_iter().collect(),
@@ -922,6 +936,7 @@ fn poll_worker_events(
                             lan.saved.retain(|s| s.device_id != device_id);
                             save_saved_peers(&lan.data_dir, &lan.saved);
                             reset_unauthorized_device(&mut tree, &mut lan.in_flight, &device_id);
+                            sync.request_reset();
                         } else {
                             tree.set_remote_state(node, LoadState::Failed, false);
                         }
@@ -947,6 +962,7 @@ fn poll_worker_events(
                             save_saved_peers(&lan.data_dir, &lan.saved);
                             tree.set_remote_state(node, LoadState::Failed, true);
                             reset_unauthorized_device(&mut tree, &mut lan.in_flight, &device_id);
+                            sync.request_reset();
                         } else {
                             tree.set_remote_state(node, LoadState::Failed, true);
                         }
@@ -959,17 +975,24 @@ fn poll_worker_events(
     }
 }
 
-/// 相手の端末やフォルダが見えるところに来るか開かれたら、裏のスレッドで中身を取りに行く。
+/// 相手の端末やフォルダが見えるところに来るか開かれたら、裏のスレッドで中身を取りに行く（操作中は保留）。
+#[allow(clippy::too_many_arguments)]
 fn request_remote_nodes(
     lan: Option<ResMut<LanState>>,
     nav: Res<Nav>,
     layouts: Res<Layouts>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
+    animating: Option<Res<crate::view::Animating>>,
+    fades: Query<(), With<crate::view::Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
 ) {
     let Some(mut lan) = lan else {
         return;
     };
+    if animating.is_some() || !fades.is_empty() || gesture.active() {
+        return;
+    }
     let lan = &mut *lan;
     let top = nav.top().node;
     let opened_new = lan.last_top != Some(top);

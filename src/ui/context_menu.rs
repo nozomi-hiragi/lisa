@@ -109,8 +109,8 @@ impl ContextAction {
                 }
             }
             Self::Rename => "名前の変更…（準備中）",
-            Self::Move => "移動…（準備中）",
-            Self::Delete => "削除…（準備中）",
+            Self::Move => "移動…",
+            Self::Delete => "削除…",
             Self::Details => "詳細…（準備中）",
         }
     }
@@ -126,6 +126,8 @@ pub struct Target {
     pub at_root: bool,
     /// 手元のディスク上のパス。
     pub local_path: Option<PathBuf>,
+    /// 手元のドライブの中のファイル・フォルダか（Root・端末・ドライブの一番上や LAN の相手は false）。
+    pub local_movable: bool,
     /// コピーするパス（手元なら絶対パス、LAN の相手なら「端末名: パス」）。
     pub path_text: Option<String>,
 }
@@ -137,11 +139,11 @@ pub fn availability(action: ContextAction, target: &Target) -> bool {
         ContextAction::Up => !target.at_root,
         ContextAction::CopyPath => target.path_text.is_some(),
         ContextAction::Reveal => target.local_path.as_ref().is_some_and(|p| p.exists()),
+        ContextAction::Move | ContextAction::Delete => {
+            target.local_movable && target.local_path.as_ref().is_some_and(|p| p.exists())
+        }
         // まだ作っていない。
-        ContextAction::Rename
-        | ContextAction::Move
-        | ContextAction::Delete
-        | ContextAction::Details => false,
+        ContextAction::Rename | ContextAction::Details => false,
     }
 }
 
@@ -204,6 +206,8 @@ fn open_menu(
         return;
     };
     let local = local_path(&tree, node);
+    let local_movable =
+        tree.nodes[node].remote.is_none() && tree.nodes[node].depth >= 3 && local.is_some();
     let path_text = local
         .as_ref()
         .map(|p| p.display().to_string())
@@ -213,6 +217,7 @@ fn open_menu(
         is_open: nav.top().node == node,
         at_root: nav.stack.len() < 2,
         local_path: local,
+        local_movable,
         path_text,
     };
     let window_size = Vec2::new(window.width(), window.height());
@@ -268,6 +273,7 @@ fn run_command(
     mut commands: Commands,
     mut reader: MessageReader<ContextCommand>,
     mut clipboard: Option<ResMut<Clipboard>>,
+    mut organize: Option<ResMut<crate::organize::OrganizeState>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     for command in reader.read() {
@@ -292,11 +298,18 @@ fn run_command(
                     reveal(path);
                 }
             }
-            // TODO: 名前の変更、移動、削除、詳細はここに足す（今は押せない）。
-            ContextAction::Rename
-            | ContextAction::Move
-            | ContextAction::Delete
-            | ContextAction::Details => {}
+            ContextAction::Move => {
+                if let (Some(path), Some(organize)) = (&target.local_path, organize.as_mut()) {
+                    organize.pick_move_source = Some(path.clone());
+                }
+            }
+            ContextAction::Delete => {
+                if let (Some(path), Some(organize)) = (&target.local_path, organize.as_mut()) {
+                    organize.user_trash(path.clone());
+                }
+            }
+            // TODO: 名前の変更、詳細はここに足す（今は押せない）。
+            ContextAction::Rename | ContextAction::Details => {}
         }
         redraw.write(RequestRedraw);
     }
@@ -480,6 +493,7 @@ mod tests {
             is_open: false,
             at_root: false,
             local_path: None,
+            local_movable: false,
             path_text: None,
         }
     }
@@ -500,26 +514,33 @@ mod tests {
         let mut t = target();
         assert!(!availability(ContextAction::CopyPath, &t));
         assert!(!availability(ContextAction::Reveal, &t));
-        // LAN の相手のもの: コピーはできるが、手元のディスクに無いので表示はできない。
+        assert!(!availability(ContextAction::Move, &t));
+        assert!(!availability(ContextAction::Delete, &t));
+        // LAN の相手のもの: コピーはできるが、手元のディスクに無いので表示・移動・削除はできない。
         t.path_text = Some("Windows PC: C:/Users".into());
         assert!(availability(ContextAction::CopyPath, &t));
         assert!(!availability(ContextAction::Reveal, &t));
+        assert!(!availability(ContextAction::Move, &t));
+        assert!(!availability(ContextAction::Delete, &t));
         let here = std::env::current_dir().unwrap();
         t.local_path = Some(here.clone());
         t.path_text = Some(here.display().to_string());
         assert!(availability(ContextAction::Reveal, &t));
+        // ドライブの一番上（local_movable = false）では移動・削除はできない。
+        assert!(!availability(ContextAction::Move, &t));
+        assert!(!availability(ContextAction::Delete, &t));
+        // ドライブの中のファイル・フォルダなら移動・削除できる。
+        t.local_movable = true;
+        assert!(availability(ContextAction::Move, &t));
+        assert!(availability(ContextAction::Delete, &t));
     }
 
     #[test]
     fn unfinished_actions_are_disabled() {
         let mut t = target();
         t.local_path = Some(std::env::current_dir().unwrap());
-        for action in [
-            ContextAction::Rename,
-            ContextAction::Move,
-            ContextAction::Delete,
-            ContextAction::Details,
-        ] {
+        t.local_movable = true;
+        for action in [ContextAction::Rename, ContextAction::Details] {
             assert!(!availability(action, &t));
         }
     }

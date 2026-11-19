@@ -8,7 +8,9 @@ use bevy::prelude::*;
 
 use crate::model::tree::{FileTree, NodeId};
 use crate::ui::menu::BAR_PX;
-use crate::view::{CurrentScene, Level, Nav, SceneMaker, fit, scene_path, show_breadcrumb};
+use crate::view::{
+    CurrentScene, Level, Location, Nav, SceneMaker, SyncRequest, fit, scene_path, show_breadcrumb,
+};
 
 use super::zoom_levels::{ZoomGoal, grid_levels, grid_snap};
 
@@ -109,33 +111,45 @@ pub(super) fn targets(
     pos: Vec2,
 ) -> Vec<(Target, Vec2, f32)> {
     let top = *nav.top();
-    let fit_of = |id: NodeId| fit(maker.layouts[id].fit, window);
+    let fit_of = |id: NodeId| -> Option<(Vec2, f32)> {
+        let rect = maker.layouts[id].fit;
+        if !(rect.width() > 0.0 && rect.height() > 0.0) {
+            return None;
+        }
+        let (p, s) = fit(rect, window);
+        (s > 0.0 && s.is_finite() && p.is_finite()).then_some((p, s))
+    };
     // フォルダの中を拡大して見る段も、そのフォルダの行き先として候補に入れる。
     let grid_of = |id: NodeId| {
         grid_levels(maker, window, id)
             .into_iter()
+            .filter(|s| *s > 0.0 && s.is_finite())
             .map(move |s| (grid_snap(maker, window, id, pos, s), s))
     };
     let mut out = Vec::new();
-    let (p, s) = fit_of(top.node);
-    out.push((Target::Current, p, s));
+    if let Some((p, s)) = fit_of(top.node) {
+        out.push((Target::Current, p, s));
+    }
     for (p, s) in grid_of(top.node) {
         out.push((Target::Current, p, s));
     }
     for &child in &maker.tree.nodes[top.node].children {
-        let (p, s) = fit_of(child);
-        out.push((Target::Child(child), p, s));
+        if let Some((p, s)) = fit_of(child) {
+            out.push((Target::Child(child), p, s));
+        }
     }
     if nav.stack.len() >= 2 {
         let parent = nav.stack[nav.stack.len() - 2].node;
-        let (p, s) = fit_of(parent);
-        out.push((Target::Parent, p, s));
+        if let Some((p, s)) = fit_of(parent) {
+            out.push((Target::Parent, p, s));
+        }
         for (p, s) in grid_of(parent) {
             out.push((Target::Parent, p, s));
         }
         for &sibling in &maker.tree.nodes[parent].children {
-            if sibling != top.node {
-                let (p, s) = fit_of(sibling);
+            if sibling != top.node
+                && let Some((p, s)) = fit_of(sibling)
+            {
                 out.push((Target::Sibling(sibling), p, s));
             }
         }
@@ -151,6 +165,8 @@ pub(super) fn targets(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn coast_step(
     coast: &mut Coast,
+    location: &mut Location,
+    sync: &mut SyncRequest,
     nav: &mut Nav,
     current: &mut CurrentScene,
     maker: &mut SceneMaker,
@@ -163,10 +179,25 @@ pub(super) fn coast_step(
     let dt = (now - coast.last).as_secs_f32().min(1.0 / 30.0);
     coast.last = now;
 
-    // 動いている途中でも、いちばん近い行き先が変わったら、開いている場所をそちらへ切り替える。
     let pos = transform.translation.truncate();
+    let root_scale = fit(maker.layouts[FileTree::ROOT].fit, window).1;
+    if !(ortho.scale > 0.0
+        && ortho.scale.is_finite()
+        && pos.is_finite()
+        && root_scale > 0.0
+        && root_scale.is_finite())
+    {
+        if let Some(parent) = coast.parent_scene.take() {
+            maker.commands.entity(parent).despawn();
+        }
+        sync.request_reset();
+        return true;
+    }
+
+    // 動いている途中でも、いちばん近い行き先が変わったら、開いている場所をそちらへ切り替える。
     refocus(
         &mut coast.parent_scene,
+        location,
         nav,
         current,
         maker,
@@ -186,10 +217,13 @@ pub(super) fn coast_step(
     // ピンチでなければ（2本指で動かしただけなら）、勢いで少し流してから止める。
     // どちらでも、Root より縮めていたら Root の大きさへ寄せる。
     let mut ln = ln + coast.velocity_ln * dt;
-    if let Some(goal) = coast.zoom_goal {
+    if let Some(goal) = coast.zoom_goal
+        && goal.scale > 0.0
+        && goal.scale.is_finite()
+    {
         ln += (goal.scale.ln() - ln) * pull;
     }
-    let root_ln = fit(maker.layouts[FileTree::ROOT].fit, window).1.ln();
+    let root_ln = root_scale.ln();
     if ln > root_ln {
         ln += (root_ln - ln) * pull;
     }
@@ -204,22 +238,37 @@ pub(super) fn coast_step(
     };
     let goal = match (grid_folder, coast.zoom_goal, coast.pan_goal) {
         (_, None, Some(PanGoal::Grid(goal))) => goal,
-        (_, None, Some(PanGoal::Node(node))) => {
+        (_, None, Some(PanGoal::Node(node))) if maker.layouts.contains(node) => {
             let (p, s) = fit(maker.layouts[node].fit, window);
             p + Vec2::new(0.0, BAR_PX / 2.0 * (scale - s))
         }
-        (Some(folder), _, _) => grid_snap(maker, window, folder, pos, scale),
-        (None, Some(goal), _) => {
+        (Some(folder), _, _) if maker.layouts.contains(folder) => {
+            grid_snap(maker, window, folder, pos, scale)
+        }
+        (None, Some(goal), _) if maker.layouts.contains(goal.node) => {
             let (p, s) = fit(maker.layouts[goal.node].fit, window);
             p + Vec2::new(0.0, BAR_PX / 2.0 * (scale - s))
         }
-        (None, None, _) => {
-            let (_, p, s) = nearest(nav, maker, window, pos, scale).0;
-            p + Vec2::new(0.0, BAR_PX / 2.0 * (scale - s))
-        }
+        _ => match nearest(nav, maker, window, pos, scale) {
+            Some(((_, p, s), _, _)) => p + Vec2::new(0.0, BAR_PX / 2.0 * (scale - s)),
+            None => {
+                if let Some(parent) = coast.parent_scene.take() {
+                    maker.commands.entity(parent).despawn();
+                }
+                sync.request_reset();
+                return true;
+            }
+        },
     };
     let mut pos = pos + coast.velocity * dt;
     pos += (goal - pos) * pull;
+    if !(scale > 0.0 && scale.is_finite() && pos.is_finite()) {
+        if let Some(parent) = coast.parent_scene.take() {
+            maker.commands.entity(parent).despawn();
+        }
+        sync.request_reset();
+        return true;
+    }
     transform.translation = pos.extend(0.0);
     ortho.scale = scale;
 
@@ -228,9 +277,9 @@ pub(super) fn coast_step(
         && coast.velocity_ln.abs() < REST_LN_PER_SECOND
         && (goal - pos).length() / scale < REST_PX
         && ln <= root_ln + 1e-3
-        && coast
-            .zoom_goal
-            .is_none_or(|goal| (ln - goal.scale.ln()).abs() < 0.002);
+        && coast.zoom_goal.is_none_or(|goal| {
+            goal.scale <= 0.0 || !goal.scale.is_finite() || (ln - goal.scale.ln()).abs() < 0.002
+        });
     if !at_rest {
         show_parent_if_zoomed_out(&mut coast.parent_scene, nav, current, maker, window, scale);
         return false;
@@ -242,11 +291,22 @@ pub(super) fn coast_step(
         _ => None,
     };
     if let Some(node) = settled {
-        focus_node(node, &mut coast.parent_scene, nav, current, maker, window);
+        focus_node(
+            node,
+            &mut coast.parent_scene,
+            location,
+            sync,
+            nav,
+            current,
+            maker,
+            window,
+        );
     }
     // 今のものより縮めたまま止まったら、下に敷いた親の場面は残す（周りが見えているので）。
+    // ただしファイルを開いているとき（親の場面そのものを表示中）は親の下敷きは不要なので必ず消す。
+    let top_is_dir = maker.tree.nodes[nav.top().node].is_dir;
     let (_, rest_scale) = fit(nav.top().frame(&maker.layouts), window);
-    if scale <= rest_scale * 1.01
+    if (!top_is_dir || scale <= rest_scale * 1.01)
         && let Some(parent) = coast.parent_scene.take()
     {
         maker.commands.entity(parent).despawn();
@@ -280,6 +340,7 @@ pub(super) fn choose_pan(
     let nearest = siblings
         .iter()
         .copied()
+        .filter(|s| maker.layouts.contains(*s))
         .min_by(|a, b| {
             center(*a)
                 .distance_squared(at)
@@ -296,7 +357,7 @@ pub(super) fn choose_pan(
     let next = siblings
         .iter()
         .copied()
-        .filter(|s| *s != top)
+        .filter(|s| *s != top && maker.layouts.contains(*s))
         .filter_map(|s| {
             let d = center(s) - from;
             let along = d.dot(direction);
@@ -316,24 +377,39 @@ pub(super) fn zoomed_within(nav: &Nav, maker: &SceneMaker, window: &Window, scal
     maker.tree.nodes[top].is_dir && scale < fit(maker.layouts[top].fit, window).1 * 0.9
 }
 
-/// 開いている場所を `node` にする（Root からの道のりに置き換え、場面を入れ替える）。
+/// 開いている場所を `node` にする（Root からの道のりに置き換え、正の場所と場面を入れ替える）。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn focus_node(
     node: NodeId,
     parent_scene: &mut Option<Entity>,
+    location: &mut Location,
+    sync: &mut SyncRequest,
     nav: &mut Nav,
     current: &mut CurrentScene,
     maker: &mut SceneMaker,
     window: &Window,
 ) {
-    if nav.top().node == node {
+    let Some(nodes) = maker.tree.path_from_root(node) else {
+        // 木から外れた古いノードなら無視して、正の場所からそろえ直す。
+        sync.request_reset();
+        return;
+    };
+    if !maker.layouts.contains(node) {
+        sync.request_reset();
         return;
     }
-    let mut path = vec![Level { node }];
-    while let Some(parent) = maker.tree.nodes[path[0].node].parent {
-        path.insert(0, Level { node: parent });
+    if nav.top().node == node {
+        if !maker.tree.nodes[node].is_dir
+            && let Some(parent) = parent_scene.take()
+        {
+            maker.commands.entity(parent).despawn();
+        }
+        return;
     }
+    let path: Vec<Level> = nodes.into_iter().map(|node| Level { node }).collect();
     let old_folder = scene_path(nav, &maker.tree).last().map(|l| l.node);
     nav.stack = path;
+    *location = Location::from_tree(&maker.tree, node);
     let new_scene = scene_path(nav, &maker.tree).to_vec();
     let new_folder = new_scene.last().map(|l| l.node);
     if old_folder != new_folder {
@@ -353,6 +429,11 @@ pub(super) fn focus_node(
                 current.0 = maker.spawn(&new_scene, scale);
             }
         }
+    } else if !maker.tree.nodes[node].is_dir
+        && let Some(parent) = parent_scene.take()
+    {
+        // 同じ場面のままファイルへ移ったら、親の下敷きは不要なので消す。
+        maker.commands.entity(parent).despawn();
     }
     show_breadcrumb(&mut maker.commands, &maker.tree, nav.top().node);
 }
@@ -365,6 +446,9 @@ pub(super) fn closeness(
     target_scale: f32,
     view_width: f32,
 ) -> f32 {
+    if !(scale > 0.0 && target_scale > 0.0 && view_width > 0.0) {
+        return f32::INFINITY;
+    }
     (scale.ln() - target_scale.ln()).abs()
         + (pos - target_pos).length() / (target_scale * view_width)
 }
@@ -376,8 +460,11 @@ pub(super) fn nearest(
     window: &Window,
     pos: Vec2,
     scale: f32,
-) -> ((Target, Vec2, f32), f32, f32) {
+) -> Option<((Target, Vec2, f32), f32, f32)> {
     let candidates = targets(nav, maker, window, pos);
+    if candidates.is_empty() {
+        return None;
+    }
     let close = |(_, p, s): &(Target, Vec2, f32)| {
         closeness(pos, scale, *p, *s, crate::view::view_width(window))
     };
@@ -389,16 +476,17 @@ pub(super) fn nearest(
         .fold(f32::INFINITY, f32::min);
     let best = candidates
         .into_iter()
-        .min_by(|a, b| close(a).total_cmp(&close(b)))
-        .expect("今開いているものは必ず候補にある");
+        .min_by(|a, b| close(a).total_cmp(&close(b)))?;
     let best_closeness = close(&best);
-    (best, best_closeness, current)
+    Some((best, best_closeness, current))
 }
 
 /// いちばん近い行き先が今開いているものより十分近ければ、開いている場所をそちらへ切り替える
 /// （カメラは動かさない）。動かしている最中も離したあとも、毎フレーム見る。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn refocus(
     parent_scene: &mut Option<Entity>,
+    location: &mut Location,
     nav: &mut Nav,
     current: &mut CurrentScene,
     maker: &mut SceneMaker,
@@ -408,19 +496,22 @@ pub(super) fn refocus(
 ) {
     // 一度に 2 段以上ずれていることもあるので、何回か見る。
     for _ in 0..4 {
-        let ((target, _, _), best, now) = nearest(nav, maker, window, pos, scale);
+        let Some(((target, _, _), best, now)) = nearest(nav, maker, window, pos, scale) else {
+            return;
+        };
         // 境目で行ったり来たりしないよう、少し余裕を持たせる。
         if target == Target::Current || best > now - REFOCUS_MARGIN {
             return;
         }
-        switch_focus(target, parent_scene, nav, current, maker, window);
+        switch_focus(target, parent_scene, location, nav, current, maker, window);
     }
 }
 
-/// 開いている場所を `target` へ切り替え、場面をその場で入れ替える（カメラは動かさない）。
+/// 開いている場所を `target` へ切り替え、正の場所と場面をその場で入れ替える（カメラは動かさない）。
 pub(super) fn switch_focus(
     target: Target,
     parent_scene: &mut Option<Entity>,
+    location: &mut Location,
     nav: &mut Nav,
     current: &mut CurrentScene,
     maker: &mut SceneMaker,
@@ -437,6 +528,9 @@ pub(super) fn switch_focus(
     match target {
         Target::Current => return,
         Target::Child(child) => {
+            if !maker.tree.is_attached(child) || !maker.layouts.contains(child) {
+                return;
+            }
             if let Some(parent) = parent_scene.take() {
                 maker.commands.entity(parent).despawn();
             }
@@ -447,6 +541,9 @@ pub(super) fn switch_focus(
             }
         }
         Target::Parent => {
+            if nav.stack.len() < 2 {
+                return;
+            }
             nav.stack.pop();
             // 開いていたのがファイルなら、今の場面がもう親の場面。
             if was_dir {
@@ -457,9 +554,14 @@ pub(super) fn switch_focus(
                     }
                     None => respawn(current, maker, nav),
                 }
+            } else if let Some(parent) = parent_scene.take() {
+                maker.commands.entity(parent).despawn();
             }
         }
         Target::Sibling(sibling) => {
+            if !maker.tree.is_attached(sibling) || !maker.layouts.contains(sibling) {
+                return;
+            }
             *nav.stack.last_mut().expect("今のもの") = Level { node: sibling };
             let is_dir = maker.tree.nodes[sibling].is_dir;
             if is_dir || was_dir {
@@ -471,5 +573,6 @@ pub(super) fn switch_focus(
             }
         }
     }
+    *location = Location::from_tree(&maker.tree, nav.top().node);
     show_breadcrumb(&mut maker.commands, &maker.tree, nav.top().node);
 }

@@ -41,7 +41,7 @@ const TEXT_EXTENSIONS: &[&str] = &[
 
 impl Server {
     /// `settings.json` の場所（テスト用に `data_dir` の中があればそれを優先し、無ければアプリと同じ）。
-    fn settings_path(&self) -> Option<PathBuf> {
+    pub(super) fn settings_path(&self) -> Option<PathBuf> {
         let local = self.data_dir.join("settings.json");
         if local.exists() {
             return Some(local);

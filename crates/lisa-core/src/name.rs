@@ -52,12 +52,20 @@ pub fn hash_order(a_nfc: &str, a_raw: &[u8], b_nfc: &str, b_raw: &[u8]) -> Order
         .then_with(|| a_raw.cmp(b_raw))
 }
 
+/// 隔離フォルダの名前（ドライブの一番上に作るもの）。読む係は飛ばす。
+pub const QUARANTINE_DIR_NAME: &str = ".lisa-trash";
+
 /// OS が勝手に作るファイル。木にもハッシュにも入れない。
 pub fn is_os_junk(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
         Some(".DS_Store" | ".localized" | "Thumbs.db" | "desktop.ini" | "Desktop.ini")
     )
+}
+
+/// Lisa の隔離フォルダの名前か。木にもハッシュにも重複にも入れない。
+pub fn is_quarantine_dir(name: &OsStr) -> bool {
+    name == OsStr::new(QUARANTINE_DIR_NAME)
 }
 
 #[cfg(test)]

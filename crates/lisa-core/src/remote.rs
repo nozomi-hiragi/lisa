@@ -54,6 +54,41 @@ pub enum Command {
     Pause { paused: bool },
     /// アプリを終了する。
     Quit,
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 描画・ナビ・場面・カメラの状態を返す。
+    DebugState,
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 指定フォルダを「読み直したら変わっていた」扱いにして
+    /// 読む係から `Changed -> Listed -> Committed` を流す。
+    DebugChanged { path: PathBuf },
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: ピンチ入力を送る（正で拡大、負で縮小）。
+    DebugPinch {
+        delta: f32,
+        #[serde(default)]
+        touching: Option<bool>,
+        #[serde(default)]
+        cursor: Option<[f32; 2]>,
+    },
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 2 本指パン入力を送る。
+    /// `phase` は `"began"` / `"changed"` / `"ended"` / `"tap"`。
+    DebugPan {
+        dx: f32,
+        dy: f32,
+        phase: String,
+        #[serde(default)]
+        cursor: Option<[f32; 2]>,
+    },
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: マウスホイール入力を送る（正で拡大、負で縮小）。
+    DebugWheel {
+        y: f32,
+        #[serde(default)]
+        cursor: Option<[f32; 2]>,
+    },
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: クリックや親へ戻る操作を送る。
+    /// `action` は `"up"` または `"click"`（`screen_pos` に論理ピクセル座標を指定）。
+    DebugNav {
+        action: String,
+        #[serde(default)]
+        screen_pos: Option<[f32; 2]>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +107,9 @@ pub struct Reply {
     /// 頼みのあとの様子。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<State>,
+    /// 検証用の描画状態（`Command::DebugState` の返事だけ）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<DebugState>,
 }
 
 impl Reply {
@@ -80,6 +118,16 @@ impl Reply {
             ok: true,
             error: None,
             state: Some(state),
+            debug: None,
+        }
+    }
+
+    pub fn ok_debug(state: State, debug: DebugState) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            state: Some(state),
+            debug: Some(debug),
         }
     }
 
@@ -88,8 +136,77 @@ impl Reply {
             ok: false,
             error: Some(message.into()),
             state: None,
+            debug: None,
         }
     }
+}
+
+/// 画面レイヤー上の `SceneRoot` 1 つ分の検証用情報。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DebugSceneInfo {
+    pub entity: u64,
+    pub folder: usize,
+    pub folder_name: String,
+    pub is_current: bool,
+    pub is_parent_scene: bool,
+    pub has_fade: bool,
+    pub fade_in: Option<bool>,
+    pub fade_replaces: Option<u64>,
+    pub children_count: usize,
+}
+
+/// 今の場面の直下タイルの検証用情報。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DebugTileRect {
+    pub node: usize,
+    pub name: String,
+    pub is_dir: bool,
+    pub has_image: bool,
+    pub image_format: Option<String>,
+    /// 本体（`frame`）の画面上の矩形 `[x, y, width, height]`（論理ピクセル、左上原点）。
+    pub screen_rect: Option<[f32; 4]>,
+}
+
+/// 検証用の描画・ナビゲーション状態。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DebugState {
+    pub nav_nodes: Vec<usize>,
+    pub nav_names: Vec<String>,
+    pub nav_entries: Vec<Option<i64>>,
+    pub nav_top_path: Option<PathBuf>,
+    pub nav_top_attached: bool,
+    pub nav_top_in_layout: bool,
+    pub breadcrumb: String,
+    pub menu_breadcrumb: Option<String>,
+    pub anchor_node: usize,
+    pub anchor_name: String,
+    pub anchor_attached: bool,
+    pub camera_pos: [f32; 2],
+    pub camera_pos_finite: bool,
+    pub camera_scale: f32,
+    pub camera_scale_finite: bool,
+    pub fit_pos: [f32; 2],
+    pub fit_scale: f32,
+    pub fit_scale_finite: bool,
+    pub parent_fit_scale: Option<f32>,
+    pub root_fit_scale: f32,
+    pub window_logical_size: [f32; 2],
+    pub window_scale_factor: f32,
+    pub main_scenes: usize,
+    pub scenes: Vec<DebugSceneInfo>,
+    pub current_scene_folder: Option<usize>,
+    pub current_scene_folder_name: Option<String>,
+    pub gesture_active: bool,
+    pub gesture_has_parent_scene: bool,
+    pub animating: bool,
+    pub fades: usize,
+    pub bake_state: String,
+    pub folder_images_slots: usize,
+    pub folder_images_ready: usize,
+    pub tree_changed_pending: bool,
+    pub jump_pending: bool,
+    pub occluded: bool,
+    pub child_tiles: Vec<DebugTileRect>,
 }
 
 /// アプリの今の様子。

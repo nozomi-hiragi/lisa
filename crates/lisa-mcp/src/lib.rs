@@ -5,10 +5,12 @@
 //!   カタログの TOML ファイル（`lisa_catalog_save`）と DB の `assignment` の表（`lisa_assign` /
 //!   `lisa_unassign`）だけ。
 //! - アプリの画面を動かす道具（`lisa_app_*`）は、起動中のアプリに `lisa_core::remote` で頼む。
-//! - ユーザーのファイルやフォルダは何も動かさない（ペアリングした端末から sidecar に頼む `lisa_update` だけ、
-//!   `lisa` / `lisa-mcp` の実行ファイルを入れ替える）。
+//! - ユーザーのファイルを動かすには `lisa_plan_create` で計画を出し、人が Lisa の画面（か CLI）で
+//!   許可したときだけ実行される（許可する道具は作らない。取り消しは `lisa_undo`）。ペアリングした端末から
+//!   sidecar に頼む `lisa_update` だけ、`lisa` / `lisa-mcp` の実行ファイルを入れ替える。
 
 mod catalog;
+mod organize;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -271,6 +273,11 @@ impl Server {
             "lisa_catalog_save" => self.catalog_save(args),
             "lisa_assign" => self.assign(args),
             "lisa_unassign" => self.unassign(args),
+            "lisa_plan_create" => self.plan_create(args, auth),
+            "lisa_plan_status" => self.plan_status(args),
+            "lisa_plans" => self.plans(args),
+            "lisa_plan_cancel" => self.plan_cancel(args),
+            "lisa_undo" => self.undo(args),
             _ => Err(format!("知らない道具: {name}")),
         };
         match result {
@@ -2219,8 +2226,8 @@ pub const INSTRUCTIONS: &str = "Lisa は、複数の PC やドライブのファ
 DB を読む道具（lisa_drives, lisa_list, lisa_info, lisa_search, lisa_duplicates, lisa_copies, lisa_snapshots）と\
 ログや生死を見る道具（lisa_logs, lisa_app_alive）はアプリが起動していなくても使えます。lisa_app_* は起動中のアプリの画面や起動・終了を扱います。\
 カタログの道具（lisa_catalogs, lisa_catalog_matches, lisa_unclassified, lisa_outline, lisa_catalog_test）でアプリのフォルダを見分けたり形を調べたりできます。\
-書き込むのはカタログの型ファイル（lisa_catalog_save）と 1 か所の仕分け（lisa_assign, lisa_unassign）だけです。\
-ユーザーのファイルは何も動かしません（ペアリングした端末から sidecar に頼む lisa_update だけ実行ファイルを入れ替えます）。\
+整理の道具（lisa_plan_create, lisa_plan_status, lisa_plans, lisa_plan_cancel, lisa_undo）で移動・フォルダ作成・隔離の計画を出せます。\
+計画の許可は人が Lisa の画面（か CLI）で押します。押されるまでユーザーのファイルは何も動きません（許可する道具は無く、lisa_plan_status の wait で待てます）。\
 大きさはバイト、日時は UTC の Unix 時刻（ミリ秒）、ハッシュは BLAKE3 の 16 進です。";
 
 /// 道具の一覧（名前、説明、引数の形）。
@@ -2467,6 +2474,89 @@ pub fn tools() -> Value {
                 "assignment_id": {"type": "integer", "description": "仕分けの行 ID（path / id の代わりに）"},
             })),
             "annotations": app_hint,
+        },
+        {
+            "name": "lisa_plan_create",
+            "description": "ファイルの移動・フォルダ作成・隔離の計画を確かめて作る。許可は人が画面（または CLI）で押す。押されるまで何も動かない。refused が 1 つでもあれば計画を作らず理由だけ返す（dry_run: true なら作らず確かめだけ）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ops": {
+                        "type": "array",
+                        "description": "操作の配列（最大 5000 件）。各要素は {op: \"mkdir\", path}、{op: \"move\", from, to}、{op: \"trash\", path, keep?} のどれか。パスは絶対パス。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": {"type": "string", "enum": ["mkdir", "move", "trash"]},
+                                "path": {"type": "string"},
+                                "from": {"type": "string"},
+                                "to": {"type": "string"},
+                                "keep": {"type": "string"},
+                            },
+                            "required": ["op"],
+                        },
+                    },
+                    "note": {"type": "string", "description": "計画の説明（許可画面で人に見せる）"},
+                    "dry_run": {"type": "boolean", "description": "true なら計画を作らず確かめだけ行う（既定 false）"},
+                },
+                "required": ["ops"],
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+        },
+        {
+            "name": "lisa_plan_status",
+            "description": "計画の状態と操作ごとの結果を返す。許可は人が画面で押す。wait（秒、最大 60）を付けると、許可待ち（や実行中）が終わるまで待つ。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "計画の番号（lisa_plan_create の id）"},
+                    "wait": {"type": "integer", "description": "許可待ちが変わるまで待つ秒数（0〜60、既定 0）"},
+                    "ops_offset": {"type": "integer", "description": "操作の一覧で飛ばす件数（既定 0）"},
+                    "ops_limit": {"type": "integer", "description": "操作の一覧で出す件数（既定 200、最大 5000）"},
+                },
+                "required": ["id"],
+            },
+            "annotations": read_only,
+        },
+        {
+            "name": "lisa_plans",
+            "description": "整理の計画の一覧（新しい順）。状態（state）で絞れる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": ["pending", "approved", "running", "done", "partial", "rejected", "cancelled", "expired", "undone"],
+                        "description": "状態で絞る（省略すれば全部）",
+                    },
+                    "limit": {"type": "integer", "description": "出す件数（既定 20、最大 200）"},
+                },
+            },
+            "annotations": read_only,
+        },
+        {
+            "name": "lisa_plan_cancel",
+            "description": "許可待ち（pending）の計画を取り下げる。すでに実行された計画は取り下げられない（戻すには lisa_undo を使う）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "計画の番号"},
+                },
+                "required": ["id"],
+            },
+            "annotations": app_hint,
+        },
+        {
+            "name": "lisa_undo",
+            "description": "実行済みの計画（done / partial）を逆の順で取り消す。許可は要らない（上書きはせず、戻す先が埋まっている・元が変わったものは飛ばして理由を返す）。隔離から OS のゴミ箱へ送った分は戻せない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "計画の番号"},
+                },
+                "required": ["id"],
+            },
+            "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
         },
     ])
 }

@@ -19,7 +19,14 @@ impl Plugin for MenuPlugin {
             .add_systems(PostStartup, spawn_menu)
             .add_systems(
                 Update,
-                (close_with_escape, show_popup, show_breadcrumb, show_pause).in_set(MenuSystems),
+                (
+                    close_with_escape,
+                    show_popup,
+                    show_breadcrumb,
+                    show_pause,
+                    show_organize_badge,
+                )
+                    .in_set(MenuSystems),
             );
     }
 }
@@ -51,6 +58,10 @@ struct BreadcrumbText;
 /// 一時停止のボタンの文字（止めているあいだは「再開」）。
 #[derive(Component)]
 struct PauseText;
+
+/// 整理ボタンの文字（許可待ちがあれば件数を添える）。
+#[derive(Component)]
+struct OrganizeText;
 
 pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
     let text_font = TextFont::from_font_size(14.0).with_font(font.0.clone());
@@ -132,6 +143,22 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                     .observe(
                         |_: On<PointerClick>, mut view: ResMut<crate::catalog::CatalogView>| {
                             view.open = !view.open;
+                        },
+                    );
+                buttons
+                    .spawn((
+                        button(),
+                        children![(
+                            OrganizeText,
+                            Text::new("整理"),
+                            text_font.clone(),
+                            TextColor(TEXT_COLOR)
+                        )],
+                    ))
+                    .observe(
+                        |_: On<PointerClick>,
+                         mut organize: ResMut<crate::organize::OrganizeState>| {
+                            organize.panel_open = !organize.panel_open;
                         },
                     );
                 buttons
@@ -259,5 +286,26 @@ fn show_pause(
     let label = if paused { "再開" } else { "一時停止" };
     if text.0 != label {
         text.0 = label.to_string();
+    }
+}
+
+fn show_organize_badge(
+    organize: Option<Res<crate::organize::OrganizeState>>,
+    mut text: Single<&mut Text, With<OrganizeText>>,
+) {
+    let Some(organize) = organize else {
+        return;
+    };
+    if !organize.is_changed() {
+        return;
+    }
+    let n = organize.pending.len();
+    let label = if n > 0 {
+        format!("整理 ({n})")
+    } else {
+        "整理".to_string()
+    };
+    if text.0 != label {
+        text.0 = label;
     }
 }
