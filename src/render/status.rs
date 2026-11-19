@@ -55,6 +55,7 @@ pub fn draw_file(
     background: Color,
     z: f32,
     live: bool,
+    loaded: Option<(Handle<Image>, UVec2)>,
 ) {
     match state {
         LoadState::Unloaded => outline(painter, frame, background, z),
@@ -64,9 +65,9 @@ pub fn draw_file(
                 pulse(painter, frame, z + 0.1);
             }
         }
-        LoadState::Loaded => preview::draw(previews, painter, name, frame, background, z),
+        LoadState::Loaded => preview::draw(previews, painter, name, frame, background, z, loaded),
         LoadState::Stale => {
-            preview::draw(previews, painter, name, frame, background, z);
+            preview::draw(previews, painter, name, frame, background, z, loaded);
             dim(painter, frame, z + 0.1);
         }
         LoadState::Failed => failed(painter, frame, background, z),

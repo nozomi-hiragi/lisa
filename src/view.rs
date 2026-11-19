@@ -96,6 +96,7 @@ impl Plugin for TreeViewPlugin {
                     update_ears,
                     fade_scenes,
                     cache::update_thumbnails,
+                    crate::preview::update_previews,
                     crate::render::status::pulse_loading,
                     keep_redrawing,
                     update_title,
