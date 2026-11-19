@@ -531,7 +531,8 @@ fn show_baked(
     current.0 = maker.spawn(path, scale);
 }
 
-/// 左クリックしたフォルダかファイルへズームイン、右クリックか Esc で親へズームアウト。
+/// 左クリックしたフォルダかファイルへズームイン、Esc で親へズームアウト（右クリックはメニュー、
+/// `ui/context_menu.rs`。そこで選んだ「開く」「親へ戻る」もここで動かす）。
 #[allow(clippy::too_many_arguments)]
 fn navigate(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -546,13 +547,22 @@ fn navigate(
     popup: Res<Popup>,
     banners: Query<&bevy::picking::hover::Hovered, With<crate::lan::PairBanner>>,
     mut gesture: ResMut<crate::input::gesture::Gesture>,
+    context_menu: Res<crate::ui::context_menu::ContextMenu>,
+    request: Option<Res<crate::ui::context_menu::NavRequest>>,
 ) {
+    use crate::ui::context_menu::NavRequest;
+    // 右クリックのメニューで選んだ「開く」「親へ戻る」。
+    let request = request.map(|r| *r);
+    if request.is_some() {
+        maker.commands.remove_resource::<NavRequest>();
+    }
     // 切り替えの途中や、メニューやジェスチャーを操作しているときは受け付けない。
     let over_banner = banners.iter().any(|h| h.get());
     if animating.is_some()
         || !fades.is_empty()
         || gesture.active()
-        || ui_has_pointer(&window, &popup, over_banner)
+        || (request.is_none()
+            && (context_menu.busy() || ui_has_pointer(&window, &popup, over_banner)))
     {
         return;
     }
@@ -562,20 +572,24 @@ fn navigate(
         return;
     };
     let old = nav.stack.clone();
-    if mouse.just_pressed(MouseButton::Left) {
-        // クリックした所にあるもの（今のものの中なら子、外なら隣や親の隣、何も無い所なら親）。
-        let Some(world) = window
+    let click_at = match request {
+        Some(NavRequest::ClickAt(world)) => Some(world),
+        Some(NavRequest::Up) => None,
+        None if mouse.just_pressed(MouseButton::Left) => window
             .cursor_position()
-            .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
-        else {
-            return;
-        };
+            .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok()),
+        None => None,
+    };
+    let go_up = matches!(request, Some(NavRequest::Up))
+        || (request.is_none() && keys.just_pressed(KeyCode::Escape));
+    if let Some(world) = click_at {
+        // クリックした所にあるもの（今のものの中なら子、外なら隣や親の隣、何も無い所なら親）。
         let path = hit_path(&maker, &nav, world);
         if path.len() == old.len() && path.iter().zip(&old).all(|(a, b)| *a == b.node) {
             return;
         }
         nav.stack = path.into_iter().map(|node| Level { node }).collect();
-    } else if mouse.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::Escape) {
+    } else if go_up {
         if nav.stack.len() < 2 {
             return;
         }

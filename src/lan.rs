@@ -159,7 +159,7 @@ pub(crate) fn clean_peer_name(raw: &str) -> String {
 
 /// 頼む側・受ける側の全体の状態。
 #[derive(Resource)]
-struct LanState {
+pub(crate) struct LanState {
     data_dir: PathBuf,
     cache_dir: Option<PathBuf>,
     this_device_id: String,
@@ -193,6 +193,16 @@ struct LanState {
     /// 設定のポップアップに出す「つないだ端末」（`lan.json` の `peers`）のキャッシュ。
     authorized_peers: Vec<Peer>,
     authorized_dirty: bool,
+}
+
+impl LanState {
+    /// ペアリング済みの相手を `device_id` で引く。
+    pub(crate) fn saved_peer(&self, device_id: &str) -> Option<SavedPeer> {
+        self.saved
+            .iter()
+            .find(|s| s.device_id == device_id)
+            .cloned()
+    }
 }
 
 enum WorkerEvent {
@@ -1342,6 +1352,88 @@ fn fetch_children(peer: &SavedPeer, entry_id: i64) -> Result<Vec<Item>, (bool, S
     Ok(all)
 }
 
+/// 相手のフォルダ（または端末）の合計（下まで全部）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteTotals {
+    pub files: u64,
+    pub folders: u64,
+    pub bytes: u64,
+}
+
+/// 相手のフォルダ（またはドライブ）`entry_id` の合計を、`lisa_info`（`totals: true`）で取る。
+/// フォルダでない・まだ読んでいない・エラーがあるときは `Ok(None)`。
+pub(crate) fn fetch_folder_total(
+    peer: &SavedPeer,
+    entry_id: i64,
+) -> Result<Option<RemoteTotals>, (bool, String)> {
+    let content = call_mcp_tool(
+        &peer.addr,
+        peer.port,
+        &peer.key,
+        "lisa_info",
+        json!({
+            "id": entry_id,
+            "totals": true,
+        }),
+    )?;
+    Ok(parse_info_totals(&content))
+}
+
+/// `lisa_info` の `structuredContent` からフォルダの合計を取り出す。
+fn parse_info_totals(content: &Value) -> Option<RemoteTotals> {
+    let item = content.get("item")?;
+    if item.get("kind").and_then(Value::as_str) != Some("dir") {
+        return None;
+    }
+    if item.get("listed").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    if item.get("error").is_some_and(|e| !e.is_null()) {
+        return None;
+    }
+    let totals = content.get("totals")?;
+    let files = totals.get("files").and_then(Value::as_u64)?;
+    let folders = totals.get("folders").and_then(Value::as_u64)?;
+    let bytes = totals.get("bytes").and_then(Value::as_u64)?;
+    Some(RemoteTotals {
+        files,
+        folders,
+        bytes,
+    })
+}
+
+/// 相手の端末の合計を、ドライブごとに `lisa_info`（`totals: true`）を呼んで足す。
+/// `drive_entry_ids` が空なら、先に `lisa_drives` でドライブ一覧を取る。
+/// 1 つでも通信に失敗したら `Err`、どのドライブもまだ読んでいなければ `Ok(None)`。
+pub(crate) fn fetch_device_total(
+    peer: &SavedPeer,
+    drive_entry_ids: &[i64],
+) -> Result<Option<RemoteTotals>, (bool, String)> {
+    let ids: Vec<i64> = if drive_entry_ids.is_empty() {
+        fetch_drives(peer)?
+            .into_iter()
+            .map(|d| d.entry_id)
+            .collect()
+    } else {
+        drive_entry_ids.to_vec()
+    };
+    let mut total = RemoteTotals {
+        files: 0,
+        folders: 0,
+        bytes: 0,
+    };
+    let mut any = false;
+    for entry_id in ids {
+        if let Some(t) = fetch_folder_total(peer, entry_id)? {
+            total.files = total.files.saturating_add(t.files);
+            total.folders = total.folders.saturating_add(t.folders);
+            total.bytes = total.bytes.saturating_add(t.bytes);
+            any = true;
+        }
+    }
+    Ok(any.then_some(total))
+}
+
 // --- UI（ペアリングのポップアップ、頼んでいる番号の表示、設定の「つないだ端末」一覧） ---
 
 /// ペアリングのバナーの上でクリックしたときに、裏の木が反応しないように見分ける印。
@@ -1885,5 +1977,128 @@ mod tests {
         );
         assert!(tree.nodes[dev_node].loaded);
         assert_eq!(tree.nodes[dev_node].children.len(), 1);
+    }
+
+    #[test]
+    fn fetch_remote_folder_and_device_totals_via_mcp() {
+        let dir_a = std::env::temp_dir().join(format!("lisa-lan-totals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let drive1 = dir_a.join("drive1");
+        let nested = drive1.join("sub").join("deep");
+        let unlisted = drive1.join("unlisted");
+        let drive2 = dir_a.join("drive2");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&unlisted).unwrap();
+        std::fs::create_dir_all(&drive2).unwrap();
+        std::fs::write(drive1.join("top.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(drive1.join("sub").join("mid.bin"), vec![0u8; 200]).unwrap();
+        std::fs::write(nested.join("leaf.bin"), vec![0u8; 300]).unwrap();
+        std::fs::write(drive2.join("d2.bin"), vec![0u8; 400]).unwrap();
+
+        let (sub_id, unlisted_id, d1_root, d2_root) = {
+            let mut db = lisa_core::db::Db::open(&dir_a.join("lisa.db")).unwrap();
+            let dev = db.this_device("PC-A", "PC-A", "macos").unwrap();
+            let make_vol = |id: &str, label: &str, mount: &Path| lisa_core::volumes::Volume {
+                id: Some(id.into()),
+                label: label.into(),
+                fs: "apfs".into(),
+                mount_path: mount.to_path_buf(),
+                capacity: None,
+                available: None,
+                removable: false,
+                network: false,
+                read_only: false,
+                case_sensitive: Some(false),
+                hidden: false,
+            };
+            db.upsert_drive(&dev, &make_vol("drive:1", "D1", &drive1))
+                .unwrap();
+            db.upsert_drive(&dev, &make_vol("drive:2", "D2", &drive2))
+                .unwrap();
+            for (did, mount, folder) in [
+                ("drive:1", &drive1, drive1.as_path()),
+                ("drive:1", &drive1, drive1.join("sub").as_path()),
+                ("drive:1", &drive1, nested.as_path()),
+                ("drive:2", &drive2, drive2.as_path()),
+            ] {
+                let listing = lisa_core::listing::read_dir(folder).map_err(|e| e.to_string());
+                db.save_listing(did, mount, folder, &listing).unwrap();
+            }
+            let d1_root = db.drive_root("drive:1").unwrap().unwrap().id;
+            let d2_root = db.drive_root("drive:2").unwrap().unwrap().id;
+            let sub_id = *lisa_core::query::locate(&db, &drive1.join("sub"))
+                .unwrap()
+                .unwrap()
+                .chain
+                .last()
+                .unwrap();
+            let unlisted_id = *lisa_core::query::locate(&db, &unlisted)
+                .unwrap()
+                .unwrap()
+                .chain
+                .last()
+                .unwrap();
+            (sub_id, unlisted_id, d1_root, d2_root)
+        };
+
+        let token = load_or_create_token(&dir_a).unwrap();
+        let peer_rec = add_peer(&dir_a, "dev-b", "PC-B").unwrap();
+        let listener = HttpListener::bind(
+            "127.0.0.1:0",
+            Server {
+                data_dir: dir_a.clone(),
+                cache_dir: None,
+            },
+            token,
+        )
+        .unwrap();
+        let addr = listener.local_addr();
+        let handle = listener.handle();
+        let server_thread = std::thread::spawn(move || listener.run());
+
+        let saved = SavedPeer {
+            device_id: "dev-a".into(),
+            name: "PC-A".into(),
+            key: peer_rec.key,
+            addr: addr.ip().to_string(),
+            port: addr.port(),
+            mcp_port: None,
+        };
+
+        // 途中のフォルダ: mid.bin (200) + deep/leaf.bin (300) = 2 ファイル、1 フォルダ（deep）、500 バイト。
+        assert_eq!(
+            fetch_folder_total(&saved, sub_id).unwrap(),
+            Some(RemoteTotals {
+                files: 2,
+                folders: 1,
+                bytes: 500,
+            })
+        );
+        // まだ読んでいないフォルダは None。
+        assert_eq!(fetch_folder_total(&saved, unlisted_id).unwrap(), None);
+        // ドライブ 1: top + mid + leaf (3 ファイル)、sub + deep + unlisted (3 フォルダ)、600 バイト。
+        assert_eq!(
+            fetch_folder_total(&saved, d1_root).unwrap(),
+            Some(RemoteTotals {
+                files: 3,
+                folders: 3,
+                bytes: 600,
+            })
+        );
+        // 端末全体（ドライブ一覧を明示しても、空で自動取得しても同じ）: 4 ファイル、3 フォルダ、1000 バイト。
+        let expected_dev = Some(RemoteTotals {
+            files: 4,
+            folders: 3,
+            bytes: 1000,
+        });
+        assert_eq!(
+            fetch_device_total(&saved, &[d1_root, d2_root]).unwrap(),
+            expected_dev
+        );
+        assert_eq!(fetch_device_total(&saved, &[]).unwrap(), expected_dev);
+
+        handle.unblock();
+        server_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir_a);
     }
 }

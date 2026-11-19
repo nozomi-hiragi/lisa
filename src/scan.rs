@@ -15,7 +15,7 @@
 //! `LISA_DUMMY=1` で起動すると、今までのダミーの木を使い、何も読まない。
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -195,9 +195,30 @@ struct Setup(Mutex<Option<(Option<Db>, Vec<Root>)>>);
 
 /// 木に出すために DB を読む口と、ドライブのノードごとの（DB の ID、つないでいる場所）。
 #[derive(Resource)]
-struct Store {
+pub(crate) struct Store {
     reader: Option<Mutex<Db>>,
     roots: HashMap<NodeId, (Option<String>, PathBuf)>,
+}
+
+impl Store {
+    /// 起動時に DB を開けたか（DB を使わずに動かしているときは false）。
+    pub(crate) fn has_db(&self) -> bool {
+        self.reader.is_some()
+    }
+
+    /// ノード `id` があるドライブの DB ID。DB に残さないドライブなら None。
+    pub(crate) fn drive_id_of(&self, tree: &FileTree, id: NodeId) -> Option<String> {
+        drive_of(tree, self, id).map(|(drive_id, _)| drive_id)
+    }
+
+    /// 端末ノード `device` の下にある、DB に残すドライブの ID 一覧。
+    pub(crate) fn device_drive_ids(&self, tree: &FileTree, device: NodeId) -> Vec<String> {
+        tree.nodes[device]
+            .children
+            .iter()
+            .filter_map(|&child| self.roots.get(&child)?.0.clone())
+            .collect()
+    }
 }
 
 /// ドライブの一覧が取れない OS（開発用の Linux など）では、「/」だけを出す。
@@ -782,6 +803,14 @@ fn drive_of(tree: &FileTree, store: &Store, id: NodeId) -> Option<(String, PathB
         cur = tree.nodes[i].parent;
     }
     None
+}
+
+/// 手元のファイルかフォルダの、DB にある行（ツールチップのハッシュ用）。DB が無い、まだ読んでいないなら None。
+pub(crate) fn stored_item(store: &Store, path: &Path) -> Option<lisa_core::query::Item> {
+    let db = store.reader.as_ref()?.lock().ok()?;
+    let located = lisa_core::query::locate(&db, path).ok()??;
+    let id = *located.chain.last()?;
+    lisa_core::query::item(&db, id).ok()?
 }
 
 #[cfg(test)]

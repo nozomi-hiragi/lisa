@@ -40,6 +40,8 @@ src/
   ui/progress.rs           読み込み中・ハッシュ中のリスト（画面左下）
   ui/dups.rs               重複の一覧のパネル（画面右側）
   ui/catalog.rs            カタログのパネル（画面右側。当たり、今のフォルダの仕分け、大きな未分類、LAN の相手）
+  ui/tooltip.rs            タイルにカーソルを止めると出す情報（ツールチップ）
+  ui/context_menu.rs       タイルを右クリックしたときのメニュー
   settings.rs              設定（settings.json への保存と、ポップアップの項目）
   debug.rs                 デバッグビルドで FPS をタイトルに出す
   remote.rs                外（lisa-mcp）からの頼みを受けて画面を動かす（飛ぶ、重複の一覧、読み直し、一時停止）
@@ -82,7 +84,7 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 1. `cache::bake` — フォルダの画像を作る（鍵が変わったものだけ。ディスクにあれば読み、無ければ焼く）
 2. `show_baked` / `jump` / `relayout` / `reanchor` / `show_relayout` — 焼き上がりや一覧からのジャンプ、並べ直し、基準の付け替えに
    合わせて、今の場面を作り直す
-3. `navigate` — クリック、右クリック、Esc
+3. `navigate` — クリック、Esc、メニューの「開く」「親へ戻る」
 4. `gesture` — トラックパッドとマウスのジェスチャー、離したあとの動き
 5. `refit_on_resize` / `follow_side_panel` — ウィンドウの大きさや右の一覧の幅が変わったら合わせ直す
 6. `animate_camera` — クリックや Esc で移るときのズームのアニメーション
