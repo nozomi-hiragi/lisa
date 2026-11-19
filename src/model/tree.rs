@@ -51,6 +51,21 @@ pub struct Node {
     pub entry: Option<i64>,
     /// LAN の相手のノードなら、どの相手かと相手の DB の `entry.id`。
     pub remote: Option<RemoteRef>,
+    /// LAN の相手のノードで、相手から届いた更新日時とハッシュ（ツールチップに出す）。
+    pub remote_meta: Option<RemoteMeta>,
+}
+
+/// LAN の相手から届いた、1 つのファイルかフォルダの情報（`lisa_core::query::Item` の一部）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteMeta {
+    /// `file` / `dir` / `symlink`。
+    pub kind: String,
+    /// 更新日時（UTC の Unix 時刻、ミリ秒）。
+    pub mtime: Option<i64>,
+    /// 中身のハッシュ（16 進）。
+    pub hash: Option<String>,
+    pub cloud_only: bool,
+    pub error: Option<String>,
 }
 
 /// LAN の他の PC のノードが指す相手と、相手の DB の `entry.id`（端末のノード自身は `None`）。
@@ -491,6 +506,13 @@ impl FileTree {
                 device_id: device_id.clone(),
                 entry_id: Some(item.id),
             });
+            self.nodes[child].remote_meta = Some(RemoteMeta {
+                kind: item.kind.clone(),
+                mtime: item.mtime,
+                hash: item.hash.clone(),
+                cloud_only: item.cloud_only,
+                error: item.error.clone(),
+            });
             if readable {
                 let node = &mut self.nodes[child];
                 node.listed = item.listed;
@@ -613,6 +635,7 @@ impl FileTree {
             loaded: true,
             entry: None,
             remote: None,
+            remote_meta: None,
         });
         if let Some(p) = parent {
             self.nodes[p].children.push(id);

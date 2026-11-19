@@ -67,6 +67,8 @@ fn main() {
         ui::menu::MenuPlugin,
         ui::progress::ProgressPlugin,
         ui::dups::DupsPanelPlugin,
+        ui::tooltip::TooltipPlugin,
+        ui::context_menu::ContextMenuPlugin,
         dups::DupsPlugin,
         catalog::CatalogPlugin,
         ui::catalog::CatalogPanelPlugin,

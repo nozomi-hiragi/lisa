@@ -186,7 +186,7 @@ fn show_progress(
 }
 
 /// 読みやすい大きさ（1024 区切り）。
-fn bytes(n: u64) -> String {
+pub(crate) fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = n as f64;
     let mut unit = 0;
