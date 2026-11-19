@@ -191,6 +191,8 @@ fn draw_children(
             mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
         } else {
+            let loaded = crate::ui::tooltip::local_path(tree, child)
+                .and_then(|path| source.previews.images.get(&path));
             in_group(painter, slot, size, |painter| {
                 status::draw_file(
                     painter,
@@ -201,6 +203,7 @@ fn draw_children(
                     background,
                     z,
                     live,
+                    loaded,
                 );
             });
             // 名前はプレビューの下に、同じフォルダの中のフォルダの耳の名前と同じ大きさで書く。
