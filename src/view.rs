@@ -17,6 +17,7 @@ use bevy::winit::{UpdateMode, WinitSettings};
 
 use crate::layout::{EarSpec, Layouts, anchor_body, fitted_size, layout};
 use crate::model::tree::{FileTree, NodeId};
+use crate::preview::PreviewRegistry;
 use crate::render::cache::{self, FolderImages, ThumbnailCapture};
 use crate::render::ear::{EarSizes, update_ears};
 use crate::render::scene::{
@@ -269,6 +270,7 @@ pub(crate) struct SceneMaker<'w, 's> {
     pub(crate) tree: Res<'w, FileTree>,
     pub(crate) layouts: Res<'w, Layouts>,
     pub(crate) images: Res<'w, FolderImages>,
+    pub(crate) previews: Res<'w, PreviewRegistry>,
     pub(crate) font: Res<'w, LabelFont>,
     pub(crate) ears: Res<'w, EarSizes>,
     pub(crate) highlight: Res<'w, crate::dups::DupHighlight>,
@@ -295,6 +297,7 @@ impl SceneMaker<'_, '_> {
             tree: &self.tree,
             layouts: &self.layouts,
             images: &self.images,
+            previews: &self.previews,
             font: &self.font.0,
             ears: &self.ears,
             highlight: Some(&self.highlight),
@@ -320,6 +323,7 @@ fn setup(
     mut commands: Commands,
     tree: Res<FileTree>,
     settings: Res<Settings>,
+    previews: Res<PreviewRegistry>,
     mut fonts: ResMut<Assets<Font>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
@@ -365,6 +369,7 @@ fn setup(
         tree: &tree,
         layouts: &layouts,
         images: &folder_images,
+        previews: &previews,
         font: &font,
         ears: &ears,
         highlight: None,
@@ -498,6 +503,7 @@ struct SyncDrawAssets<'w> {
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<ColorMaterial>>,
     images: Res<'w, FolderImages>,
+    previews: Res<'w, PreviewRegistry>,
     font: Res<'w, LabelFont>,
     ears: ResMut<'w, EarSizes>,
     highlight: Res<'w, crate::dups::DupHighlight>,
@@ -767,6 +773,7 @@ fn spawn_scene_raw(
         tree,
         layouts,
         images: &draw.images,
+        previews: &draw.previews,
         font: &draw.font.0,
         ears: &draw.ears,
         highlight: Some(&draw.highlight),

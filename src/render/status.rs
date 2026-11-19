@@ -14,7 +14,7 @@ use bevy::sprite::Anchor;
 use bevy::window::RequestRedraw;
 
 use crate::model::tree::LoadState;
-use crate::render::preview;
+use crate::preview::{self, PreviewRegistry};
 use crate::render::scene::{BACKGROUND, OVERLAY_LAYER};
 use crate::render::shapes::{BaseAlpha, Painter, over};
 
@@ -45,8 +45,10 @@ impl Default for PulseClock {
 
 /// ファイルのタイルの本体を描く。`background` は下の色。`live` なら読み込み中の光を動かす
 /// （画像に焼くときは動かせないので、光を描かない）。
+#[allow(clippy::too_many_arguments)]
 pub fn draw_file(
     painter: &mut Painter,
+    previews: &PreviewRegistry,
     state: LoadState,
     name: &str,
     frame: Rect,
@@ -62,9 +64,9 @@ pub fn draw_file(
                 pulse(painter, frame, z + 0.1);
             }
         }
-        LoadState::Loaded => preview::draw(painter, name, frame, background, z),
+        LoadState::Loaded => preview::draw(previews, painter, name, frame, background, z),
         LoadState::Stale => {
-            preview::draw(painter, name, frame, background, z);
+            preview::draw(previews, painter, name, frame, background, z);
             dim(painter, frame, z + 0.1);
         }
         LoadState::Failed => failed(painter, frame, background, z),

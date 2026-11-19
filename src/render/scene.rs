@@ -8,6 +8,7 @@ use bevy::sprite_render::ColorMaterial;
 
 use crate::layout::Layouts;
 use crate::model::tree::{FileTree, NodeId};
+use crate::preview::PreviewRegistry;
 use crate::render::cache::FolderImages;
 use crate::render::ear::{self, EarSizes};
 use crate::render::shapes::{Painter, over};
@@ -35,6 +36,7 @@ pub struct SceneSource<'a> {
     pub tree: &'a FileTree,
     pub layouts: &'a Layouts,
     pub images: &'a FolderImages,
+    pub previews: &'a PreviewRegistry,
     pub font: &'a Handle<Font>,
     pub ears: &'a EarSizes,
     /// 重複の一覧で選んだ組の印（本物の場面だけ）。
@@ -192,6 +194,7 @@ fn draw_children(
             in_group(painter, slot, size, |painter| {
                 status::draw_file(
                     painter,
+                    source.previews,
                     child_node.state,
                     &child_node.name,
                     l.frame,

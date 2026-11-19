@@ -11,6 +11,7 @@ mod lan;
 mod layout;
 mod model;
 mod organize;
+mod preview;
 mod remote;
 mod render;
 mod scan;
@@ -70,6 +71,7 @@ fn main() {
         default_plugins.disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>();
     app.add_plugins(default_plugins);
     info!("Bevy の準備ができました");
+    app.add_plugins(preview::PreviewPlugin);
     app.add_plugins((
         settings::SettingsPlugin,
         scan::ScanPlugin,
