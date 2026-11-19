@@ -16,7 +16,7 @@
 
 use std::time::{Duration, Instant};
 
-use bevy::ecs::system::NonSendMarker;
+use bevy::ecs::system::{NonSendMarker, SystemParam};
 use bevy::input::gestures::PinchGesture;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::math::Rect;
@@ -28,7 +28,8 @@ use crate::input::scroll_input::{Action, ScrollMachine};
 use crate::model::tree::{FileTree, NodeId};
 use crate::ui::menu::{BAR_PX, Popup};
 use crate::view::{
-    Animating, CurrentScene, Fade, MainCamera, Nav, SceneMaker, fit, scene_path, ui_has_pointer,
+    Animating, CurrentScene, Fade, Location, MainCamera, Nav, SceneMaker, SyncRequest, fit,
+    scene_path, ui_has_pointer,
 };
 
 use super::settle::{Coast, choose_pan, coast_step, refocus, show_parent_if_zoomed_out};
@@ -88,7 +89,12 @@ impl Gesture {
         self.last_input.is_some() || self.coast.is_some()
     }
 
-    /// 縮めたまま止まって、親の場面を下に敷いている。
+    /// 下に敷いている親の場面（あれば。慣性移動中のものも含む）。
+    pub fn parent_scene_entity(&self) -> Option<Entity> {
+        self.parent_scene
+            .or_else(|| self.coast.as_ref().and_then(|c| c.parent_scene))
+    }
+
     pub fn has_parent_scene(&self) -> bool {
         self.parent_scene.is_some()
     }
@@ -97,7 +103,33 @@ impl Gesture {
     pub fn take_parent_scene(&mut self) -> Option<Entity> {
         self.parent_scene.take()
     }
+
+    /// 親の場面を差し替える（`sync_view` の再描画時）。
+    pub(crate) fn set_parent_scene(&mut self, entity: Option<Entity>) {
+        self.parent_scene = entity;
+    }
+
+    /// ジェスチャー・慣性移動をすべて初期化し、保持していた親の場面があれば返す。
+    pub(crate) fn clear_and_take_parent_scene(&mut self) -> Option<Entity> {
+        let parent = self
+            .parent_scene
+            .take()
+            .or_else(|| self.coast.as_mut().and_then(|c| c.parent_scene.take()));
+        *self = Gesture::default();
+        parent
+    }
 }
+
+/// ジェスチャーから正の場所と同期要求を更新するための束。
+#[derive(SystemParam)]
+pub(crate) struct GestureSync<'w> {
+    location: ResMut<'w, Location>,
+    sync: ResMut<'w, SyncRequest>,
+}
+
+/// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ使用）: 実カーソルを動かさずにピンチ等の基準点を指定する。
+#[derive(Resource, Default)]
+pub(crate) struct DebugCursor(pub(crate) Option<Vec2>);
 /// 2本指のスクロールの状態（`scroll_input` の状態機械）。ジェスチャーが終わっても残す。
 #[derive(Resource)]
 pub struct TrackpadInput {
@@ -120,6 +152,10 @@ impl Default for TrackpadInput {
     }
 }
 impl TrackpadInput {
+    pub(crate) fn uses_raw(&self) -> bool {
+        self.raw
+    }
+
     fn now(&self) -> f64 {
         self.epoch.elapsed().as_secs_f64()
     }
@@ -174,6 +210,8 @@ pub fn gesture(
     banners: Query<&bevy::picking::hover::Hovered, With<crate::lan::PairBanner>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut input: ResMut<TrackpadInput>,
+    debug_cursor: Option<Res<DebugCursor>>,
+    mut gsync: GestureSync,
 ) {
     let wheel: Vec<MouseWheel> = wheel.read().cloned().collect();
     let pinch: f32 = pinch.read().map(|p| p.0).sum();
@@ -305,10 +343,29 @@ pub fn gesture(
     };
     let top = *nav.top();
     let (_, rest_scale) = fit(top.frame(&maker.layouts), &window);
-    let cursor = window.cursor_position();
+    let root_scale = fit(maker.layouts[FileTree::ROOT].fit, &window).1;
+    if !(rest_scale > 0.0
+        && rest_scale.is_finite()
+        && root_scale > 0.0
+        && root_scale.is_finite()
+        && ortho.scale > 0.0
+        && ortho.scale.is_finite())
+    {
+        if let Some(parent) = state.clear_and_take_parent_scene() {
+            maker.commands.entity(parent).despawn();
+        }
+        gsync.sync.request_reset();
+        return;
+    }
+    let debug_pos = debug_cursor.as_deref().and_then(|c| c.0);
+    let cursor = debug_pos.or_else(|| window.cursor_position());
     let cursor_world = cursor.and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok());
     let over_banner = banners.iter().any(|h| h.get());
-    let over_ui = ui_has_pointer(&window, &popup, over_banner);
+    let over_ui = if let Some(p) = debug_pos {
+        popup.open || over_banner || p.y < BAR_PX || p.x > crate::view::view_width(&window)
+    } else {
+        ui_has_pointer(&window, &popup, over_banner)
+    };
 
     // macOS の慣性は使わない（離したあとの動きは、こちらで重力をかけて作る）。
     if !momentum.is_empty() || lifted_now {
@@ -324,6 +381,8 @@ pub fn gesture(
         } else {
             let arrived = coast_step(
                 &mut coast,
+                &mut gsync.location,
+                &mut gsync.sync,
                 &mut nav,
                 &mut current,
                 &mut maker,
@@ -403,7 +462,6 @@ pub fn gesture(
         // カーソルの下の点が動かないように拡大縮小する。
         let factor = (-pinch).exp();
         // 縮める上限は Root を基準にする（開いている場所が途中で変わっても、急に止まらない）。
-        let root_scale = fit(maker.layouts[FileTree::ROOT].fit, &window).1;
         let new_scale =
             (state.raw_scale * factor).clamp(rest_scale / MAX_ZOOM_IN, root_scale * MAX_ZOOM_OUT);
         let anchor = cursor_world.unwrap_or(state.raw_pos);
@@ -421,6 +479,13 @@ pub fn gesture(
     // 制限をかけた見え方にする。
     let siblings = Siblings::of(&nav, &maker);
     let (pos, scale) = constrain(&state, &nav, &maker, &window, rest_scale, siblings.as_ref());
+    if !(scale > 0.0 && scale.is_finite() && pos.is_finite()) {
+        if let Some(parent) = state.clear_and_take_parent_scene() {
+            maker.commands.entity(parent).despawn();
+        }
+        gsync.sync.request_reset();
+        return;
+    }
     transform.translation = pos.extend(0.0);
     ortho.scale = scale;
     if touched {
@@ -445,6 +510,7 @@ pub fn gesture(
     if touched {
         refocus(
             &mut state.parent_scene,
+            &mut gsync.location,
             &mut nav,
             &mut current,
             &mut maker,
@@ -482,10 +548,15 @@ pub fn gesture(
             release_velocity(&state.history)
         };
         // ピンチ（ホイール）なら、使った幅（と勢い）で、次の段へ進むか戻るかを決める。
-        let zoom_goal = state.zoom_start.map(|(from, start_ln)| {
+        let zoom_goal = state.zoom_start.and_then(|(from, start_ln)| {
             let amount = scale.ln() - start_ln + velocity_ln * ZOOM_LOOKAHEAD;
             let point = cursor_world.unwrap_or(pos - Vec2::new(0.0, BAR_PX / 2.0 * scale));
-            choose_zoom(&zoom_ladder(from, &maker, &window, point), start_ln, amount)
+            let ladder = zoom_ladder(from, &maker, &window, point);
+            if ladder.is_empty() {
+                None
+            } else {
+                Some(choose_zoom(&ladder, start_ln, amount))
+            }
         });
         // 2本指で動かしただけなら、勢いの先を見込んで行き先を決める（勢いがあれば隣へ進む）。
         let pan_goal = if zoom_goal.is_none() {
@@ -524,6 +595,7 @@ impl Siblings {
         let mut centers = maker.tree.nodes[parent.node]
             .children
             .iter()
+            .filter(|c| maker.layouts.contains(**c))
             .map(|c| maker.layouts[*c].fit.center());
         let first = centers.next()?;
         let area = centers.fold(Rect::from_corners(first, first), |r, c| r.union_point(c));

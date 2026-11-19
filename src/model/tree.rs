@@ -2,6 +2,7 @@
 //!
 //! 木は読んだところだけを持つ。フォルダの子は、読めたら `add_listing` で足す（`scan.rs`）。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bevy::prelude::*;
@@ -102,10 +103,28 @@ fn file(name: impl Into<String>, size: u64) -> Entry {
 #[derive(Resource)]
 pub struct FileTree {
     pub nodes: Vec<Node>,
+    /// `reset_children` で外した空きスロット。次にノードを作るときに再利用して `nodes` の肥大化を防ぐ。
+    free: Vec<NodeId>,
+    /// 木につながっている手元ノードの DB `entry.id` → `NodeId` 索引（`dups`・`catalog`・`resolve_location` 用）。
+    by_entry: HashMap<i64, NodeId>,
 }
 
 impl FileTree {
     pub const ROOT: NodeId = 0;
+
+    fn empty() -> Self {
+        Self {
+            nodes: Vec::new(),
+            free: Vec::new(),
+            by_entry: HashMap::new(),
+        }
+    }
+
+    /// DB の `entry.id` から、現在木につながっているノードを O(1) で引く。
+    pub fn node_by_entry(&self, entry: i64) -> Option<NodeId> {
+        let &id = self.by_entry.get(&entry)?;
+        self.is_attached(id).then_some(id)
+    }
 
     /// 実験用のダミーの木。
     pub fn dummy() -> Self {
@@ -205,7 +224,7 @@ impl FileTree {
             ),
         ];
 
-        let mut tree = FileTree { nodes: Vec::new() };
+        let mut tree = FileTree::empty();
         let root = tree.push("Root", 0, None, 0, true);
         for (i, device) in devices.into_iter().enumerate() {
             tree.insert(device, root, i);
@@ -218,7 +237,7 @@ impl FileTree {
 
     /// この端末と、つながっているドライブだけの木。ドライブの中は、開いたら読む。
     pub fn this_device(name: &str, drives: &[lisa_core::volumes::Volume]) -> Self {
-        let mut tree = FileTree { nodes: Vec::new() };
+        let mut tree = FileTree::empty();
         let root = tree.push("Root", 0, None, 0, true);
         let device = tree.push(name, 0, Some(root), 0, true);
         for drive in drives.iter().filter(|d| !d.hidden) {
@@ -240,8 +259,8 @@ impl FileTree {
 
     /// ドライブのノード `id` に、DB に残っていた一番上の行を合わせる（子はまだ出さない）。
     pub fn set_drive_row(&mut self, id: NodeId, row: &lisa_core::db::Stored) {
+        self.set_entry(id, row.id);
         let node = &mut self.nodes[id];
-        node.entry = Some(row.id);
         node.listed = row.listed;
         if row.error.is_some() {
             node.state = LoadState::Failed;
@@ -252,18 +271,46 @@ impl FileTree {
         self.update_ancestor_states(id);
     }
 
+    /// ノード `id` に DB の `entry.id` を紐づけ、索引にも登録する。
+    pub fn set_entry(&mut self, id: NodeId, entry: i64) {
+        if let Some(old) = self.nodes[id].entry
+            && self.by_entry.get(&old) == Some(&id)
+        {
+            self.by_entry.remove(&old);
+        }
+        self.nodes[id].entry = Some(entry);
+        self.by_entry.insert(entry, id);
+    }
+
     /// 読み終えた（DB にはある）が、子をまだ出していない。ハッシュができるまでは未読み込みのまま。
     pub fn mark_listed(&mut self, id: NodeId) {
         self.nodes[id].listed = true;
     }
 
-    /// フォルダ `id` の子を外す（読み直したら変わっていたので、出し直す）。外した子は木の中に
-    /// 残るが、どこからも指されない。
+    /// フォルダ `id` の子を外す（読み直したら変わっていたので、出し直す）。外した子孫のスロットは
+    /// `free` へ戻して再利用し、`nodes` の際限ない肥大化を防ぐ。
     pub fn reset_children(&mut self, id: NodeId) {
         let children = std::mem::take(&mut self.nodes[id].children);
         let removed: u64 = children.iter().map(|&c| self.nodes[c].size).sum();
-        for child in children {
-            self.nodes[child].parent = None;
+        let mut stack = children;
+        while let Some(child) = stack.pop() {
+            let grand = std::mem::take(&mut self.nodes[child].children);
+            stack.extend(grand);
+            if let Some(entry) = self.nodes[child].entry.take()
+                && self.by_entry.get(&entry) == Some(&child)
+            {
+                self.by_entry.remove(&entry);
+            }
+            let node = &mut self.nodes[child];
+            node.parent = None;
+            node.name.clear();
+            node.path = None;
+            node.remote = None;
+            node.remote_meta = None;
+            node.listed = false;
+            node.loaded = false;
+            node.size = 0;
+            self.free.push(child);
         }
         self.nodes[id].loaded = false;
         let mut cur = Some(id);
@@ -271,6 +318,38 @@ impl FileTree {
             self.nodes[i].size = self.nodes[i].size.saturating_sub(removed);
             cur = self.nodes[i].parent;
         }
+    }
+
+    /// ノード `id` が Root までつながっているか（`reset_children` で親から外されたノードは false）。
+    pub fn is_attached(&self, mut id: NodeId) -> bool {
+        if id >= self.nodes.len() {
+            return false;
+        }
+        loop {
+            if id == Self::ROOT {
+                return true;
+            }
+            match self.nodes[id].parent {
+                Some(parent) => id = parent,
+                None => return false,
+            }
+        }
+    }
+
+    /// Root から `id` までの道のり。木から外れているノードなら `None`。
+    pub fn path_from_root(&self, id: NodeId) -> Option<Vec<NodeId>> {
+        if id >= self.nodes.len() {
+            return None;
+        }
+        let mut path = vec![id];
+        let mut cur = id;
+        while cur != Self::ROOT {
+            let parent = self.nodes[cur].parent?;
+            path.push(parent);
+            cur = parent;
+        }
+        path.reverse();
+        Some(path)
     }
 
     /// フォルダ `id` は読み直したら変わっていた（ハッシュし直すまで古い）。中のハッシュの無いファイルも
@@ -329,6 +408,7 @@ impl FileTree {
             let is_dir = row.kind == Kind::Dir;
             let readable = is_dir && !row.cloud_only && !row.other_volume;
             let child = self.push(&row.name_nfc, row.size, Some(id), device, is_dir);
+            self.set_entry(child, row.id);
             // ファイルはハッシュができたら読み込み済み。ハッシュしないもの（クラウドのみ、リンク、
             // 中に入らないフォルダ）は、一覧に載った時点で読み込み済み。
             let skip = row.kind != Kind::File || row.cloud_only;
@@ -344,7 +424,6 @@ impl FileTree {
                 let node = &mut self.nodes[child];
                 node.listed = row.listed || scanned(&path);
                 node.loaded = false;
-                node.entry = Some(row.id);
                 // ハッシュができたフォルダは、子を出していなくても読み込み済み。
                 let done = row.hash.is_some() || hashed(&path);
                 node.state = if row.error.is_some() {
@@ -569,7 +648,7 @@ impl FileTree {
     /// テスト用: フォルダ `dirs` 個に、それぞれファイル `files` 個。
     #[cfg(test)]
     pub fn wide(dirs: usize, files: usize) -> Self {
-        let mut tree = FileTree { nodes: Vec::new() };
+        let mut tree = FileTree::empty();
         let root = tree.push("Root", 0, None, 0, true);
         for i in 0..dirs {
             let children = (0..files).map(|j| file(format!("f{j:04}"), 1)).collect();
@@ -588,7 +667,7 @@ impl FileTree {
             children.push(entry);
             entry = dir(format!("d{i:02}"), children);
         }
-        let mut tree = FileTree { nodes: Vec::new() };
+        let mut tree = FileTree::empty();
         let root = tree.push("Root", 0, None, 0, true);
         tree.insert(entry, root, 0);
         tree.sum_sizes(root);
@@ -618,10 +697,9 @@ impl FileTree {
         device: usize,
         is_dir: bool,
     ) -> NodeId {
-        let id = self.nodes.len();
         let state = dummy_state(name);
         let depth = parent.map_or(0, |p| self.nodes[p].depth + 1);
-        self.nodes.push(Node {
+        let node = Node {
             name: name.to_string(),
             size,
             depth,
@@ -636,7 +714,18 @@ impl FileTree {
             entry: None,
             remote: None,
             remote_meta: None,
-        });
+        };
+        let id = match self.free.pop() {
+            Some(slot) => {
+                self.nodes[slot] = node;
+                slot
+            }
+            None => {
+                let id = self.nodes.len();
+                self.nodes.push(node);
+                id
+            }
+        };
         if let Some(p) = parent {
             self.nodes[p].children.push(id);
         }
@@ -866,9 +955,16 @@ mod tests {
         tree.mark_hashed(drive);
         assert_eq!(tree.nodes[drive].state, LoadState::Loaded);
         // 読み直したら変わっていた: 子を外して出し直し、ハッシュし直すまで古い。
+        let len_before = tree.nodes.len();
         tree.reset_children(drive);
         assert!(tree.nodes[drive].children.is_empty() && !tree.nodes[drive].loaded);
         assert_eq!(tree.nodes[drive].size, 0);
+        // 繰り返し reset_children しても空きスロットを再利用し、nodes が際限なく膨らまない。
+        for _ in 0..20 {
+            tree.add_listing(drive, read());
+            assert_eq!(tree.nodes.len(), len_before);
+            tree.reset_children(drive);
+        }
         std::fs::write(dir.join("b.txt"), b"xy").unwrap();
         tree.add_listing(drive, read());
         tree.mark_stale(drive);

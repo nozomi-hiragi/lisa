@@ -324,7 +324,12 @@ fn watch(
             let Some(folder) = path.parent() else {
                 continue;
             };
-            if own.iter().any(|o| path.starts_with(o)) || is_under_any(&path, &noisy) {
+            if own.iter().any(|o| path.starts_with(o))
+                || is_under_any(&path, &noisy)
+                || path
+                    .components()
+                    .any(|c| lisa_core::name::is_quarantine_dir(c.as_os_str()))
+            {
                 continue;
             }
             let _ = requests.send(worker::Request::Hint(folder.to_path_buf()));
@@ -394,6 +399,26 @@ impl ScanControl {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+
+    /// 整理で触ったフォルダなどを、裏の分として読み直してもらう（`Request::Hint`）。
+    pub(crate) fn hint(&self, path: PathBuf) {
+        if let Ok(sender) = self.requests.lock() {
+            let _ = sender.send(worker::Request::Hint(path));
+        }
+    }
+
+    /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: フォルダを「変わっていた」扱いにして読み直す。
+    pub(crate) fn debug_force_changed(&self, path: PathBuf) {
+        let sent = self
+            .requests
+            .lock()
+            .is_ok_and(|s| s.send(worker::Request::DebugForceChanged(path)).is_ok());
+        if sent {
+            self.control
+                .urgent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// 設定の値を、読む係との決まりに写す。
@@ -420,17 +445,21 @@ fn apply_settings(settings: Res<crate::settings::Settings>, control: Option<Res<
     );
 }
 
-/// 開いている場面のフォルダが変わったら、そこを先に読んで（ハッシュして）もらう。
+/// 開いている場面のフォルダが変わって操作が止まったら、そこを先に読んで（ハッシュして）もらう。
+/// ジェスチャーやアニメーションの途中で通り掛かるだけの親フォルダは読み直さない。
 fn request_visible(
     nav: Res<crate::view::Nav>,
     tree: Res<FileTree>,
     control: Option<Res<ScanControl>>,
+    animating: Option<Res<crate::view::Animating>>,
+    fades: Query<(), With<crate::view::Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
     mut last: Local<Option<NodeId>>,
 ) {
     let Some(control) = control else {
         return;
     };
-    if !nav.is_changed() {
+    if animating.is_some() || !fades.is_empty() || gesture.active() {
         return;
     }
     let path = crate::view::scene_path(&nav, &tree);
@@ -445,13 +474,38 @@ fn request_visible(
     }
 }
 
+/// 読む係が中に入らず飛ばす隔離フォルダ（データのフォルダの `trash/`。Mac の firmlink の側も含める）。
+fn quarantine_skip_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push = |base: PathBuf| {
+        let trash = base.join("trash");
+        if !dirs.contains(&trash) {
+            dirs.push(trash.clone());
+        }
+        #[cfg(target_os = "macos")]
+        if let Ok(rel) = trash.strip_prefix("/") {
+            let data_vol = PathBuf::from("/System/Volumes/Data").join(rel);
+            if !dirs.contains(&data_vol) {
+                dirs.push(data_vol);
+            }
+        }
+    };
+    if let Some(dir) = data_dir() {
+        push(dir);
+    }
+    if let Some(proj) = directories::ProjectDirs::from("", "", "Lisa") {
+        push(proj.data_dir().to_path_buf());
+    }
+    dirs
+}
+
 /// 読む係の進み具合を UI から覗く。
 #[derive(Resource, Clone)]
 pub struct ScanProgress(pub Arc<Mutex<Progress>>);
 
 /// 読む係から届く結果を受け取る。
 #[derive(Resource)]
-struct Scanner {
+pub(crate) struct Scanner {
     results: Mutex<Receiver<Message>>,
     /// 木にあって、まだ読み終えていないフォルダ（パスからノードを引く）。
     pending: HashMap<PathBuf, NodeId>,
@@ -503,6 +557,7 @@ fn start_workers(
         ..default()
     })));
     let control = Arc::new(worker::Control::default());
+    let skip_dirs = quarantine_skip_dirs();
     let worker = worker::Worker {
         db,
         roots,
@@ -513,6 +568,7 @@ fn start_workers(
         control: control.clone(),
         dirty: false,
         hints: Default::default(),
+        skip_dirs,
     };
     let watched: Vec<PathBuf> = worker
         .roots
@@ -570,19 +626,47 @@ impl Scanner {
             self.track(tree, child);
         }
     }
+
+    /// `reset_children(id)` で木から外れる子孫を `folders`・`pending` から除く。
+    fn remove_descendants(&mut self, tree: &FileTree, id: NodeId) {
+        let mut stack = tree.nodes[id].children.clone();
+        while let Some(child) = stack.pop() {
+            if let Some(p) = &tree.nodes[child].path {
+                if self.folders.get(p) == Some(&child) {
+                    self.folders.remove(p);
+                }
+                if self.pending.get(p) == Some(&child) {
+                    self.pending.remove(p);
+                }
+            }
+            stack.extend(tree.nodes[child].children.iter().copied());
+        }
+    }
 }
 
 /// 届いた結果を受け取る。DB に書いたものは、木にあれば「読み終えた」にするだけ（子は見えるところに
 /// 来たら出す）。DB に書いていないものは、そのまま木に足す。
+///
+/// ピンチ・パン・クリックのアニメーション・Fade の最中は受け取りを保留し、操作が止まってから
+/// 木に当てて `sync_view` でそろえる（操作の途中で指の動きが切れないようにする）。
+#[allow(clippy::too_many_arguments)]
 fn receive(
     scanner: Option<ResMut<Scanner>>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
-    mut nav: ResMut<crate::view::Nav>,
+    nav: Res<crate::view::Nav>,
+    layouts: Res<Layouts>,
+    mut sync: ResMut<crate::view::SyncRequest>,
+    animating: Option<Res<crate::view::Animating>>,
+    fades: Query<(), With<crate::view::Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
 ) {
     let Some(mut scanner) = scanner else {
         return;
     };
+    if animating.is_some() || !fades.is_empty() || gesture.active() {
+        return;
+    }
     let scanner = &mut *scanner;
     let messages: Vec<Message> = scanner
         .results
@@ -592,6 +676,7 @@ fn receive(
         .take(APPLY_PER_FRAME)
         .collect();
     let mut any = false;
+    let mut structure_reset = false;
     for message in messages {
         match message {
             Message::Committed => {
@@ -600,24 +685,26 @@ fn receive(
             }
             Message::Hashed { path } => {
                 scanner.stale.remove(&path);
-                if let Some(&id) = scanner.folders.get(&path) {
+                if let Some(&id) = scanner.folders.get(&path)
+                    && tree.is_attached(id)
+                {
                     tree.mark_hashed(id);
                     any = true;
                 }
                 scanner.hashed.insert(path);
             }
             Message::Changed { path } => {
-                // 木にあれば、子を出し直す（このあと届く `Listed` から）。ハッシュができるまで古い。
-                if let Some(&id) = scanner.folders.get(&path) {
+                // 木にあれば、子を外して出し直す（このあと届く `Listed` から）。ハッシュができるまで古い。
+                if let Some(&id) = scanner.folders.get(&path)
+                    && tree.is_attached(id)
+                {
+                    scanner.remove_descendants(&tree, id);
                     tree.reset_children(id);
                     tree.mark_stale(id);
-                    // 外した子を開いていたら、そのフォルダまで戻る（子は出し直すと別のノードになる）。
-                    if let Some(at) = nav.stack.iter().position(|l| l.node == id)
-                        && at + 1 < nav.stack.len()
-                    {
-                        nav.stack.truncate(at + 1);
-                    }
                     any = true;
+                    if !tree.is_attached(nav.top().node) || !tree.is_attached(layouts.anchor) {
+                        structure_reset = true;
+                    }
                 }
                 scanner.hashed.remove(&path);
                 scanner.stale.insert(path);
@@ -627,7 +714,9 @@ fn receive(
                 result,
                 stored: false,
             } => {
-                if let Some(id) = scanner.pending.remove(&path) {
+                if let Some(id) = scanner.pending.remove(&path)
+                    && tree.is_attached(id)
+                {
                     tree.add_listing(id, result);
                     scanner.track_children(&tree, id);
                     any = true;
@@ -638,7 +727,9 @@ fn receive(
                 result,
                 stored: true,
             } => {
-                if let Some(id) = scanner.pending.remove(&path) {
+                if let Some(id) = scanner.pending.remove(&path)
+                    && tree.is_attached(id)
+                {
                     tree.mark_listed(id);
                     any = true;
                 }
@@ -646,32 +737,48 @@ fn receive(
             }
         }
     }
+    if structure_reset {
+        sync.request_reset();
+    }
     if any {
         changed.pending = true;
     }
 }
 
 /// 並べてあるフォルダのうち、読み終えているのに子をまだ出していないものを、DB（か、まだ確定して
-/// いない結果）から 1 段出す。
+/// いない結果）から 1 段出す。操作中は保留して、止まってから出す。
+#[allow(clippy::too_many_arguments)]
 fn load_visible(
     scanner: Option<ResMut<Scanner>>,
     store: Res<Store>,
     layouts: Res<Layouts>,
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
+    animating: Option<Res<crate::view::Animating>>,
+    fades: Query<(), With<crate::view::Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
+    mut dirty: Local<bool>,
 ) {
     let Some(mut scanner) = scanner else {
         return;
     };
-    let scanner = &mut *scanner;
-    if !layouts.is_changed() && !tree.is_changed() {
+    if layouts.is_changed() || tree.is_changed() {
+        *dirty = true;
+    }
+    if !*dirty || animating.is_some() || !fades.is_empty() || gesture.active() {
         return;
     }
+    *dirty = false;
+    let scanner = &mut *scanner;
     let wanted: Vec<NodeId> = layouts
         .ids()
         .filter(|&id| {
             let node = &tree.nodes[id];
-            node.is_dir && node.listed && !node.loaded && node.path.is_some()
+            node.is_dir
+                && node.listed
+                && !node.loaded
+                && node.path.is_some()
+                && tree.is_attached(id)
         })
         .take(LOAD_PER_FRAME)
         .collect();
@@ -735,62 +842,118 @@ fn load_children(
     true
 }
 
-/// 行きたい場所（DB の `entry.id` の列。ドライブの一番上から）。`resolve_jump` が木の上のノードの
-/// 道のりにする（足りない子は DB から出す）。
+/// 行きたい場所（DB の `entry.id` の列。ドライブの一番上から）。`resolve_jump` が
+/// 正の場所（`Location::Local`）へ移して `sync_view` で開く。
 #[derive(Resource)]
 pub struct JumpTo(pub Vec<i64>);
 
-/// 行きたい場所の、Root からの道のり（`view.rs` の `jump` が開く）。
-#[derive(Resource)]
-pub struct JumpPath(pub Vec<NodeId>);
-
-/// `JumpTo` を木の上の道のりにする。
+/// `JumpTo` を正の場所 `Location::Local` へ移し、`sync_view` にリセット同期を頼む。
+/// 操作中（ピンチ・アニメーション・Fade）は保留し、止まってから移る。
 fn resolve_jump(
     mut commands: Commands,
     jump: Option<Res<JumpTo>>,
-    scanner: Option<ResMut<Scanner>>,
-    store: Res<Store>,
-    mut tree: ResMut<FileTree>,
-    mut changed: ResMut<TreeChanged>,
+    mut location: ResMut<crate::view::Location>,
+    mut sync: ResMut<crate::view::SyncRequest>,
+    animating: Option<Res<crate::view::Animating>>,
+    fades: Query<(), With<crate::view::Fade>>,
+    gesture: Res<crate::input::gesture::Gesture>,
 ) {
-    let (Some(jump), Some(mut scanner)) = (jump, scanner) else {
+    let Some(jump) = jump else {
         return;
     };
+    if animating.is_some() || !fades.is_empty() || gesture.active() {
+        return;
+    }
+    let chain = jump.0.clone();
     commands.remove_resource::<JumpTo>();
-    let chain = &jump.0;
-    // 一番上は、ドライブのノード（`entry` が chain[0]）。
-    let Some(mut node) =
-        (0..tree.nodes.len()).find(|&i| tree.nodes[i].entry == chain.first().copied())
-    else {
-        warn!("行き先のドライブが木にありません");
+    if chain.is_empty() {
         return;
-    };
-    let mut reader = store.reader.as_ref().and_then(|r| r.lock().ok());
-    for &entry in &chain[1..] {
-        if !tree.nodes[node].loaded
-            && !load_children(&mut tree, &store, reader.as_deref_mut(), &mut scanner, node)
-        {
-            warn!("行き先の途中を DB から出せませんでした");
-            return;
+    }
+    *location = crate::view::Location::Local(chain);
+    sync.request_reset();
+}
+
+/// 正の場所（`Location`）を現在の木の上の道のり（Root から）へ解決する。
+/// 足りない子は DB から 1 段ずつ出し、途中が無ければたどれた最深のノードまで返す。
+/// 戻り値は常に `FileTree::ROOT` から始まる、木につながった道のり。
+pub(crate) fn resolve_location(
+    tree: &mut FileTree,
+    store: Option<&Store>,
+    mut scanner: Option<&mut Scanner>,
+    location: &crate::view::Location,
+) -> Vec<NodeId> {
+    match location {
+        crate::view::Location::Local(chain) => {
+            let Some(&first_entry) = chain.first() else {
+                return vec![FileTree::ROOT];
+            };
+            let Some(mut node) = tree.node_by_entry(first_entry) else {
+                warn!("行き先のドライブが木にありません（Root を開きます）");
+                return vec![FileTree::ROOT];
+            };
+            let mut reader = store.and_then(|s| s.reader.as_ref()?.lock().ok());
+            for &entry in &chain[1..] {
+                if !tree.nodes[node].loaded
+                    && let (Some(store), Some(sc)) = (store, scanner.as_deref_mut())
+                    && !load_children(tree, store, reader.as_deref_mut(), sc, node)
+                {
+                    warn!("行き先の途中を DB から出せませんでした（たどれたところまで開きます）");
+                    break;
+                }
+                let by_entry = tree.nodes[node]
+                    .children
+                    .iter()
+                    .copied()
+                    .find(|&c| tree.nodes[c].entry == Some(entry));
+                let child = match by_entry {
+                    Some(c) => Some(c),
+                    None => {
+                        // 未確定結果（`recent`）から出した直後は `entry` が無いので、DB の名前でも照合する。
+                        let want_name = reader
+                            .as_deref()
+                            .and_then(|db| lisa_core::query::item(db, entry).ok().flatten())
+                            .map(|item| item.name);
+                        want_name.and_then(|name| {
+                            tree.nodes[node]
+                                .children
+                                .iter()
+                                .copied()
+                                .find(|&c| tree.nodes[c].name == name)
+                        })
+                    }
+                };
+                let Some(child) = child else {
+                    warn!("行き先が木にありません（たどれたところまで開きます）");
+                    break;
+                };
+                node = child;
+            }
+            tree.path_from_root(node)
+                .unwrap_or_else(|| vec![FileTree::ROOT])
         }
-        let Some(child) = tree.nodes[node]
-            .children
-            .iter()
-            .copied()
-            .find(|&c| tree.nodes[c].entry == Some(entry))
-        else {
-            warn!("行き先が木にありません（読み直しが要るかもしれません）");
-            return;
-        };
-        node = child;
+        crate::view::Location::Named(names) => {
+            let mut node = FileTree::ROOT;
+            let mut reader = store.and_then(|s| s.reader.as_ref()?.lock().ok());
+            for name in names.iter().skip(1) {
+                if !tree.nodes[node].loaded
+                    && let (Some(store), Some(sc)) = (store, scanner.as_deref_mut())
+                {
+                    let _ = load_children(tree, store, reader.as_deref_mut(), sc, node);
+                }
+                let Some(child) = tree.nodes[node]
+                    .children
+                    .iter()
+                    .copied()
+                    .find(|&c| tree.nodes[c].name == *name)
+                else {
+                    break;
+                };
+                node = child;
+            }
+            tree.path_from_root(node)
+                .unwrap_or_else(|| vec![FileTree::ROOT])
+        }
     }
-    let mut path = vec![node];
-    while let Some(parent) = tree.nodes[path[path.len() - 1]].parent {
-        path.push(parent);
-    }
-    path.reverse();
-    changed.pending = true;
-    commands.insert_resource(JumpPath(path));
 }
 
 /// ノード `id` があるドライブの（DB の ID、つないでいる場所）。DB に残さないドライブなら None。

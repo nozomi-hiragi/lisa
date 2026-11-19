@@ -72,14 +72,22 @@ pub(super) fn zoom_ladder(
     window: &Window,
     point: Vec2,
 ) -> Vec<ZoomGoal> {
-    let fit_goal = |node: NodeId| ZoomGoal {
-        node,
-        scale: fit(maker.layouts[node].fit, window).1,
-        grid: false,
+    let fit_goal = |node: NodeId| -> Option<ZoomGoal> {
+        let rect = maker.layouts[node].fit;
+        if !(rect.width() > 0.0 && rect.height() > 0.0) {
+            return None;
+        }
+        let scale = fit(rect, window).1;
+        (scale > 0.0 && scale.is_finite()).then_some(ZoomGoal {
+            node,
+            scale,
+            grid: false,
+        })
     };
     let grid_goals = |node: NodeId| {
         grid_levels(maker, window, node)
             .into_iter()
+            .filter(|s| *s > 0.0 && s.is_finite())
             .map(move |scale| ZoomGoal {
                 node,
                 scale,
@@ -87,23 +95,32 @@ pub(super) fn zoom_ladder(
             })
     };
     let mut ladder = Vec::new();
-    // カーソルの下の子。タイルの隙間なら、いちばん近い子。
+    // カーソルの下の子。タイルの隙間なら、いちばん近い子（配置済みのものだけ）。
     if let Some(child) = maker.tree.nodes[top]
         .children
         .iter()
         .copied()
+        .filter(|&c| {
+            let r = maker.layouts[c].fit;
+            r.width() > 0.0 && r.height() > 0.0
+        })
         .min_by(|a, b| {
             let d = |c: NodeId| maker.layouts[c].cell.center().distance_squared(point);
             d(*a).total_cmp(&d(*b))
         })
+        && let Some(goal) = fit_goal(child)
     {
-        ladder.push(fit_goal(child));
+        ladder.push(goal);
     }
     ladder.extend(grid_goals(top));
-    ladder.push(fit_goal(top));
+    if let Some(goal) = fit_goal(top) {
+        ladder.push(goal);
+    }
     if let Some(parent) = maker.tree.nodes[top].parent {
         ladder.extend(grid_goals(parent));
-        ladder.push(fit_goal(parent));
+        if let Some(goal) = fit_goal(parent) {
+            ladder.push(goal);
+        }
     }
     ladder.sort_by(|a, b| a.scale.total_cmp(&b.scale));
     ladder

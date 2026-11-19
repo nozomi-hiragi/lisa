@@ -16,13 +16,20 @@ use crate::render::tag;
 
 pub const BACKGROUND: Color = Color::srgb(0.08, 0.08, 0.1);
 
+/// フォルダの枠・中身・耳・プレビューを描くレイヤー（本物の描画とサムネ撮影の両方で映す）。
+pub const CONTENT_LAYER: usize = 0;
+/// 本物の場面にだけ重ねる印（重複の枠、カタログの札・暗い膜、読み込み中の光）。サムネには映さない。
+pub const OVERLAY_LAYER: usize = 1;
+
 /// 場面の根。これを消すと場面の中身もまとめて消える。
 ///
 /// 注意: 重なった場面どうしは、z の大小ではなく作った順に描かれる（後に作ったほうが上）。
 /// Bevy 0.20 のスプライトのまとめ描きで、z の並べ替えが効かない場合があるため。
 /// 上に見せたい場面は、必ず後から作る。
 #[derive(Component)]
-pub struct SceneRoot;
+pub struct SceneRoot {
+    pub folder: NodeId,
+}
 
 pub struct SceneSource<'a> {
     pub tree: &'a FileTree,
@@ -57,7 +64,7 @@ pub fn spawn(
     let tree = source.tree;
     let root = commands
         .spawn((
-            SceneRoot,
+            SceneRoot { folder },
             Transform::default(),
             Visibility::default(),
             layer.clone(),
@@ -127,7 +134,10 @@ pub fn spawn(
         });
         ear::draw_ear(&mut painter, slot, size, &node.name, background, z + 0.5);
         if let Some(marks) = source.catalog {
+            let prev_layer = painter.layer.clone();
+            painter.layer = RenderLayers::layer(OVERLAY_LAYER);
             tag::draw_tag(&mut painter, marks, folder, slot, size, &node.name, z + 0.5);
+            painter.layer = prev_layer;
         }
     }
     root
@@ -162,7 +172,7 @@ fn draw_children(
         let (slot, size) = (slot_of(source, child), size_of(source, child, live));
         if child_node.is_dir {
             let color = folder_color(tree, child);
-            let image = source.images.ready(child);
+            let image = source.images.ready(tree, child);
             in_group(painter, slot, size, |painter| {
                 status::draw_folder(
                     painter,
@@ -200,7 +210,7 @@ fn draw_children(
     painter.no_cull = true;
 }
 
-/// カタログの印（札、役割で暗くする膜、選んだ枠）。本物の場面だけ。
+/// カタログの印（札、役割で暗くする膜、選んだ枠）。本物の場面だけ（`OVERLAY_LAYER` に描き、サムネには入れない）。
 fn mark_catalog(
     painter: &mut Painter,
     source: &SceneSource,
@@ -212,6 +222,8 @@ fn mark_catalog(
     let Some(marks) = source.catalog else {
         return;
     };
+    let prev_layer = painter.layer.clone();
+    painter.layer = RenderLayers::layer(OVERLAY_LAYER);
     let frame = source.layouts[id].frame;
     in_group(painter, slot, size, |painter| {
         tag::draw_body_marks(painter, marks, id, frame, z);
@@ -227,12 +239,13 @@ fn mark_catalog(
             z,
         );
     }
+    painter.layer = prev_layer;
 }
 
 /// 重複の印の色（暖かい黄色。読み込み中の青い光とは別の色）。
 const DUPLICATE: Color = Color::srgb(0.949, 0.784, 0.443);
 
-/// 重複の一覧で選んだ組のコピーなら太い枠と薄い色、コピーを中に含むなら細い枠を描く。
+/// 重複の一覧で選んだ組のコピーなら太い枠と薄い色、コピーを中に含むなら細い枠を描く（`OVERLAY_LAYER`、サムネには入れない）。
 fn mark_duplicate(
     painter: &mut Painter,
     source: &SceneSource,
@@ -248,6 +261,8 @@ fn mark_duplicate(
     if !copy && !highlight.around.contains(&id) {
         return;
     }
+    let prev_layer = painter.layer.clone();
+    painter.layer = RenderLayers::layer(OVERLAY_LAYER);
     let frame = source.layouts[id].frame;
     in_group(painter, slot, size, |painter| {
         if copy {
@@ -265,6 +280,7 @@ fn mark_duplicate(
             painter.rect(rect, DUPLICATE, z + 0.45);
         }
     });
+    painter.layer = prev_layer;
 }
 
 /// 耳に譲って縮む入れ物の中に描く。

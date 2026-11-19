@@ -1,17 +1,18 @@
-//! フォルダの中身を画像にキャッシュする。
+//! フォルダの中身を画像（サムネ）にキャッシュする。
 //!
-//! 画面に映らないカメラで、フォルダの場面を1枚の画像に描く（render to texture）。
-//! 深い階層のカメラから先に描くので、親の画像には子の焼き上がった画像が入る。
-//! 焼くのは、並べてあるもの（基準のフォルダの周り、`layout.rs`）だけ。並ばなくなったものは捨てる。
-//! 焼き直している間は、前の画像をそのまま見せる。
+//! 先読みで焼く仕組み（`Bake`）は持たない。フォルダを開いて本物の場面が描かれたら、
+//! そのフォルダの本体の範囲（`layouts[folder].frame`）を `RenderLayers::layer(CONTENT_LAYER)` のみ
+//! 映す一時カメラ 1 台で 1024×724 の `Rgba8UnormSrgb` 画像へ撮り、`ReadbackOnce` で読み戻して
+//! WebP に保存し、そのままメモリにも載せる。重複の印・カタログの札や暗い膜・読み込み中の光は
+//! `OVERLAY_LAYER` に分けてあるため、サムネには入らない。
 //!
-//! 画像ごとに鍵（`Key`）を持つ。鍵は、その画像に描かれるものから作るハッシュ: 見た目の設定
-//! （画像の大きさ、耳の大きさ、描き方の版）と、子の種類・名前・状態、画像を持つ子はその子の鍵。
-//! 鍵が変わったものだけを作り直す。焼いた画像は GPU から読み戻して、WebP（非可逆）でディスクに
-//! 残す（ファイル名が鍵）。同じ鍵のファイルがあれば、焼かずにそれを読む。
-//! いずれ鍵はフォルダのハッシュ（`docs/schema.md` の `folder_image`）にする。
+//! もう一度そのフォルダを開き直したら撮り直して上書きする。まだ一度も開いていないフォルダは
+//! ディスクに前回の画像があれば裏スレッドで読み込み、無ければ画像なし（空の枠）で描く。
+//!
+//! 撮った直後の画像も、ディスクから読み込んだ画像も、同じ `loaded_image`（`TextureFormat::Rgba8UnormSrgb`、
+//! `view_formats` 不使用で OpenGL でも安全）を通すため、色が食い違わない。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -20,28 +21,27 @@ use std::time::{Duration, SystemTime};
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
 use bevy::camera::visibility::RenderLayers;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::gpu_readback::{ReadbackComplete, ReadbackOnce};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::sprite_render::ColorMaterial;
-use bevy::window::RequestRedraw;
+use bevy::window::{PrimaryWindow, RequestRedraw};
 
 use crate::layout::{BODY_ASPECT, Layouts};
-use crate::model::tree::{FileTree, LoadState, NodeId};
-use crate::render::ear::EarSizes;
-use crate::render::scene::{self, LabelFont, SceneSource};
+use crate::model::tree::{FileTree, NodeId};
+use crate::render::scene::{CONTENT_LAYER, LabelFont};
+use crate::view::{
+    Animating, Fade, MainCamera, Nav, SceneVisit, SyncRequest, WindowOccludedState, fit, scene_path,
+};
 
 /// 画像の幅（ピクセル）。高さは本体の縦横比（√2:1）に合わせる。
 const IMAGE_WIDTH: u32 = 1024;
-/// 一度に持つ画像の数の上限。
-const MAX_IMAGES: usize = 300;
-/// 一度に焼く画像の数の上限。焼く画像ごとにカメラを 1 つ立てるので、一度に何十枚も焼くと、
-/// 弱い GPU（Windows の古い Intel など）ではそのフレームが何秒も止まる。深いものから順に分けて焼く。
-const BAKE_BATCH: usize = 8;
-/// 焼くカメラを何フレーム残すか（描き終わるまでの余裕）。
-const BAKE_FRAMES: u32 = 3;
-/// 描き方の版。描き方を変えたら上げる（ディスクの古い画像を使わなくなる）。
-const DRAW_VERSION: u32 = 1;
+/// メモリに保持するサムネの上限枚数。
+const MAX_CACHED_IMAGES: usize = 300;
+/// 撮影カメラを何フレーム動かしてから読み戻すか（描き終わるまでの余裕）。
+const CAPTURE_FRAMES: u32 = 2;
+/// 描き方・色空間の版。`Rgba8UnormSrgb` 統一とフォルダ単位の鍵への変更に伴い 2 へ上げた。
+const DRAW_VERSION: u32 = 2;
 /// 使わないまま、これより経った画像は消す。
 const KEEP_UNUSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// 画像のキャッシュの大きさの上限（超えた分は、使っていない古いものから消す）。
@@ -49,67 +49,100 @@ const KEEP_BYTES: u64 = 1 << 30;
 /// WebP の品質（0〜100）。
 const WEBP_QUALITY: f32 = 85.0;
 
-/// 画像の鍵（描かれるもののハッシュ）。
+/// フォルダごとのサムネの鍵（パスまたはリモート識別子の blake3）。
 pub type Key = [u8; 32];
 
 fn image_height() -> u32 {
     (IMAGE_WIDTH as f32 / BODY_ASPECT).round() as u32
 }
 
-struct Slot {
-    image: Handle<Image>,
-    /// 今の画像（か、作っている途中の画像）の鍵。まだ何も無ければ None。
-    key: Option<Key>,
-    /// `image` が焼ける入れ物（ディスクから読んだ画像は焼けないので、焼くときに作り直す）。
-    target: bool,
+/// フォルダ `id` のサムネの鍵。Root やファイルは `None`。
+///
+/// - 手元のフォルダ: `DRAW_VERSION` + ディスク上のパス
+/// - LAN の相手のフォルダ: `DRAW_VERSION` + 端末 ID + 端末ノード以下の名前の道のり
+/// - ダミーの木や端末ノードなど: `DRAW_VERSION` + Root からの名前の道のり
+pub fn folder_key(tree: &FileTree, id: NodeId) -> Option<Key> {
+    let node = tree.nodes.get(id)?;
+    if id == FileTree::ROOT || !node.is_dir {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&DRAW_VERSION.to_le_bytes());
+    hasher.update(&IMAGE_WIDTH.to_le_bytes());
+    if let Some(remote) = &node.remote {
+        hasher.update(b"remote\0");
+        hasher.update(remote.device_id.as_bytes());
+        hasher.update(b"\0");
+        let mut names = Vec::new();
+        let mut cur = Some(id);
+        while let Some(i) = cur {
+            let n = &tree.nodes[i];
+            let same_device = n
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.device_id == remote.device_id);
+            if !same_device {
+                break;
+            }
+            // 端末ノード自身（entry_id == None）は表示名が変わっても鍵がぶれないよう省く。
+            if n.remote.as_ref().and_then(|r| r.entry_id).is_some() {
+                names.push(n.name.as_str());
+            }
+            cur = n.parent;
+        }
+        names.reverse();
+        for name in names {
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name.as_bytes());
+        }
+    } else if let Some(path) = &node.path {
+        hasher.update(b"local\0");
+        hasher.update(path.as_os_str().as_encoded_bytes());
+    } else {
+        hasher.update(b"tree\0");
+        hasher.update(tree.path(id).as_bytes());
+    }
+    Some(*hasher.finalize().as_bytes())
 }
 
-/// フォルダごとの画像。
+/// フォルダごとのサムネ（鍵 → 画像ハンドル）。`NodeId` ではなく `Key` で持つため、
+/// 読み直し（`reset_children`）でノード番号が変わっても画像が消えない。
 #[derive(Resource, Default)]
 pub struct FolderImages {
-    slots: HashMap<NodeId, Slot>,
-    /// 中身ができているもの。
-    baked: HashSet<NodeId>,
+    images: HashMap<Key, Handle<Image>>,
+    order: VecDeque<Key>,
+    /// 起動中に一度ディスクを確認した鍵（存在しないファイルへの再 stat を防ぐ）。
+    disk_checked: HashSet<Key>,
 }
 
 impl FolderImages {
-    /// 中身ができていれば画像を返す。
-    pub fn ready(&self, id: NodeId) -> Option<Handle<Image>> {
-        if self.baked.contains(&id) {
-            self.slots.get(&id).map(|slot| slot.image.clone())
-        } else {
-            None
-        }
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        (self.images.len(), self.images.len())
     }
 
-    /// 並べてあるフォルダ（Root 以外）のうち、基準から 2 段下までの画像の入れ物をそろえる
-    /// （それより下は、画像の中でも見分けられないほど小さい）。浅いものから `MAX_IMAGES` まで。
-    /// 並ばなくなったものは捨てる。
-    pub fn prepare(&mut self, tree: &FileTree, layouts: &Layouts, assets: &mut Assets<Image>) {
-        let until = tree.nodes[layouts.anchor].depth + 2;
-        let mut candidates: Vec<NodeId> = layouts
-            .ids()
-            .filter(|&id| {
-                let node = &tree.nodes[id];
-                id != FileTree::ROOT && node.is_dir && node.depth <= until
-            })
-            .collect();
-        candidates.sort_by_key(|&id| (tree.nodes[id].depth, id));
-        candidates.truncate(MAX_IMAGES);
-        let wanted: HashSet<NodeId> = candidates.into_iter().collect();
-        self.slots.retain(|id, _| wanted.contains(id));
-        self.baked.retain(|id| wanted.contains(id));
-        for id in wanted {
-            self.slots.entry(id).or_insert_with(|| Slot {
-                image: assets.add(target_image()),
-                key: None,
-                target: true,
-            });
+    /// フォルダ `id` のサムネがメモリにあれば返す。
+    pub fn ready(&self, tree: &FileTree, id: NodeId) -> Option<Handle<Image>> {
+        let key = folder_key(tree, id)?;
+        self.images.get(&key).cloned()
+    }
+
+    /// サムネをメモリへ登録（既にあれば上書き）し、上限を超えたら古いものから外す。
+    fn insert(&mut self, key: Key, handle: Handle<Image>) {
+        let existed = self.images.insert(key, handle).is_some();
+        self.disk_checked.insert(key);
+        if !existed {
+            self.order.push_back(key);
+            while self.order.len() > MAX_CACHED_IMAGES {
+                if let Some(old) = self.order.pop_front() {
+                    self.images.remove(&old);
+                    self.disk_checked.remove(&old);
+                }
+            }
         }
     }
 }
 
-/// 焼ける入れ物（読み戻せるように COPY_SRC も付ける）。
+/// 撮影用の描画先テクスチャ（読み戻せるように `COPY_SRC` を付ける）。
 fn target_image() -> Image {
     // 中身は sRGB のまま持つ（描くのも貼るのも sRGB として扱う）。Unorm の画像に sRGB の見方を
     // 足す形（view_formats）は、OpenGL（WGPU_BACKEND=gl）では作れずに落ちるので使わない。
@@ -123,7 +156,9 @@ fn target_image() -> Image {
     image
 }
 
-/// ディスクから読んだ画像（焼いた画像と同じ形式、同じバイト列）。
+/// 読み戻したバイト列・ディスクから読んだ WebP を貼るための画像。
+/// 描画先と同じ `TextureFormat::Rgba8UnormSrgb`（`view_formats` 不使用）にそろえ、
+/// 撮影直後と再読込後で色が完全に一致するようにする。
 fn loaded_image(rgba: Vec<u8>) -> Image {
     let mut image = Image::new(
         Extent3d {
@@ -133,18 +168,22 @@ fn loaded_image(rgba: Vec<u8>) -> Image {
         },
         TextureDimension::D2,
         rgba,
-        TextureFormat::Rgba8Unorm,
+        TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_view_descriptor = None;
     image
 }
 
-/// ディスクの画像の置き場と、書く係・読む係とのやりとり。
+/// ディスクの画像の置き場と、書く係・読む係・読み戻し結果のやりとり。
 #[derive(Resource)]
 pub struct ImageCache {
     dir: Option<PathBuf>,
     save: Mutex<Sender<(Key, Vec<u8>)>>,
+    read_req: Mutex<Sender<(Key, PathBuf)>>,
+    read_res: Mutex<Receiver<(Key, Option<Vec<u8>>)>>,
+    capture_tx: Mutex<Sender<(Key, Vec<u8>)>>,
+    capture_rx: Mutex<Receiver<(Key, Vec<u8>)>>,
 }
 
 impl ImageCache {
@@ -166,21 +205,40 @@ impl ImageCache {
                 })
                 .expect("画像を掃除する係を作る");
         }
-        let (save, receiver) = channel::<(Key, Vec<u8>)>();
+        let (save, save_rx) = channel::<(Key, Vec<u8>)>();
         let writer_dir = dir.clone();
         std::thread::Builder::new()
             .name("lisa-image-writer".into())
             .spawn(move || {
-                for (key, rgba) in receiver {
+                for (key, rgba) in save_rx {
                     if let Some(dir) = &writer_dir {
                         write_webp(dir, &key, &rgba);
                     }
                 }
             })
             .expect("画像を書く係を作る");
+
+        let (read_req, read_req_rx) = channel::<(Key, PathBuf)>();
+        let (read_res_tx, read_res) = channel::<(Key, Option<Vec<u8>>)>();
+        std::thread::Builder::new()
+            .name("lisa-image-reader".into())
+            .spawn(move || {
+                for (key, path) in read_req_rx {
+                    if read_res_tx.send((key, read_webp(&path))).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("画像を読む係を作る");
+
+        let (capture_tx, capture_rx) = channel::<(Key, Vec<u8>)>();
         Self {
             dir,
             save: Mutex::new(save),
+            read_req: Mutex::new(read_req),
+            read_res: Mutex::new(read_res),
+            capture_tx: Mutex::new(capture_tx),
+            capture_rx: Mutex::new(capture_rx),
         }
     }
 
@@ -275,339 +333,276 @@ fn sweep(dir: &std::path::Path, now: SystemTime, keep: Duration, max_bytes: u64)
     (removed, removed_bytes)
 }
 
-/// 見た目の設定のハッシュ（鍵の元のひとつ）。
-fn look(ears: &EarSizes) -> Key {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&DRAW_VERSION.to_le_bytes());
-    hasher.update(&IMAGE_WIDTH.to_le_bytes());
-    for value in [ears.fitted_width, ears.selected_px, ears.preview_px] {
-        hasher.update(&value.to_bits().to_le_bytes());
-    }
-    *hasher.finalize().as_bytes()
+/// 開いているフォルダのサムネ撮影と、見える子フォルダのディスク読込の状態。
+#[derive(Resource, Default)]
+pub struct ThumbnailCapture {
+    /// 最後に撮影し終えた `SceneVisit` 番号。
+    last_visit: u64,
+    /// 最後にディスク確認した `(scene_folder, children.len(), parent_children_len)`。
+    last_disk_scan: Option<(NodeId, usize, usize)>,
+    /// 撮影中のカメラ。
+    active: Option<ActiveCapture>,
+    /// ディスクから読み込み中の枚数。
+    in_flight_reads: usize,
 }
 
-/// 画像を持つフォルダの鍵を、深いものから順に作る。
-fn keys(tree: &FileTree, ids: &[NodeId], look: &Key) -> HashMap<NodeId, Key> {
-    let mut order = ids.to_vec();
-    order.sort_by_key(|&id| std::cmp::Reverse(tree.nodes[id].depth));
-    let mut keys: HashMap<NodeId, Key> = HashMap::new();
-    for id in order {
-        let node = &tree.nodes[id];
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(look);
-        hasher.update(&(node.device as u64).to_le_bytes());
-        hasher.update(&[node.loaded as u8]);
-        for &child in &node.children {
-            let c = &tree.nodes[child];
-            hasher.update(&[c.is_dir as u8, state_byte(c.state)]);
-            hasher.update(&(c.name.len() as u64).to_le_bytes());
-            hasher.update(c.name.as_bytes());
-            match keys.get(&child) {
-                Some(key) => hasher.update(key),
-                None => hasher.update(&[0]),
-            };
+struct ActiveCapture {
+    visit: u64,
+    folder: NodeId,
+    key: Key,
+    camera: Entity,
+    target: Handle<Image>,
+    frames: u32,
+    readback_sent: bool,
+}
+
+impl ThumbnailCapture {
+    pub fn status_label(&self) -> String {
+        if let Some(a) = &self.active {
+            format!("Capturing(f={},rb={})", a.frames, a.readback_sent)
+        } else if self.in_flight_reads > 0 {
+            format!("Loading({})", self.in_flight_reads)
+        } else {
+            "Idle".to_string()
         }
-        keys.insert(id, *hasher.finalize().as_bytes());
-    }
-    keys
-}
-
-fn state_byte(state: LoadState) -> u8 {
-    match state {
-        LoadState::Unloaded => 1,
-        LoadState::Loading => 2,
-        LoadState::Loaded => 3,
-        LoadState::Stale => 4,
-        LoadState::Failed => 5,
     }
 }
 
-/// ディスクから読んだ画像（読めなければ None）。
-type Loaded = (NodeId, Key, Option<Vec<u8>>);
-
-/// 作る作業の進み具合。
-#[derive(Resource)]
-pub enum Bake {
-    /// フォントの読み込み待ち（と、何を作るかを決める前）。
-    Waiting,
-    /// ディスクから読んでいる最中。読み終えたら、残り（`to_bake`）を焼く。
-    Loading {
-        results: Mutex<Receiver<Loaded>>,
-        remaining: usize,
-        to_bake: Vec<NodeId>,
-    },
-    /// 焼いている最中。
-    Rendering {
-        frames: u32,
-        entities: Vec<Entity>,
-        /// 焼き終えたら読み戻してディスクに残すもの。
-        saves: Vec<(Key, Handle<Image>)>,
-        /// このあと焼くもの（`BAKE_BATCH` を超えた分。浅いものほど後ろ）。
-        rest: Vec<NodeId>,
-    },
-    Done,
+/// `update_thumbnails` が参照する描画・操作状態の束。
+#[derive(SystemParam)]
+pub(crate) struct ThumbContext<'w, 's> {
+    fonts: Res<'w, Assets<Font>>,
+    font: Res<'w, LabelFont>,
+    tree: Res<'w, FileTree>,
+    layouts: Res<'w, Layouts>,
+    nav: Res<'w, Nav>,
+    visit: Res<'w, SceneVisit>,
+    window: Single<'w, 's, &'static Window, With<PrimaryWindow>>,
+    camera: Single<'w, 's, &'static Projection, With<MainCamera>>,
+    animating: Option<Res<'w, Animating>>,
+    fades: Query<'w, 's, (), With<Fade>>,
+    gesture: Res<'w, crate::input::gesture::Gesture>,
+    readbacks: Query<'w, 's, (), With<ReadbackOnce>>,
+    occluded: Res<'w, WindowOccludedState>,
 }
 
-/// 焼き上がった直後の1回だけ存在する。
-#[derive(Resource)]
-pub struct BakeFinished;
-
+/// 毎フレーム:
+/// 1. 読み戻し完了したサムネ・ディスクから読めたサムネを `FolderImages` へ反映し、見えるタイルに必要なら再描画を頼む。
+/// 2. 今開いている場面の直下の子（と隣）のうち、まだメモリに無くディスクにある WebP を裏で読む。
+/// 3. 今開いているフォルダが落ち着いて描かれたら、`CONTENT_LAYER`（レイヤー 0）だけを 1 枚撮って保存する。
 #[allow(clippy::too_many_arguments)]
-pub fn bake(
+pub(crate) fn update_thumbnails(
     mut commands: Commands,
-    mut bake: ResMut<Bake>,
+    mut capture: ResMut<ThumbnailCapture>,
     mut images: ResMut<FolderImages>,
     cache: Res<ImageCache>,
     mut assets: ResMut<Assets<Image>>,
-    fonts: Res<Assets<Font>>,
-    font: Res<LabelFont>,
-    tree: Res<FileTree>,
-    layouts: Res<Layouts>,
-    ears: Res<EarSizes>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
+    mut sync: ResMut<SyncRequest>,
     mut redraw: MessageWriter<RequestRedraw>,
+    ctx: ThumbContext,
 ) {
-    match bake.as_mut() {
-        Bake::Waiting => {
-            redraw.write(RequestRedraw);
-            if !fonts.contains(&font.0) {
-                return;
-            }
-            // 鍵が変わったものだけを作り直す。
-            let ids: Vec<NodeId> = images.slots.keys().copied().collect();
-            let new_keys = keys(&tree, &ids, &look(&ears));
-            let mut to_load = Vec::new();
-            let mut to_bake = Vec::new();
-            for (id, key) in new_keys {
-                let slot = images.slots.get_mut(&id).expect("入れ物");
-                if slot.key == Some(key) {
-                    continue;
-                }
-                slot.key = Some(key);
-                match cache.path(&key).filter(|p| p.exists()) {
-                    Some(path) => to_load.push((id, key, path)),
-                    None => to_bake.push(id),
-                }
-            }
-            if to_load.is_empty() {
-                *bake = start_baking(
-                    &mut commands,
-                    &mut images,
-                    &mut assets,
-                    &mut meshes,
-                    &mut materials,
-                    &tree,
-                    &layouts,
-                    &font,
-                    &ears,
-                    to_bake,
-                );
-                return;
-            }
-            let (sender, receiver) = channel();
-            let remaining = to_load.len();
-            std::thread::Builder::new()
-                .name("lisa-image-reader".into())
-                .spawn(move || {
-                    for (id, key, path) in to_load {
-                        if sender.send((id, key, read_webp(&path))).is_err() {
-                            return;
-                        }
-                    }
-                })
-                .expect("画像を読む係を作る");
-            *bake = Bake::Loading {
-                results: Mutex::new(receiver),
-                remaining,
-                to_bake,
-            };
-        }
-        Bake::Loading {
-            results,
-            remaining,
-            to_bake,
-        } => {
-            redraw.write(RequestRedraw);
-            let results = results.get_mut().expect("読んだ画像");
-            for (id, key, rgba) in results.try_iter() {
-                *remaining -= 1;
-                let Some(slot) = images.slots.get_mut(&id) else {
-                    continue;
-                };
-                if slot.key != Some(key) {
-                    continue;
-                }
-                match rgba {
-                    Some(rgba) => {
-                        slot.image = assets.add(loaded_image(rgba));
-                        slot.target = false;
-                        images.baked.insert(id);
-                    }
-                    // 壊れていたら焼き直す（書き直される）。
-                    None => to_bake.push(id),
-                }
-            }
-            if *remaining > 0 {
-                return;
-            }
-            let to_bake = std::mem::take(to_bake);
-            *bake = start_baking(
-                &mut commands,
-                &mut images,
-                &mut assets,
-                &mut meshes,
-                &mut materials,
-                &tree,
-                &layouts,
-                &font,
-                &ears,
-                to_bake,
-            );
-            if matches!(*bake, Bake::Done) {
-                commands.insert_resource(BakeFinished);
+    let path = scene_path(&ctx.nav, &ctx.tree);
+    let scene_folder = path[path.len() - 1].node;
+
+    // 1a. 撮影の読み戻し結果を反映する。
+    let mut updated_keys: Vec<Key> = Vec::new();
+    if let Ok(rx) = cache.capture_rx.lock() {
+        for (key, rgba) in rx.try_iter() {
+            let expected = (IMAGE_WIDTH * image_height() * 4) as usize;
+            if rgba.len() == expected {
+                let handle = assets.add(loaded_image(rgba));
+                images.insert(key, handle);
+                updated_keys.push(key);
             }
         }
-        Bake::Rendering {
-            frames,
-            entities,
-            saves,
-            rest,
-        } => {
-            redraw.write(RequestRedraw);
-            *frames += 1;
-            if *frames == BAKE_FRAMES - 1 {
-                // 描き終えた画像を読み戻して、ディスクに残す。
-                for (key, image) in saves.drain(..) {
-                    let save = cache.save.lock().expect("画像を書く係").clone();
-                    commands.spawn(ReadbackOnce::texture(image)).observe(
-                        move |event: On<ReadbackComplete>, mut commands: Commands| {
-                            let _ = save.send((key, event.data.clone()));
-                            commands.entity(event.entity).despawn();
-                        },
-                    );
-                }
-            }
-            if *frames < BAKE_FRAMES {
-                return;
-            }
-            for entity in entities.drain(..) {
-                commands.entity(entity).despawn();
-            }
-            let rest = std::mem::take(rest);
-            *bake = start_baking(
-                &mut commands,
-                &mut images,
-                &mut assets,
-                &mut meshes,
-                &mut materials,
-                &tree,
-                &layouts,
-                &font,
-                &ears,
-                rest,
-            );
-            if matches!(*bake, Bake::Done) {
-                commands.insert_resource(BakeFinished);
-            }
-        }
-        Bake::Done => {}
     }
+
+    // 1b. ディスクから読めた WebP を反映する。
+    if let Ok(rx) = cache.read_res.lock() {
+        for (key, opt_rgba) in rx.try_iter() {
+            capture.in_flight_reads = capture.in_flight_reads.saturating_sub(1);
+            if let Some(rgba) = opt_rgba {
+                let handle = assets.add(loaded_image(rgba));
+                images.insert(key, handle);
+                updated_keys.push(key);
+            }
+        }
+    }
+
+    // いま画面に並んでいる子や隣に更新した鍵が含まれていれば、場面を描き直す（操作中は sync_view が待つ）。
+    if !updated_keys.is_empty() && visible_contains_any(&ctx.tree, scene_folder, &updated_keys) {
+        sync.request_redraw();
+    }
+
+    let busy = ctx.animating.is_some()
+        || !ctx.fades.is_empty()
+        || ctx.gesture.active()
+        || ctx.gesture.has_parent_scene();
+
+    // 2. 操作が止まっていて、場面のフォルダや子の数が変わったときだけディスク上の WebP を確認する。
+    let parent_children_len = ctx.tree.nodes[scene_folder]
+        .parent
+        .map_or(0, |p| ctx.tree.nodes[p].children.len());
+    let scan_sig = (
+        scene_folder,
+        ctx.tree.nodes[scene_folder].children.len(),
+        parent_children_len,
+    );
+    if !busy && capture.last_disk_scan != Some(scan_sig) {
+        capture.last_disk_scan = Some(scan_sig);
+        let mut visible_dirs = Vec::new();
+        for &c in &ctx.tree.nodes[scene_folder].children {
+            if ctx.tree.nodes[c].is_dir {
+                visible_dirs.push(c);
+            }
+        }
+        if let Some(parent) = ctx.tree.nodes[scene_folder].parent {
+            for &s in &ctx.tree.nodes[parent].children {
+                if s != scene_folder && ctx.tree.nodes[s].is_dir {
+                    visible_dirs.push(s);
+                }
+            }
+        }
+        for dir_id in visible_dirs {
+            let Some(key) = folder_key(&ctx.tree, dir_id) else {
+                continue;
+            };
+            if images.images.contains_key(&key) || !images.disk_checked.insert(key) {
+                continue;
+            }
+            if let Some(path) = cache.path(&key).filter(|p| p.exists())
+                && let Ok(tx) = cache.read_req.lock()
+                && tx.send((key, path)).is_ok()
+            {
+                capture.in_flight_reads += 1;
+            }
+        }
+    }
+
+    // 裏読込や GPU 読み戻しが進行中なら、reactive の 1 秒待ちを待たずに次のフレームを回す。
+    if (capture.in_flight_reads > 0 || !ctx.readbacks.is_empty()) && !ctx.occluded.0 {
+        redraw.write(RequestRedraw);
+    }
+
+    // 3. 今開いているフォルダのサムネ撮影を進める・始める。
+
+    if let Some(active) = capture.active.as_mut() {
+        let stale = active.folder != scene_folder || active.visit != ctx.visit.0;
+        if !active.readback_sent && (busy || ctx.occluded.0 || stale) {
+            commands.entity(active.camera).despawn();
+            capture.active = None;
+            return;
+        }
+        if !ctx.occluded.0 {
+            redraw.write(RequestRedraw);
+        }
+        active.frames += 1;
+        if active.frames == CAPTURE_FRAMES && !active.readback_sent {
+            let key = active.key;
+            let save = cache.save.lock().expect("画像を書く係").clone();
+            let mem = cache.capture_tx.lock().expect("画像を受け取る係").clone();
+            commands
+                .spawn(ReadbackOnce::texture(active.target.clone()))
+                .observe(move |event: On<ReadbackComplete>, mut commands: Commands| {
+                    let data = event.data.clone();
+                    let _ = save.send((key, data.clone()));
+                    let _ = mem.send((key, data));
+                    commands.entity(event.entity).despawn();
+                });
+            active.readback_sent = true;
+        }
+        if active.frames > CAPTURE_FRAMES {
+            let done_visit = active.visit;
+            let cam = active.camera;
+            commands.entity(cam).despawn();
+            capture.last_visit = done_visit;
+            capture.active = None;
+        }
+        return;
+    }
+
+    // 新規撮影の条件: 操作停止中・可視・フォント読込済・まだこの訪問を撮っていない・anchor 一致・通常倍率。
+    if busy
+        || ctx.occluded.0
+        || !ctx.fonts.contains(&ctx.font.0)
+        || ctx.visit.0 == capture.last_visit
+    {
+        return;
+    }
+    if scene_folder == FileTree::ROOT
+        || !ctx.tree.nodes[scene_folder].is_dir
+        || !ctx.tree.nodes[scene_folder].loaded
+        || ctx.layouts.anchor != scene_folder
+        || !ctx.layouts.contains(scene_folder)
+    {
+        return;
+    }
+    let cam_scale = match *ctx.camera {
+        Projection::Orthographic(o) => o.scale,
+        _ => return,
+    };
+    let (_, fit_scale) = fit(ctx.layouts[scene_folder].fit, &ctx.window);
+    if !(fit_scale > 0.0 && cam_scale.is_finite())
+        || (cam_scale - fit_scale).abs() > fit_scale * 0.05
+    {
+        return;
+    }
+    let Some(key) = folder_key(&ctx.tree, scene_folder) else {
+        capture.last_visit = ctx.visit.0;
+        return;
+    };
+    let frame = ctx.layouts[scene_folder].frame;
+    if !(frame.width() > 0.0 && frame.height() > 0.0) {
+        return;
+    }
+    let target = assets.add(target_image());
+    let scale = frame.width() / IMAGE_WIDTH as f32;
+    let cam_entity = commands
+        .spawn((
+            Camera2d,
+            Camera {
+                order: -1,
+                clear_color: ClearColorConfig::Custom(Color::NONE),
+                ..default()
+            },
+            RenderTarget::Image(target.clone().into()),
+            Projection::Orthographic(OrthographicProjection {
+                scale,
+                ..OrthographicProjection::default_2d()
+            }),
+            Transform::from_translation(frame.center().extend(0.0)),
+            // レイヤー 0（中身のみ）を撮る。レイヤー 1 の重複・カタログ印やパルスは入らない。
+            RenderLayers::layer(CONTENT_LAYER),
+        ))
+        .id();
+    capture.active = Some(ActiveCapture {
+        visit: ctx.visit.0,
+        folder: scene_folder,
+        key,
+        camera: cam_entity,
+        target,
+        frames: 0,
+        readback_sent: false,
+    });
+    redraw.write(RequestRedraw);
 }
 
-/// `targets` を焼き始める。何も無ければ `Done`。
-#[allow(clippy::too_many_arguments)]
-fn start_baking(
-    commands: &mut Commands,
-    images: &mut FolderImages,
-    assets: &mut Assets<Image>,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<ColorMaterial>,
-    tree: &FileTree,
-    layouts: &Layouts,
-    font: &LabelFont,
-    ears: &EarSizes,
-    mut targets: Vec<NodeId>,
-) -> Bake {
-    if targets.is_empty() {
-        return Bake::Done;
-    }
-    // 子は親より先に焼く（親の場面には子の焼き上がった画像を貼る）。深いものから `BAKE_BATCH` 枚だけ。
-    targets.sort_by_key(|&id| (std::cmp::Reverse(tree.nodes[id].depth), id));
-    let rest = targets.split_off(targets.len().min(BAKE_BATCH));
-    // ディスクから読んだ画像には焼けないので、入れ物を作り直す。
-    let mut saves = Vec::new();
-    for &id in &targets {
-        let slot = images.slots.get_mut(&id).expect("入れ物");
-        if !slot.target {
-            slot.image = assets.add(target_image());
-            slot.target = true;
-        }
-        if let Some(key) = slot.key {
-            saves.push((key, slot.image.clone()));
-        }
-    }
-    // 親の場面には子の画像を貼る。子は同じフレームの先に焼かれる。
-    images.baked.extend(targets.iter().copied());
-    let handles: Vec<(NodeId, Handle<Image>)> = targets
+fn visible_contains_any(tree: &FileTree, scene_folder: NodeId, keys: &[Key]) -> bool {
+    let matches = |id: NodeId| folder_key(tree, id).is_some_and(|k| keys.contains(&k));
+    if tree.nodes[scene_folder]
+        .children
         .iter()
-        .map(|&id| (id, images.slots[&id].image.clone()))
-        .collect();
-    let source = SceneSource {
-        tree,
-        layouts,
-        images,
-        font: &font.0,
-        ears,
-        // 重複の印は画像に焼かない（選ぶたびに変わるので、本物の場面にだけ描く）。
-        highlight: None,
-        catalog: None,
-    };
-    let mut entities = Vec::new();
-    for (i, (id, image)) in handles.into_iter().enumerate() {
-        // `layer` は const で 64 個までしか作れないので、`from_layers` を使う。
-        let layer = RenderLayers::from_layers(&[i + 1]);
-        let frame = layouts[id].frame;
-        let scale = frame.width() / IMAGE_WIDTH as f32;
-        entities.push(scene::spawn(
-            commands,
-            meshes,
-            materials,
-            &source,
-            id,
-            layer.clone(),
-            scale,
-            false,
-            &[],
-            None,
-        ));
-        entities.push(
-            commands
-                .spawn((
-                    Camera2d,
-                    Camera {
-                        // 深いフォルダほど先に描く。
-                        order: -1000 - tree.nodes[id].depth as isize,
-                        clear_color: ClearColorConfig::Custom(Color::NONE),
-                        ..default()
-                    },
-                    RenderTarget::Image(image.into()),
-                    Projection::Orthographic(OrthographicProjection {
-                        scale,
-                        ..OrthographicProjection::default_2d()
-                    }),
-                    Transform::from_translation(frame.center().extend(0.0)),
-                    layer,
-                ))
-                .id(),
-        );
+        .copied()
+        .any(matches)
+    {
+        return true;
     }
-    Bake::Rendering {
-        frames: 0,
-        entities,
-        saves,
-        rest,
+    if let Some(parent) = tree.nodes[scene_folder].parent
+        && tree.nodes[parent].children.iter().copied().any(matches)
+    {
+        return true;
     }
+    false
 }
 
 #[cfg(test)]
@@ -676,24 +671,47 @@ mod tests {
     }
 
     #[test]
-    fn keys_change_when_a_child_changes() {
-        let mut tree = FileTree::deep(3);
-        let dirs: Vec<NodeId> = (1..tree.nodes.len())
-            .filter(|&id| tree.nodes[id].is_dir)
-            .collect();
-        let look = [7u8; 32];
-        let before = keys(&tree, &dirs, &look);
-        assert_eq!(before, keys(&tree, &dirs, &look));
-        // いちばん深いフォルダの子の名前を変えると、そのフォルダと祖先の鍵が変わる。
-        let deepest = *dirs.iter().max_by_key(|&&id| tree.nodes[id].depth).unwrap();
-        let child = tree.nodes[deepest].children[0];
-        tree.nodes[child].name.push('x');
-        let after = keys(&tree, &dirs, &look);
-        for &id in &dirs {
-            assert_ne!(before[&id], after[&id]);
-        }
-        // 見た目の設定が変わっても変わる。
-        let other = keys(&tree, &dirs, &[8u8; 32]);
-        assert_ne!(after[&deepest], other[&deepest]);
+    fn target_and_loaded_images_share_srgb_format_without_view_formats() {
+        let target = target_image();
+        let loaded = loaded_image(vec![0u8; (IMAGE_WIDTH * image_height() * 4) as usize]);
+        assert_eq!(
+            target.texture_descriptor.format,
+            TextureFormat::Rgba8UnormSrgb
+        );
+        assert_eq!(
+            loaded.texture_descriptor.format,
+            TextureFormat::Rgba8UnormSrgb
+        );
+        assert!(target.texture_descriptor.view_formats.is_empty());
+        assert!(loaded.texture_descriptor.view_formats.is_empty());
+    }
+
+    #[test]
+    fn folder_key_is_stable_across_local_and_remote_nodes() {
+        let mut tree = FileTree::dummy();
+        assert!(folder_key(&tree, FileTree::ROOT).is_none());
+        let dev = tree.nodes[FileTree::ROOT].children[0];
+        let k1 = folder_key(&tree, dev).unwrap();
+        let k2 = folder_key(&tree, dev).unwrap();
+        assert_eq!(k1, k2);
+
+        // リモート端末は端末 ID + 名前の道のりで決まる（端末の表示名が変わっても子フォルダの鍵は変わらない）。
+        let peer =
+            tree.ensure_remote_device("peer-1", "Peer A", crate::model::tree::LoadState::Loaded);
+        tree.add_remote_drives(
+            peer,
+            vec![crate::model::tree::RemoteDrive {
+                label: "C:".into(),
+                entry_id: 1,
+                listed: true,
+                has_hash: true,
+                has_error: false,
+            }],
+        );
+        let drive = tree.nodes[peer].children[0];
+        let before = folder_key(&tree, drive).unwrap();
+        tree.nodes[peer].name = "Peer Renamed".into();
+        let after = folder_key(&tree, drive).unwrap();
+        assert_eq!(before, after);
     }
 }

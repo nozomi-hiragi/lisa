@@ -88,7 +88,6 @@ impl Index<NodeId> for Layouts {
 
 impl Layouts {
     /// 並べてあるか。
-    #[cfg(test)]
     pub fn contains(&self, id: NodeId) -> bool {
         self.map.contains_key(&id)
     }
