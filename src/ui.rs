@@ -4,5 +4,6 @@ pub mod catalog;
 pub mod context_menu;
 pub mod dups;
 pub mod menu;
+pub mod organize;
 pub mod progress;
 pub mod tooltip;
