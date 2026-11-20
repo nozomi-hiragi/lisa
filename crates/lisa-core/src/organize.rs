@@ -681,6 +681,12 @@ mod tests {
         let undo = undo_plan(&mut h.db, &h.ctx, id).unwrap();
         assert_eq!(undo.undone, 0);
         assert_eq!(undo.skipped.len(), 1);
+        assert_eq!(undo.state, PlanState::Undone);
+        let saved_plan = plan::load_plan_required(&mut h.db, id).unwrap();
+        assert_eq!(saved_plan.state, PlanState::Undone);
+        let saved_op = plan::plan_ops(&mut h.db, id).unwrap().remove(0);
+        assert_eq!(saved_op.state, OpState::Skipped);
+        assert_eq!(saved_op.reason.as_deref(), Some(undo.skipped[0].reason.as_str()));
         assert_eq!(fs::read(&a).unwrap(), b"blocker");
         assert_eq!(fs::read(&b).unwrap(), b"first");
     }

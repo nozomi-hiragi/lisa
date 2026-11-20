@@ -68,6 +68,13 @@ pub struct PlanDetails {
     pub chains: Vec<Option<Vec<i64>>>,
 }
 
+/// OS のゴミ箱へ送る前の確認内容。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfirmPurge {
+    Plan(i64),
+    All,
+}
+
 /// UI と裏のスレッドの橋渡しをする状態。
 #[derive(Resource, Default)]
 pub struct OrganizeState {
@@ -83,8 +90,10 @@ pub struct OrganizeState {
     pub selected_details: Option<PlanDetails>,
     /// 「場所を見る」で木の上を光らせている計画の ID。
     pub highlighted_plan: Option<i64>,
-    /// 右クリックの「移動…」で選んだ移動元。これが `Some` のあいだは、次に押したフォルダへ移動する。
-    pub pick_move_source: Option<PathBuf>,
+    /// 右クリックの「切り取り」で選んだ移動元。貼り付けるまで保持する。
+    pub cut_source: Option<PathBuf>,
+    /// OS のゴミ箱へ送る前の確認。
+    pub confirming_purge: Option<ConfirmPurge>,
     /// 裏のスレッドで実行・取り消し・掃除が動いているか。
     pub busy: bool,
     /// 一時的なお知らせ（結果やエラー）。
@@ -147,7 +156,7 @@ impl OrganizeState {
         self.send(Action::UserTrash { path });
     }
 
-    /// 右クリックの「移動…」で移動先フォルダを選んだとき。1 件の move 計画を `by = "user"` で作り実行する。
+    /// 右クリックの「ここに貼り付け」で移動を実行したとき。1 件の move 計画を `by = "user"` で作る。
     pub fn user_move(&mut self, from: PathBuf, dest_dir: PathBuf) {
         self.busy = true;
         self.send(Action::UserMove { from, dest_dir });
@@ -239,6 +248,7 @@ fn receive_events(
             Event::Touched(folders) => {
                 if let Some(control) = &control {
                     for folder in folders {
+                        control.visible(folder.clone());
                         control.hint(folder);
                     }
                 }
@@ -372,11 +382,17 @@ fn run_worker(
                                 if !report.touched_folders.is_empty() {
                                     send(Event::Touched(report.touched_folders));
                                 }
-                                send(Event::Notice(format!(
-                                    "計画 #{id} を取り消しました（戻した {} / 飛ばした {}）",
-                                    report.undone,
-                                    report.skipped.len()
-                                )));
+                                let notice = if report.skipped.is_empty() {
+                                    format!("計画 #{id} を取り消しました（戻した {}）", report.undone)
+                                } else {
+                                    format!(
+                                        "計画 #{id} の取り消し結果（戻した {} / 飛ばした {}: {}）",
+                                        report.undone,
+                                        report.skipped.len(),
+                                        report.skipped[0].reason
+                                    )
+                                };
+                                send(Event::Notice(notice));
                             }
                             Err(err) => {
                                 send(Event::Notice(format!(
