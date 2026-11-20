@@ -55,7 +55,7 @@ pub fn draw_file(
     background: Color,
     z: f32,
     live: bool,
-    loaded: Option<(Handle<Image>, UVec2)>,
+    loaded: Option<crate::preview::Preview>,
 ) {
     match state {
         LoadState::Unloaded => outline(painter, frame, background, z),
