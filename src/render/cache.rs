@@ -45,7 +45,7 @@ const MAX_CACHED_IMAGES: usize = 300;
 /// 撮影カメラを何フレーム動かしてから読み戻すか（描き終わるまでの余裕）。
 const CAPTURE_FRAMES: u32 = 2;
 /// 描き方・色空間の版。本体の中身を透明背景で撮影する。
-const DRAW_VERSION: u32 = 10;
+const DRAW_VERSION: u32 = 11;
 /// 使わないまま、これより経った画像は消す。
 const KEEP_UNUSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// 画像のキャッシュの大きさの上限（超えた分は、使っていない古いものから消す）。

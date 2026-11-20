@@ -80,6 +80,10 @@ pub trait Cartridge: Send + Sync + 'static {
     fn load(&self, _path: &Path) -> Option<LoadedPreview> {
         None
     }
+    /// 紙の形を縦 A4 にする。
+    fn portrait_a4(&self) -> bool {
+        false
+    }
     /// 紙の内側を描く。
     fn draw(&self, ctx: &mut DrawContext<'_, '_, '_, '_>);
 }
@@ -96,6 +100,10 @@ impl Cartridge for BuiltinFallback {
 
     fn extensions(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    fn portrait_a4(&self) -> bool {
+        true
     }
 
     fn draw(&self, _ctx: &mut DrawContext<'_, '_, '_, '_>) {}
@@ -179,6 +187,17 @@ pub fn extension(name: &str) -> &str {
     name.rsplit_once('.').map_or("", |(_, ext)| ext)
 }
 
+fn paper_frame(frame: Rect, portrait_a4: bool) -> Rect {
+    if !portrait_a4 {
+        return frame;
+    }
+    let size = Vec2::new(
+        (frame.height() * std::f32::consts::FRAC_1_SQRT_2).min(frame.width()),
+        frame.height(),
+    );
+    Rect::from_center_size(frame.center(), size)
+}
+
 /// 紙の形の背景（右上が折れている）と、選んだカートリッジの絵を描く。`background` は下の色。
 pub fn draw(
     registry: &PreviewRegistry,
@@ -189,10 +208,18 @@ pub fn draw(
     z: f32,
     loaded: Option<Preview>,
 ) {
+    let cartridge = registry.pick(name);
+    let portrait_a4 = cartridge.portrait_a4();
+    let frame = paper_frame(frame, portrait_a4);
     let paper = Color::srgb(0.85, 0.87, 0.95);
     let page = over(background, paper, 0.10);
     let fold = over(background, paper, 0.22);
-    let c = frame.height() * 0.15;
+    let short_side = frame.width().min(frame.height());
+    let c = if portrait_a4 {
+        short_side * 0.22
+    } else {
+        frame.height() * 0.15
+    };
     painter.rect(
         Rect::new(frame.min.x, frame.min.y, frame.max.x - c, frame.max.y),
         page,
@@ -213,7 +240,11 @@ pub fn draw(
         z,
     );
 
-    let pad = frame.height() * 0.14;
+    let pad = if portrait_a4 {
+        short_side
+    } else {
+        frame.height()
+    } * 0.14;
     let inner = Rect {
         min: frame.min + pad,
         max: frame.max - pad,
@@ -227,7 +258,7 @@ pub fn draw(
         z: z + 0.05,
         loaded,
     };
-    registry.pick(name).draw(&mut ctx);
+    cartridge.draw(&mut ctx);
 }
 
 /// プレビューのカートリッジを登録するプラグイン。
@@ -470,6 +501,36 @@ mod tests {
         }
 
         fn draw(&self, _ctx: &mut DrawContext<'_, '_, '_, '_>) {}
+    }
+
+    #[test]
+    fn only_document_cartridges_use_portrait_a4_paper() {
+        let mut registry = PreviewRegistry::default();
+        cartridges::register(&mut registry);
+        let frame = Rect::new(-30.0, 10.0, 130.0, 130.0);
+        for name in [
+            "unknown.custom",
+            "notes.txt",
+            "notes.md",
+            "memo.docx",
+            "data.xlsx",
+            "brief.pdf",
+        ] {
+            let paper = paper_frame(frame, registry.pick(name).portrait_a4());
+            assert!(
+                (paper.width() / paper.height() - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+                "{name}"
+            );
+            assert_eq!(paper.center(), frame.center(), "{name}");
+            assert_eq!(paper.height(), frame.height(), "{name}");
+        }
+        for name in ["photo.png", "photo.heic", "clip.mov", "clip.mp4"] {
+            assert_eq!(
+                paper_frame(frame, registry.pick(name).portrait_a4()),
+                frame,
+                "{name}"
+            );
+        }
     }
 
     #[test]

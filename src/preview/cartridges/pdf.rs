@@ -33,6 +33,10 @@ impl Cartridge for Pdf {
         None
     }
 
+    fn portrait_a4(&self) -> bool {
+        true
+    }
+
     fn draw(&self, ctx: &mut DrawContext<'_, '_, '_, '_>) {
         if let Some(Preview::Image(handle, size)) = ctx.loaded.clone()
             && size.x > 0

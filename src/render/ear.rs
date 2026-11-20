@@ -464,7 +464,11 @@ fn draw_part(
             TextLayout::no_wrap(),
             TextFont::from_font_size(px).with_font(painter.font.clone()),
             TextColor(color),
-            Anchor::CENTER_LEFT,
+            if matches!(part, Part::Below) {
+                Anchor::CENTER
+            } else {
+                Anchor::CENTER_LEFT
+            },
         )),
     };
     if painter.no_cull {
@@ -571,8 +575,8 @@ fn part_transform(
             )
         }
         Part::Below => {
-            let size = (h * TEXT_RATIO).min(shown.width() * 0.95 / em);
-            text(Vec2::new(shown.min.x, shown.min.y - h / 2.0), size)
+            let size = (h * TEXT_RATIO).min(slot.cell.width() * 0.95 / em);
+            text(Vec2::new(slot.cell.center().x, shown.min.y - h / 2.0), size)
         }
     }
 }

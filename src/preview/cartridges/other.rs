@@ -16,6 +16,10 @@ impl Cartridge for Other {
         &[]
     }
 
+    fn portrait_a4(&self) -> bool {
+        true
+    }
+
     fn draw(&self, ctx: &mut DrawContext<'_, '_, '_, '_>) {
         let ext = extension(ctx.name).to_uppercase();
         let ext = if ext.is_empty() {
