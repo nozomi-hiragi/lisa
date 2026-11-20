@@ -274,6 +274,7 @@ impl Server {
             "lisa_assign" => self.assign(args),
             "lisa_unassign" => self.unassign(args),
             "lisa_plan_create" => self.plan_create(args, auth),
+            "lisa_rename" => self.rename(args, auth),
             "lisa_plan_status" => self.plan_status(args),
             "lisa_plans" => self.plans(args),
             "lisa_plan_cancel" => self.plan_cancel(args),
@@ -2226,7 +2227,7 @@ pub const INSTRUCTIONS: &str = "Lisa は、複数の PC やドライブのファ
 DB を読む道具（lisa_drives, lisa_list, lisa_info, lisa_search, lisa_duplicates, lisa_copies, lisa_snapshots）と\
 ログや生死を見る道具（lisa_logs, lisa_app_alive）はアプリが起動していなくても使えます。lisa_app_* は起動中のアプリの画面や起動・終了を扱います。\
 カタログの道具（lisa_catalogs, lisa_catalog_matches, lisa_unclassified, lisa_outline, lisa_catalog_test）でアプリのフォルダを見分けたり形を調べたりできます。\
-整理の道具（lisa_plan_create, lisa_plan_status, lisa_plans, lisa_plan_cancel, lisa_undo）で移動・フォルダ作成・隔離の計画を出せます。\
+整理の道具（lisa_plan_create, lisa_rename, lisa_plan_status, lisa_plans, lisa_plan_cancel, lisa_undo）で移動・フォルダ作成・隔離の計画を出せます。\
 計画の許可は人が Lisa の画面（か CLI）で押します。押されるまでユーザーのファイルは何も動きません（許可する道具は無く、lisa_plan_status の wait で待てます）。\
 大きさはバイト、日時は UTC の Unix 時刻（ミリ秒）、ハッシュは BLAKE3 の 16 進です。";
 
@@ -2474,6 +2475,22 @@ pub fn tools() -> Value {
                 "assignment_id": {"type": "integer", "description": "仕分けの行 ID（path / id の代わりに）"},
             })),
             "annotations": app_hint,
+        },
+        {
+            "name": "lisa_rename",
+            "description": "同じ親フォルダ内で名前を変更する計画を作る。実行には Lisa で人の許可が必要。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "手元の対象の絶対パス"},
+                    "id": {"type": "integer", "description": "対象の DB 上の ID"},
+                    "new_name": {"type": "string", "description": "親パスを含めない新しい名前"},
+                    "note": {"type": "string", "description": "計画のメモ"},
+                    "dry_run": {"type": "boolean", "description": "計画を作らず確認結果だけ返す"}
+                },
+                "required": ["new_name"],
+                "anyOf": [{"required": ["path"]}, {"required": ["id"]}]
+            }
         },
         {
             "name": "lisa_plan_create",

@@ -307,7 +307,8 @@ impl Plugin for PreviewPlugin {
     }
 }
 
-/// 開いているフォルダが変わった・子の数が変わったときだけ、直接の子のファイルの読みを頼む。
+/// 開いているフォルダが変わった・子のファイルが変わった（名前の変更や Undo で数が同じままのときも）
+/// ときだけ、直接の子のファイルの読みを頼む。
 /// 読めた絵が届いたら、場面の描き直しを 1 回頼む。
 pub fn update_previews(
     mut registry: ResMut<PreviewRegistry>,
@@ -315,7 +316,7 @@ pub fn update_previews(
     mut sync: ResMut<crate::view::SyncRequest>,
     tree: Res<crate::model::tree::FileTree>,
     nav: Res<crate::view::Nav>,
-    mut last: Local<Option<(usize, usize)>>,
+    mut last: Local<Option<(usize, u64)>>,
 ) {
     if registry.images.receive(&mut assets) {
         sync.request_redraw();
@@ -324,7 +325,10 @@ pub fn update_previews(
         .last()
         .map(|l| l.node)
         .unwrap_or(crate::model::tree::FileTree::ROOT);
-    let sig = (folder, tree.nodes[folder].children.len());
+    if last.is_some_and(|(f, _)| f == folder) && !tree.is_changed() {
+        return;
+    }
+    let sig = (folder, files_signature(&tree, folder));
     if *last == Some(sig) {
         return;
     }
@@ -346,6 +350,19 @@ pub fn update_previews(
         })
         .collect();
     registry.images.request(picked);
+}
+
+/// フォルダの直接の子のファイル（ノード・名前・大きさ）をまとめた値。読みを頼み直すかを決める。
+fn files_signature(tree: &crate::model::tree::FileTree, folder: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for &c in &tree.nodes[folder].children {
+        let node = &tree.nodes[c];
+        if !node.is_dir {
+            (c, &node.name, node.size).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 /// 中身が手元に無い（iCloud などのクラウドにだけある）ファイルか。
@@ -439,6 +456,44 @@ impl PreviewImages {
     /// 描くときに引く。読めていれば、絵と縦横。
     pub fn get(&self, path: &Path) -> Option<Preview> {
         self.images.get(self.current.get(path)?).cloned()
+    }
+
+    /// `from` が `to` へ動いた（名前の変更・移動・取り消し）。読めた絵の鍵を付け替えて、読み直さずに
+    /// 使う（中身は同じなので、大きさと更新日時は変わらない）。フォルダなら下のファイルも付け替える。
+    /// 読み直し前の古い名前でも、読み直し後の新しい名前でも、同じ絵を引けるようにする。
+    pub fn moved(&mut self, from: &Path, to: &Path) {
+        let rekey = |key: &PreviewKey| {
+            let suffix = key.path.strip_prefix(from).ok()?;
+            let path = if suffix.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(suffix)
+            };
+            Some(PreviewKey {
+                path,
+                ..key.clone()
+            })
+        };
+        // 読み中のもの（まだ絵が無い）は付け替えない。新しい鍵で読み直す。
+        let moved: Vec<(PreviewKey, PreviewKey)> = self
+            .images
+            .keys()
+            .filter_map(|old| Some((old.clone(), rekey(old)?)))
+            .collect();
+        for (old, new) in moved {
+            if let Some(preview) = self.images.remove(&old) {
+                self.images.insert(new.clone(), preview);
+            }
+            self.requested.remove(&old);
+            self.requested.insert(new.clone());
+            if let Some(slot) = self.order.iter_mut().find(|k| **k == old) {
+                *slot = new.clone();
+            }
+            for key in self.current.values_mut().filter(|k| **k == old) {
+                *key = new.clone();
+            }
+            self.current.insert(new.path.clone(), new);
+        }
     }
 
     /// 開いたフォルダの直接の子を渡す。鍵を作り直し、まだ無いものは読みを頼む。
@@ -652,6 +707,72 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn moved_previews_are_reused_without_reloading() {
+        let tmp = std::env::temp_dir().join(format!("lisa-preview-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("dir")).unwrap();
+        let a = tmp.join("a.txt");
+        let inner = tmp.join("dir/inner.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        std::fs::write(&inner, b"world").unwrap();
+        let cartridge: Arc<dyn Cartridge> = Arc::new(Dummy {
+            id: "text",
+            exts: &["txt"],
+            priority: 0,
+        });
+        let mut images = PreviewImages::default();
+        images.request(vec![
+            (a.clone(), cartridge.clone()),
+            (inner.clone(), cartridge.clone()),
+        ]);
+        // 読み終えたことにする（裏の読みを待たない）。
+        for key in images.current.values() {
+            let lines = Arc::new(vec![key.path.display().to_string()]);
+            images.images.insert(key.clone(), Preview::Text(lines));
+        }
+        let requested = images.requested.len();
+
+        let z = tmp.join("z.txt");
+        std::fs::rename(&a, &z).unwrap();
+        images.moved(&a, &z);
+        assert!(images.get(&a).is_some(), "読み直す前の古い名前でも引ける");
+        assert!(images.get(&z).is_some());
+        images.request(vec![(z.clone(), cartridge.clone())]);
+        assert!(images.get(&z).is_some(), "読み直したあとも同じ絵");
+        assert_eq!(images.requested.len(), requested, "読みを頼み直さない");
+
+        // フォルダごと動かしたら、下のファイルも付け替わる。取り消しで戻しても同じ。
+        let moved = tmp.join("moved");
+        std::fs::rename(tmp.join("dir"), &moved).unwrap();
+        images.moved(&tmp.join("dir"), &moved);
+        images.request(vec![(moved.join("inner.txt"), cartridge.clone())]);
+        assert!(images.get(&moved.join("inner.txt")).is_some());
+        std::fs::rename(&moved, tmp.join("dir")).unwrap();
+        images.moved(&moved, &tmp.join("dir"));
+        images.request(vec![(inner.clone(), cartridge)]);
+        assert!(images.get(&inner).is_some());
+        assert_eq!(images.requested.len(), requested);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn renaming_a_file_changes_the_signature_with_the_same_child_count() {
+        let mut tree = crate::model::tree::FileTree::wide(2, 3);
+        let folder = tree.nodes[crate::model::tree::FileTree::ROOT].children[0];
+        let file = *tree.nodes[folder]
+            .children
+            .iter()
+            .find(|&&c| !tree.nodes[c].is_dir)
+            .expect("ファイルがある");
+        let before = files_signature(&tree, folder);
+        assert_eq!(files_signature(&tree, folder), before);
+        let old = std::mem::replace(&mut tree.nodes[file].name, "renamed.txt".into());
+        assert_ne!(files_signature(&tree, folder), before);
+        tree.nodes[file].name = old;
+        assert_eq!(files_signature(&tree, folder), before, "Undo で元に戻る");
     }
 
     #[test]

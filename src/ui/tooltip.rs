@@ -113,7 +113,7 @@ pub(crate) enum TotalOutcome {
 }
 
 impl TotalOutcome {
-    fn into_display(self) -> FolderTotalDisplay {
+    pub(super) fn into_display(self) -> FolderTotalDisplay {
         match self {
             Self::Totals(t) => FolderTotalDisplay::Totals(t),
             Self::Unavailable => FolderTotalDisplay::LoadedOnly,
@@ -204,10 +204,10 @@ fn is_total_expired(computed_at: Instant, now: Instant, ttl: Duration) -> bool {
     now.saturating_duration_since(computed_at) >= ttl
 }
 
-struct TotalMessage {
+pub(super) struct TotalMessage {
     node: NodeId,
     generation: u64,
-    outcome: TotalOutcome,
+    pub(super) outcome: TotalOutcome,
 }
 
 /// フォルダの合計を裏のスレッドで数え、結果とキャッシュを持つリソース。
@@ -286,7 +286,7 @@ struct TotalContext<'w, 's> {
 
 /// 裏のスレッドで合計を数える対象。
 #[derive(Debug, Clone, PartialEq)]
-enum TotalTarget {
+pub(super) enum TotalTarget {
     LocalPath {
         db_path: PathBuf,
         path: PathBuf,
@@ -310,7 +310,7 @@ enum TotalTarget {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum TotalPlan {
+pub(super) enum TotalPlan {
     /// ファイルやダミーの木（非同期の合計は不要。従来の `Node.size` を出す）。
     NotNeeded,
     /// DB に残さないドライブや未ペアリングなど、問い合わせずに「（読んだ分だけ）」にする。
@@ -319,7 +319,7 @@ enum TotalPlan {
     Fetch(TotalTarget),
 }
 
-fn resolve_total_target(
+pub(super) fn resolve_total_target(
     tree: &FileTree,
     store: Option<&Store>,
     lan: Option<&LanState>,
@@ -497,7 +497,7 @@ fn compute_total(target: TotalTarget) -> TotalOutcome {
     }
 }
 
-fn spawn_total_worker(
+pub(super) fn spawn_total_worker(
     node: NodeId,
     generation: u64,
     target: TotalTarget,
@@ -524,6 +524,7 @@ fn spawn_total_worker(
 #[derive(SystemParam)]
 pub(crate) struct PointerBlocked<'w, 's> {
     popup: Res<'w, Popup>,
+    dialog: Option<Res<'w, super::dialog::DialogState>>,
     banners: Query<'w, 's, &'static bevy::picking::hover::Hovered, With<crate::lan::PairBanner>>,
     gesture: Res<'w, crate::input::gesture::Gesture>,
     animating: Option<Res<'w, Animating>>,
@@ -543,6 +544,7 @@ impl PointerBlocked<'_, '_> {
             .get(&PointerId::Mouse)
             .is_some_and(|hits| hits.keys().any(|e| self.ui_nodes.contains(*e)));
         ui_has_pointer(window, &self.popup, over_banner)
+            || self.dialog.as_ref().is_some_and(|dialog| dialog.busy())
             || over_ui
             || self.gesture.active()
             || self.animating.is_some()
@@ -783,22 +785,63 @@ pub(crate) fn describe(
     id: NodeId,
     folder_total: Option<FolderTotalDisplay>,
 ) -> Vec<Row> {
+    describe_rows(tree, store, id, folder_total, false)
+}
+
+pub(super) fn describe_details(
+    tree: &FileTree,
+    store: Option<&Store>,
+    id: NodeId,
+    folder_total: Option<FolderTotalDisplay>,
+) -> Vec<Row> {
+    describe_rows(tree, store, id, folder_total, true)
+}
+
+fn describe_rows(
+    tree: &FileTree,
+    store: Option<&Store>,
+    id: NodeId,
+    folder_total: Option<FolderTotalDisplay>,
+    full: bool,
+) -> Vec<Row> {
+    let name_or_path = |value: &str, max| {
+        if full { value.to_owned() } else { shorten_middle(value, max) }
+    };
+    let date = |ms| {
+        let minute = format_local(ms);
+        if full {
+            let second = (ms.div_euclid(1000) + local_offset_secs()).rem_euclid(60);
+            format!("{minute}:{second:02}")
+        } else {
+            minute
+        }
+    };
     let node = &tree.nodes[id];
-    let mut rows = vec![row("", shorten_middle(&node.name, MAX_NAME_CHARS))];
     let local = node.remote.is_none();
-    let meta = local
-        .then(|| local_path(tree, id))
-        .flatten()
-        .and_then(|p| std::fs::symlink_metadata(&p).ok().map(|m| (p, m)));
+    let path = if full { local_item_path(tree, store, id) } else { local_path(tree, id) };
+    let name = match path.as_deref().and_then(Path::file_name) {
+        Some(name) if full && node.depth > 2 => name.to_string_lossy(),
+        _ => node.name.as_str().into(),
+    };
+    let mut rows = vec![row(if full { "名前" } else { "" }, name_or_path(&name, MAX_NAME_CHARS))];
+    let meta = path.as_deref().and_then(|p| std::fs::symlink_metadata(p).ok().map(|m| (p, m)));
 
     let kind = match node.depth {
         1 => "端末".to_string(),
         2 => "ドライブ".to_string(),
         _ => {
             if let Some((_, m)) = &meta {
-                kind_label(m.file_type().is_symlink(), node.is_dir, false)
+                if full && m.file_type().is_symlink() {
+                    "シンボリックリンク".into()
+                } else {
+                    kind_label(m.file_type().is_symlink(), node.is_dir, false)
+                }
             } else if let Some(r) = &node.remote_meta {
-                kind_label(r.kind == "symlink", node.is_dir, r.cloud_only)
+                if full && r.kind == "symlink" {
+                    "シンボリックリンク".into()
+                } else {
+                    kind_label(r.kind == "symlink", node.is_dir, r.cloud_only)
+                }
             } else {
                 kind_label(false, node.is_dir, false)
             }
@@ -806,63 +849,55 @@ pub(crate) fn describe(
     };
     rows.push(row("種類", kind));
     if !node.is_dir {
-        rows.push(row("大きさ", format_size(node.size)));
+        let bytes = if full {
+            meta.as_ref().map_or(node.size, |(_, m)| m.len())
+        } else {
+            node.size
+        };
+        rows.push(row("大きさ", format_size(bytes)));
     } else {
-        match folder_total {
-            Some(FolderTotalDisplay::Computing) => {
-                rows.push(row("大きさ", "計算中…"));
-            }
-            Some(FolderTotalDisplay::Totals(t)) => {
-                rows.push(row("大きさ", format_size(t.bytes)));
-                rows.push(row("中身", format_contents(t)));
-            }
-            Some(FolderTotalDisplay::LoadedOnly) => {
-                rows.push(row("大きさ", format_loaded_only_size(node.size)));
-            }
-            None => {
-                if node.size > 0 {
-                    rows.push(row("大きさ", format_size(node.size)));
-                }
-            }
-        }
+        rows.extend(folder_rows(folder_total, node.size));
     }
 
     if let Some((path, m)) = &meta {
         if node.depth > 2 {
             if let Some(t) = m.created().ok().and_then(system_ms) {
-                rows.push(row("作成", format_local(t)));
+                rows.push(row(if full { "作成日時" } else { "作成" }, date(t)));
             }
             if let Some(t) = m.modified().ok().and_then(system_ms) {
-                rows.push(row("更新", format_local(t)));
+                rows.push(row(if full { "更新日時" } else { "更新" }, date(t)));
             }
             if let Some(hash) = store
                 .and_then(|s| crate::scan::stored_item(s, path))
                 .and_then(|i| i.hash)
             {
-                rows.push(row("ハッシュ", short_hash(&hash)));
+                rows.push(row("ハッシュ", if full { hash } else { short_hash(&hash) }));
             }
         }
         rows.push(row(
             "場所",
-            shorten_middle(&path.display().to_string(), MAX_PATH_CHARS),
+            name_or_path(&path.display().to_string(), MAX_PATH_CHARS),
         ));
     } else if let Some(r) = &node.remote_meta {
         if node.depth > 2 {
             if let Some(t) = r.mtime {
-                rows.push(row("更新", format_local(t)));
+                rows.push(row(if full { "更新日時" } else { "更新" }, date(t)));
             }
             if let Some(hash) = &r.hash {
-                rows.push(row("ハッシュ", short_hash(hash)));
+                rows.push(row("ハッシュ", if full { hash.clone() } else { short_hash(hash) }));
             }
         }
         if let Some(path) = remote_path_text(tree, id) {
-            rows.push(row("場所", shorten_middle(&path, MAX_PATH_CHARS)));
+            rows.push(row("場所", name_or_path(&path, MAX_PATH_CHARS)));
         }
     } else if !local && let Some(path) = remote_path_text(tree, id) {
-        rows.push(row("場所", shorten_middle(&path, MAX_PATH_CHARS)));
+        rows.push(row("場所", name_or_path(&path, MAX_PATH_CHARS)));
+    } else if full && let Some(path) = path {
+        rows.push(row("場所", path.display().to_string()));
     }
 
     let state = match node.state {
+        LoadState::Loaded if full => Some("読み込み済み"),
         LoadState::Loaded => None,
         LoadState::Unloaded => Some("まだ読んでいない"),
         LoadState::Loading => Some("読み込み中"),
@@ -876,6 +911,32 @@ pub(crate) fn describe(
         rows.push(row("エラー", shorten_middle(error, MAX_ERROR_CHARS)));
     }
     rows
+}
+
+pub(super) fn folder_rows(total: Option<FolderTotalDisplay>, loaded_bytes: u64) -> Vec<Row> {
+    match total {
+        Some(FolderTotalDisplay::Computing) => vec![row("大きさ", "計算中…")],
+        Some(FolderTotalDisplay::Totals(t)) => vec![
+            row("大きさ", format_size(t.bytes)),
+            row("中身", format_contents(t)),
+        ],
+        Some(FolderTotalDisplay::LoadedOnly) => {
+            vec![row("大きさ", format_loaded_only_size(loaded_bytes))]
+        }
+        None if loaded_bytes > 0 => vec![row("大きさ", format_size(loaded_bytes))],
+        None => Vec::new(),
+    }
+}
+
+/// ディスク操作には短縮・正規化された表示名ではなく、DB に記録した実パスを使う。
+pub(crate) fn local_item_path(tree: &FileTree, store: Option<&Store>, id: NodeId) -> Option<PathBuf> {
+    let node = &tree.nodes[id];
+    if node.remote.is_some() {
+        return None;
+    }
+    node.path.clone()
+        .or_else(|| store?.stored_path(node.entry?))
+        .or_else(|| local_path(tree, id))
 }
 
 fn kind_label(symlink: bool, is_dir: bool, cloud_only: bool) -> String {

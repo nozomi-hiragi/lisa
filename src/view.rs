@@ -160,6 +160,8 @@ fn track_window_occlusion(
 pub enum Location {
     /// 手元の DB にあるドライブ以下: ドライブ先頭からの `entry.id` 列。
     Local(Vec<i64>),
+    /// 改名後、再走査で新しい entry.id が揃うまで追うディスク上の実パス。
+    Renamed(std::path::PathBuf),
     /// それ以外（Root、端末、ダミーの木、DB 無しドライブ、LAN の相手）: Root からの名前列。
     Named(Vec<String>),
 }
@@ -635,11 +637,13 @@ fn sync_view(
                 &mut core.tree,
                 core.store.as_deref(),
                 core.scanner.as_deref_mut(),
-                &core.location,
+                &mut core.location,
             );
             core.nav.stack = resolved.into_iter().map(|node| Level { node }).collect();
             let top_node = core.nav.top().node;
-            *core.location = Location::from_tree(&core.tree, top_node);
+            if !matches!(*core.location, Location::Renamed(_)) {
+                *core.location = Location::from_tree(&core.tree, top_node);
+            }
 
             let path = scene_path(&core.nav, &core.tree).to_vec();
             let folder = path[path.len() - 1].node;
@@ -1046,6 +1050,7 @@ fn navigate(
     mut gesture: ResMut<crate::input::gesture::Gesture>,
     context_menu: Res<crate::ui::context_menu::ContextMenu>,
     request: Option<Res<crate::ui::context_menu::NavRequest>>,
+    dialog: Option<Res<crate::ui::dialog::DialogState>>,
 ) {
     use crate::ui::context_menu::NavRequest;
     // 右クリックのメニューで選んだ「開く」「親へ戻る」。
@@ -1055,7 +1060,8 @@ fn navigate(
     }
     // 切り替えの途中や、メニューやジェスチャーを操作しているときは受け付けない。
     let over_banner = banners.iter().any(|h| h.get());
-    if animating.is_some()
+    if dialog.as_ref().is_some_and(|dialog| dialog.busy())
+        || animating.is_some()
         || !fades.is_empty()
         || gesture.active()
         || (request.is_none()

@@ -124,7 +124,7 @@ impl Plugin for ScanPlugin {
                 (
                     apply_settings,
                     request_visible,
-                    receive,
+                    receive.after(crate::organize::receive_events),
                     load_visible,
                     resolve_jump,
                 )
@@ -204,6 +204,20 @@ impl Store {
     /// 起動時に DB を開けたか（DB を使わずに動かしているときは false）。
     pub(crate) fn has_db(&self) -> bool {
         self.reader.is_some()
+    }
+
+    /// DB にある表示名からは戻せない実ファイル名を含むパス。
+    pub(crate) fn stored_path(&self, entry: i64) -> Option<PathBuf> {
+        let db = self.reader.as_ref()?.lock().ok()?;
+        let located = lisa_core::query::path_of(&db, entry).ok()??;
+        located.path.is_absolute().then_some(located.path)
+    }
+
+    fn entry_chain_at(&self, path: &Path) -> Option<Vec<i64>> {
+        let db = self.reader.as_ref()?.lock().ok()?;
+        lisa_core::query::locate(&db, path)
+            .ok()?
+            .map(|target| target.chain)
     }
 
     /// ノード `id` があるドライブの DB ID。DB に残さないドライブなら None。
@@ -655,6 +669,7 @@ fn receive(
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
     nav: Res<crate::view::Nav>,
+    (location, store): (Res<crate::view::Location>, Res<Store>),
     layouts: Res<Layouts>,
     mut sync: ResMut<crate::view::SyncRequest>,
     animating: Option<Res<crate::view::Animating>>,
@@ -682,6 +697,12 @@ fn receive(
             Message::Committed => {
                 scanner.recent.clear();
                 scanner.hashed.clear();
+                if let crate::view::Location::Renamed(path) = &*location
+                    && (store.entry_chain_at(path).is_some()
+                        || std::fs::symlink_metadata(path).is_err())
+                {
+                    structure_reset = true;
+                }
             }
             Message::Hashed { path } => {
                 scanner.stale.remove(&path);
@@ -880,8 +901,35 @@ pub(crate) fn resolve_location(
     tree: &mut FileTree,
     store: Option<&Store>,
     mut scanner: Option<&mut Scanner>,
-    location: &crate::view::Location,
+    location: &mut crate::view::Location,
 ) -> Vec<NodeId> {
+    if let crate::view::Location::Renamed(path) = location {
+        let chain = store.and_then(|store| store.entry_chain_at(path));
+        if let Some(chain) = chain {
+            *location = crate::view::Location::Local(chain);
+        } else {
+            // 親だけ先に読み終える場合がある。開ける地点まで表示し、次の確定後に再試行する。
+            let fallback = store.and_then(|store| {
+                path.ancestors()
+                    .skip(1)
+                    .find_map(|p| store.entry_chain_at(p))
+            });
+            if std::fs::symlink_metadata(path).is_err() {
+                *location = crate::view::Location::root();
+            }
+            return fallback.map_or_else(
+                || vec![FileTree::ROOT],
+                |chain| {
+                    resolve_location(
+                        tree,
+                        store,
+                        scanner,
+                        &mut crate::view::Location::Local(chain),
+                    )
+                },
+            );
+        }
+    }
     match location {
         crate::view::Location::Local(chain) => {
             let Some(&first_entry) = chain.first() else {
@@ -931,6 +979,7 @@ pub(crate) fn resolve_location(
             tree.path_from_root(node)
                 .unwrap_or_else(|| vec![FileTree::ROOT])
         }
+        crate::view::Location::Renamed(_) => unreachable!("上で実パスを解決済み"),
         crate::view::Location::Named(names) => {
             let mut node = FileTree::ROOT;
             let mut reader = store.and_then(|s| s.reader.as_ref()?.lock().ok());
@@ -979,6 +1028,61 @@ pub(crate) fn stored_item(store: &Store, path: &Path) -> Option<lisa_core::query
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_location_waits_for_descendant_and_resolves_raw_name() {
+        use crate::view::Location;
+
+        let mount =
+            std::env::temp_dir().join(format!("lisa-rename-location-{}", std::process::id()));
+        let folder = mount.join("Numéro");
+        let target = folder.join("child");
+        std::fs::create_dir_all(&target).unwrap();
+        let volume = lisa_core::volumes::Volume {
+            id: Some("test:rename".into()),
+            mount_path: mount.clone(),
+            ..root_volume()
+        };
+        let mut db = Db::open_in_memory().unwrap();
+        let device = db.this_device("端末", "host", "macos").unwrap();
+        db.upsert_drive(&device, &volume).unwrap();
+        let mut tree = FileTree::this_device("端末", &[volume]);
+        let drive = tree.nodes[tree.nodes[FileTree::ROOT].children[0]].children[0];
+        let drive_id = "test:rename";
+        let save = |db: &mut Db, path: &Path| {
+            let result = listing::read_dir(path).map_err(|e| e.to_string());
+            db.save_listing(drive_id, &mount, path, &result).unwrap();
+        };
+        save(&mut db, &mount);
+        tree.set_drive_row(drive, &db.drive_root(drive_id).unwrap().unwrap());
+
+        let store = Store {
+            reader: Some(Mutex::new(db)),
+            roots: HashMap::from([(drive, (Some(drive_id.into()), mount.clone()))]),
+        };
+        let (_sender, receiver) = channel();
+        let mut scanner = Scanner {
+            results: Mutex::new(receiver),
+            pending: HashMap::new(),
+            recent: HashMap::new(),
+            folders: HashMap::new(),
+            hashed: HashSet::new(),
+            stale: HashSet::new(),
+        };
+        let mut location = Location::Renamed(target.clone());
+        let resolved = resolve_location(&mut tree, Some(&store), Some(&mut scanner), &mut location);
+        assert_eq!(tree.nodes[*resolved.last().unwrap()].name, "Numéro");
+        assert_eq!(location, Location::Renamed(target.clone()));
+
+        save(&mut store.reader.as_ref().unwrap().lock().unwrap(), &folder);
+        let resolved = resolve_location(&mut tree, Some(&store), Some(&mut scanner), &mut location);
+        assert_eq!(
+            tree.nodes[*resolved.last().unwrap()].path.as_ref(),
+            Some(&target)
+        );
+        assert!(matches!(location, Location::Local(_)));
+        std::fs::remove_dir_all(mount).unwrap();
+    }
 
     #[test]
     fn noisy_dirs_match_ignoring_case_and_separators() {

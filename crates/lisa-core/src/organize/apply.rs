@@ -363,7 +363,9 @@ fn run_one_op(
                 .dst
                 .as_deref()
                 .ok_or_else(|| "行き先がありません".to_string())?;
-            if fs::symlink_metadata(dst).is_ok() {
+            if super::move_destination_exists(&op.src, dst)
+                .map_err(|e| format!("行き先を確かめられません: {e}"))?
+            {
                 return Ok(OpExecOutcome::Skipped(
                     "行き先にすでにファイルやフォルダがあります".into(),
                 ));
@@ -371,6 +373,15 @@ fn run_one_op(
             let dst_parent = dst
                 .parent()
                 .ok_or_else(|| "行き先の親フォルダがありません".to_string())?;
+            if op.src.parent() == Some(dst_parent) {
+                return match rename_without_replace(&op.src, dst) {
+                    Ok(()) => Ok(OpExecOutcome::Done { exact_dst: None }),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(
+                        OpExecOutcome::Skipped("行き先にすでにファイルやフォルダがあります".into()),
+                    ),
+                    Err(e) => Err(format!("名前を変更できませんでした: {e}")),
+                };
+            }
             if quarantine::same_volume(&op.src, dst_parent) {
                 match fs::rename(&op.src, dst) {
                     Ok(()) => return Ok(OpExecOutcome::Done { exact_dst: None }),
@@ -443,7 +454,23 @@ fn recover_running_ops(
                     (true, true) => {
                         // 別ボリュームのコピー後に元を隔離する直前で落ちた可能性がある。
                         let dst = dst.expect("dst_exists is true");
-                        if entries_match_content(&op.src, dst) {
+                        if op.src.parent() == dst.parent() {
+                            // 同じディレクトリ内ではコピーしない。大小無視で両方見えるときは実名で再開点を判定する。
+                            let (state, reason, at) =
+                                if super::is_name_alias(dst, &op.src).unwrap_or(false) {
+                                    (OpState::Done, None, Some(now))
+                                } else if super::is_name_alias(&op.src, dst).unwrap_or(false) {
+                                    (OpState::Pending, None, None)
+                                } else {
+                                    (
+                                        OpState::Failed,
+                                        Some("中断後に元と行き先の両方があります"),
+                                        Some(now),
+                                    )
+                                };
+                            plan::set_op_state(db, plan_id, op.seq, state, None, reason, at)
+                                .map_err(|e| e.to_string())?;
+                        } else if entries_match_content(&op.src, dst) {
                             let mount = drive_mount_of(drives, &op);
                             match quarantine::move_to_quarantine(
                                 plan_id,
@@ -684,7 +711,9 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<(), String> {
             };
             let dst_meta = fs::symlink_metadata(dst)
                 .map_err(|_| "移動先にファイルやフォルダがありません".to_string())?;
-            if fs::symlink_metadata(&op.src).is_ok() {
+            if super::move_destination_exists(dst, &op.src)
+                .map_err(|e| format!("戻す先を確かめられません: {e}"))?
+            {
                 return Err("戻す先にすでにファイルやフォルダがあります".into());
             }
             verify_unchanged_for_undo(op, &dst_meta)?;
@@ -693,6 +722,10 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<(), String> {
             };
             if !parent.is_dir() {
                 return Err("戻す先の親フォルダがありません".into());
+            }
+            if dst.parent() == Some(parent) {
+                return rename_without_replace(dst, &op.src)
+                    .map_err(|e| format!("元の名前に戻せませんでした: {e}"));
             }
             if quarantine::same_volume(dst, parent) {
                 match fs::rename(dst, &op.src) {
@@ -820,6 +853,92 @@ fn shallowest_missing_dir(path: &Path) -> Option<PathBuf> {
         cur = p.parent();
     }
     missing
+}
+
+// 事前確認のあとに別プロセスが同名項目を作っても、上書きせずに失敗する。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::ffi::{CString, c_char, c_int, c_uint};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn renamex_np(src: *const c_char, dst: *const c_char, flags: c_uint) -> c_int;
+    }
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn renameat2(
+            old_dir: c_int,
+            src: *const c_char,
+            new_dir: c_int,
+            dst: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
+    }
+
+    let src = CString::new(src.as_os_str().as_bytes())?;
+    let dst = CString::new(dst.as_os_str().as_bytes())?;
+    // SAFETY: 両ポインターは呼び出し中有効な NUL 終端文字列を指す。
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        const RENAME_EXCL: c_uint = 4;
+        renamex_np(src.as_ptr(), dst.as_ptr(), RENAME_EXCL)
+    };
+    // SAFETY: 両ポインターは呼び出し中有効な NUL 終端文字列を指す。
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        const AT_FDCWD: c_int = -100;
+        const RENAME_NOREPLACE: c_uint = 1;
+        renameat2(
+            AT_FDCWD,
+            src.as_ptr(),
+            AT_FDCWD,
+            dst.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+
+    if [src, dst]
+        .iter()
+        .any(|path| path.as_os_str().as_encoded_bytes().contains(&0))
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain([0])
+            .collect::<Vec<_>>()
+    };
+    // UNC と長いパスを扱える形にし、同じ実ディレクトリの下で変更する。
+    let parent = src
+        .parent()
+        .ok_or(io::ErrorKind::InvalidInput)?
+        .canonicalize()?;
+    let src = wide(&parent.join(src.file_name().ok_or(io::ErrorKind::InvalidInput)?));
+    let dst = wide(&parent.join(dst.file_name().ok_or(io::ErrorKind::InvalidInput)?));
+    // SAFETY: 両ポインターは呼び出し中有効な NUL 終端ワイド文字列を指す。
+    if unsafe { MoveFileW(src.as_ptr(), dst.as_ptr()) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn rename_without_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 fn is_cross_device_error(err: &io::Error) -> bool {

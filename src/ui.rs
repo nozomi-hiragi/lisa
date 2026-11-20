@@ -2,6 +2,7 @@
 //! ツールチップ、右クリックのメニュー）。
 pub mod catalog;
 pub mod context_menu;
+pub(crate) mod dialog;
 pub mod dups;
 pub mod menu;
 pub mod organize;

@@ -73,6 +73,120 @@ impl Context {
     }
 }
 
+/// 親フォルダを変えずに名前だけを変更する行き先を求める。
+pub fn rename_destination(from: &std::path::Path, new_name: &str) -> Result<PathBuf, String> {
+    use std::path::{Component, Path};
+
+    if new_name.is_empty() {
+        return Err("新しい名前を入力してください".into());
+    }
+    let mut components = Path::new(new_name).components();
+    if new_name.contains(['/', '\\', '\0'])
+        || !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err("名前に /、\\、.、.. などは使えません".into());
+    }
+    #[cfg(windows)]
+    if new_name.contains([':', '<', '>', '"', '|', '?', '*'])
+        || new_name.ends_with([' ', '.'])
+        || new_name.chars().any(|c| c < ' ')
+    {
+        return Err("Windows の名前に使えない文字が含まれています".into());
+    }
+    let parent = from
+        .parent()
+        .filter(|p| from.is_absolute() && p.is_absolute())
+        .ok_or("対象の絶対パスと親フォルダが必要です")?;
+    Ok(parent.join(new_name))
+}
+
+/// 行き先が別のディレクトリエントリで占有されているか。
+pub fn move_destination_exists(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(to) {
+        Ok(_) => Ok(!is_name_alias(from, to)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// 大小無視などで別の名前が同じ項目を指すか。ハードリンクは別項目として扱う。
+pub(crate) fn is_name_alias(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<bool> {
+    let (Some(parent), Some(from_name), Some(to_name)) =
+        (from.parent(), from.file_name(), to.file_name())
+    else {
+        return Ok(false);
+    };
+    // 同じ inode を持つ別名のハードリンクが大小無視で引ける場合も拒否する。
+    if from_name == to_name
+        || Some(parent) != to.parent()
+        || from_name.to_str().is_none()
+        || to_name.to_str().is_none()
+        || crate::name::nfc(from_name).to_lowercase() != crate::name::nfc(to_name).to_lowercase()
+        || !same_file_identity(from, to)
+    {
+        return Ok(false);
+    }
+    let mut found_from = false;
+    for entry in std::fs::read_dir(parent)? {
+        let name = entry?.file_name();
+        if name == to_name {
+            return Ok(false);
+        }
+        found_from |= name == from_name;
+    }
+    Ok(found_from)
+}
+
+#[cfg(unix)]
+fn same_file_identity(from: &std::path::Path, to: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(from), Ok(to)) = (
+        std::fs::symlink_metadata(from),
+        std::fs::symlink_metadata(to),
+    ) else {
+        return false;
+    };
+    (from.dev(), from.ino()) == (to.dev(), to.ino()) && from.ino() != 0
+}
+
+#[cfg(windows)]
+fn same_file_identity(from: &std::path::Path, to: &std::path::Path) -> bool {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FileIdInfo,
+        GetFileInformationByHandleEx,
+    };
+
+    let identity = |path| {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .ok()?;
+        // SAFETY: 開いたハンドルと FILE_ID_INFO 用の書き込み先は呼び出し中有効。
+        unsafe {
+            let mut info: FILE_ID_INFO = std::mem::zeroed();
+            let ok = GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            );
+            (ok != 0).then_some((info.VolumeSerialNumber, info.FileId.Identifier))
+        }
+    };
+    identity(from).is_some_and(|id| Some(id) == identity(to))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_from: &std::path::Path, _to: &std::path::Path) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +292,139 @@ mod tests {
                 )
                 .unwrap();
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn case_only_rename_and_undo_on_case_insensitive_volume() {
+        let mut h = Harness::new("rename-case");
+        let lower = h.drive.join("a.txt");
+        let upper = h.drive.join("A.txt");
+        fs::write(&lower, b"original").unwrap();
+        if !upper.exists() {
+            // 大小を区別するボリュームでは通常の Move が対象。
+            return;
+        }
+        let assert_names = |expected: &str| {
+            let names: Vec<_> = fs::read_dir(lower.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [std::ffi::OsString::from(expected)]);
+        };
+        for crashing in [false, true] {
+            h.scan(true);
+            let id = create_plan(
+                &mut h.db,
+                &h.ctx,
+                "test",
+                None,
+                &[OpInput::Move {
+                    from: lower.clone(),
+                    to: upper.clone(),
+                }],
+                false,
+            )
+            .unwrap()
+            .id
+            .expect("大小だけの改名を許可する");
+            approve_plan(&mut h.db, id, false).unwrap();
+            if crashing {
+                // ファイル名を書き換えた直後に落ちても、同じファイルを隔離しない。
+                fs::rename(&lower, &upper).unwrap();
+                plan::set_plan_state(&mut h.db, id, PlanState::Running, None).unwrap();
+                plan::set_op_state(&mut h.db, id, 0, OpState::Running, None, None, None).unwrap();
+                let report = recover_running_plans(&mut h.db, &h.ctx).unwrap();
+                assert_eq!(report[0].done, 1);
+            } else {
+                let report = execute_plan(&mut h.db, &h.ctx, id).unwrap();
+                assert_eq!(report.done, 1, "{report:?}");
+            }
+            assert_names("A.txt");
+            assert_eq!(fs::read(&upper).unwrap(), b"original");
+            h.scan(true);
+            let report = undo_plan(&mut h.db, &h.ctx, id).unwrap();
+            assert_eq!(report.undone, 1, "{report:?}");
+            assert_names("a.txt");
+            assert_eq!(fs::read(&lower).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn rename_succeeds_while_another_connection_is_hashing() {
+        let mut h = Harness::new("rename-while-hashing");
+        fs::create_dir_all(h.drive.join("sub")).unwrap();
+        fs::write(h.drive.join("sub/a.txt"), b"rename me").unwrap();
+        fs::write(h.drive.join("slow.bin"), b"read slowly").unwrap();
+        h.scan(false);
+        // 待ちが長いと、鍵を握られていたときに busy_timeout まで待ってしまうので短くする。
+        h.db.conn()
+            .execute_batch("PRAGMA busy_timeout = 300")
+            .unwrap();
+
+        // 別のつなぎでハッシュし、sub を書いたあと slow.bin を読んでいる途中で止めておく。
+        let (reading_tx, reading_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        let db_path = h.data_dir.join("lisa.db");
+        let drive = h.drive.clone();
+        let hasher = std::thread::spawn(move || {
+            let mut db = Db::open(&db_path).unwrap();
+            let step = |bytes: u64| {
+                if bytes > 0 {
+                    let _ = reading_tx.send(());
+                    let _ = resume_rx.lock().unwrap().recv();
+                }
+                true
+            };
+            let pace = Pace {
+                background: true,
+                step: &step,
+            };
+            hash::hash_drive(&mut db, "test:vol1", &drive, 1, &mut |_| {}, &pace)
+        });
+        // sub/a.txt を読んだところ（まだ止めない）。
+        reading_rx.recv().unwrap();
+        resume_tx.send(()).unwrap();
+        // slow.bin を読んでいるところで止まっている。
+        reading_rx.recv().unwrap();
+
+        let from = h.drive.join("sub/a.txt");
+        let to = rename_destination(&from, "b.txt").unwrap();
+        let result = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "test",
+            None,
+            &[OpInput::Move {
+                from,
+                to: to.clone(),
+            }],
+            false,
+        )
+        .and_then(|res| res.id.ok_or_else(|| format!("{:?}", res.checks)))
+        .and_then(|id| approve_plan(&mut h.db, id, false).map(|_| id))
+        .and_then(|id| execute_plan(&mut h.db, &h.ctx, id));
+        resume_tx.send(()).unwrap();
+        hasher.join().unwrap().unwrap();
+        let report = result.expect("ハッシュ中でも名前を変更できる");
+        assert_eq!(report.done, 1, "{report:?}");
+        assert_eq!(fs::read(&to).unwrap(), b"rename me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_are_distinct_destinations() {
+        let h = Harness::new("rename-hard-link");
+        let from = h.drive.join("from.txt");
+        let to = h.drive.join("to.txt");
+        fs::write(&from, b"original").unwrap();
+        fs::hard_link(&from, &to).unwrap();
+        assert!(move_destination_exists(&from, &to).unwrap());
+        let alias = h.drive.join("TO.txt");
+        if alias.exists() {
+            assert!(move_destination_exists(&from, &alias).unwrap());
         }
     }
 

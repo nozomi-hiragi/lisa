@@ -174,7 +174,6 @@ fn walk(
         pace,
         last_commit: Instant::now(),
     };
-    walker.db.begin()?;
     let result = walker.visit(folder, path);
     walker.db.commit()?;
     (walker.on)(Event::Committed);
@@ -227,7 +226,11 @@ impl Walker<'_> {
             .collect();
         if !files.is_empty() {
             (self.on)(Event::Folder(&path));
+            // 読んでいる間（速さの上限で待つ間も）、書き込みの鍵を握らない。握ったままだと、ほかの
+            // つなぎ（名前の変更や lisa-mcp）が `busy_timeout` を超えて待たされ、失敗する。
+            self.db.commit()?;
             let results = self.hash_files(&children, &files, &path);
+            self.db.begin()?;
             for (i, result) in files.into_iter().zip(results) {
                 let child = &mut children[i];
                 match result {
@@ -263,6 +266,7 @@ impl Walker<'_> {
             .collect();
         let entries = tree_bytes(&parts);
         let hash = *blake3::hash(&entries).as_bytes();
+        self.db.begin()?;
         self.db.set_hash(folder.id, &hash, 0, folder.mtime)?;
         self.db.save_tree(&hash, &entries)?;
         (self.on)(Event::FolderDone(&path));
@@ -314,11 +318,12 @@ impl Walker<'_> {
         (self.pace.step)(0)
     }
 
+    /// 少し経っていたら確定する。次に書く前に `begin` し直す（先に読むと、間にほかのつなぎが確定した
+    /// とき書き込みが待たずに失敗するので、トランザクションは書くところから始める）。
     fn maybe_commit(&mut self) -> db::Result<()> {
         if self.last_commit.elapsed() >= COMMIT_EVERY {
             self.db.commit()?;
             (self.on)(Event::Committed);
-            self.db.begin()?;
             self.last_commit = Instant::now();
         }
         Ok(())

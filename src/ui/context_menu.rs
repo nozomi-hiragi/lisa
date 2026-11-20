@@ -23,7 +23,7 @@ use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::ui::menu::MenuSystems;
 use crate::ui::tooltip::{
-    ClampPopover, PointerBlocked, local_path, node_under_cursor, remote_path_text,
+    ClampPopover, PointerBlocked, local_item_path, node_under_cursor, remote_path_text,
 };
 use crate::view::{MainCamera, Nav};
 
@@ -39,6 +39,7 @@ impl Plugin for ContextMenuPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ContextMenu>()
             .add_message::<ContextCommand>()
+            .add_plugins(super::dialog::DialogPlugin)
             .add_systems(First, |mut menu: ResMut<ContextMenu>| {
                 if menu.just_closed {
                     menu.just_closed = false;
@@ -111,11 +112,11 @@ impl ContextAction {
                     "Finder で表示"
                 }
             }
-            Self::Rename => "名前の変更…（準備中）",
+            Self::Rename => "名前の変更…",
             Self::Cut => "切り取り",
             Self::Paste => "ここに貼り付け",
             Self::Delete => "削除…",
-            Self::Details => "詳細…（準備中）",
+            Self::Details => "詳細…",
         }
     }
 }
@@ -147,7 +148,7 @@ pub fn availability(action: ContextAction, target: &Target) -> bool {
         ContextAction::Up => !target.at_root,
         ContextAction::CopyPath => target.path_text.is_some(),
         ContextAction::Reveal => target.local_path.as_ref().is_some_and(|p| p.exists()),
-        ContextAction::Cut | ContextAction::Delete => {
+        ContextAction::Cut | ContextAction::Delete | ContextAction::Rename => {
             target.local_movable && target.local_path.as_ref().is_some_and(|p| p.exists())
         }
         ContextAction::Paste => {
@@ -159,8 +160,7 @@ pub fn availability(action: ContextAction, target: &Target) -> bool {
             dest_dir.is_dir() && from.parent() != Some(dest_dir.as_path())
                 && !(from.is_dir() && dest_dir.starts_with(from))
         }
-        // まだ作っていない。
-        ContextAction::Rename | ContextAction::Details => false,
+        ContextAction::Details => true,
     }
 }
 
@@ -199,6 +199,7 @@ fn open_menu(
     layouts: Res<Layouts>,
     nav: Res<Nav>,
     organize: Option<Res<crate::organize::OrganizeState>>,
+    store: Option<Res<crate::scan::Store>>,
     blocked: PointerBlocked,
     mut menu: ResMut<ContextMenu>,
     font: Res<LabelFont>,
@@ -223,7 +224,7 @@ fn open_menu(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    let local = local_path(&tree, node);
+    let local = local_item_path(&tree, store.as_deref(), node);
     let local_movable =
         tree.nodes[node].remote.is_none() && tree.nodes[node].depth >= 3 && local.is_some();
     let path_text = local
@@ -339,7 +340,7 @@ fn run_command(
                     organize.user_trash(path.clone());
                 }
             }
-            // TODO: 名前の変更、詳細はここに足す（今は押せない）。
+            // ダイアログ側が ContextCommand を受け取る。
             ContextAction::Rename | ContextAction::Details => {}
         }
         redraw.write(RequestRedraw);
@@ -569,13 +570,19 @@ mod tests {
     }
 
     #[test]
-    fn unfinished_actions_are_disabled() {
+    fn rename_requires_an_existing_local_item_and_details_is_always_available() {
         let mut t = target();
+        assert!(!availability(ContextAction::Rename, &t));
+        assert!(availability(ContextAction::Details, &t));
         t.local_path = Some(std::env::current_dir().unwrap());
+        assert!(!availability(ContextAction::Rename, &t));
+        assert!(availability(ContextAction::Details, &t));
         t.local_movable = true;
-        for action in [ContextAction::Rename, ContextAction::Details] {
-            assert!(!availability(action, &t));
-        }
+        assert!(availability(ContextAction::Rename, &t));
+        t.local_path = Some(t.local_path.unwrap().join("missing-lisa-test-item"));
+        assert!(!availability(ContextAction::Rename, &t));
+        assert_eq!(ContextAction::Rename.label(), "名前の変更…");
+        assert_eq!(ContextAction::Details.label(), "詳細…");
     }
 
     #[test]

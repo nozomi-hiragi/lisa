@@ -499,11 +499,17 @@ fn check_single_op(
             };
 
             // 行き先が無い（上書きしない）。
-            if fs::symlink_metadata(&dst).is_ok() {
-                return Ok(refused(
-                    item,
-                    "行き先にすでにファイルやフォルダがあります".into(),
-                ));
+            match super::move_destination_exists(&item.src, &dst) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Ok(refused(
+                        item,
+                        "行き先にすでにファイルやフォルダがあります".into(),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(refused(item, format!("行き先を確かめられません: {error}")));
+                }
             }
             // 行き先の親があるか、同じ計画の mkdir で作られる。
             let Some(parent) = dst.parent() else {
@@ -868,7 +874,9 @@ pub(crate) fn recheck_op_before_apply(db: &Db, ctx: &Context, op: &PlanOp) -> Re
             let verified = check_db_and_disk_source(db, &loc)?;
             check_matches_recorded(op, &verified)?;
 
-            if fs::symlink_metadata(dst).is_ok() {
+            if super::move_destination_exists(&op.src, dst)
+                .map_err(|e| format!("行き先を確かめられません: {e}"))?
+            {
                 return Err("行き先にすでにファイルやフォルダがあります".into());
             }
             let Some(parent) = dst.parent() else {
