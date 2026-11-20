@@ -88,8 +88,7 @@ pub(crate) fn view_width(window: &Window) -> f32 {
 pub(crate) fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
     let view_height = window.height() - BAR_PX;
     // 周りに少し余白を残す（外側のフォルダの色が見え、耳も端に貼りつかない）。
-    let scale = (rect.width() / view_width(window)).max(rect.height() / view_height)
-        * crate::layout::FIT_MARGIN;
+    let scale = crate::layout::fit_scale(rect.size(), Vec2::new(view_width(window), view_height));
     // 画面の中心より、バーの高さの半分だけ下に枠の中心が来るようにする。
     (rect.center() + Vec2::new(0.0, BAR_PX / 2.0 * scale), scale)
 }

@@ -495,6 +495,8 @@ pub(super) fn size_of<'a>(
     };
     let of = ear::EarOf {
         size_width,
+        selected_fit: node.is_dir.then(|| layouts[id].fit.size()),
+        selected_height: (layouts[id].cell.max.y - layouts[id].frame.max.y).max(0.0),
         parent_width: parent.map_or(size_width, |p| p.frame.width()),
         in_list,
     };
@@ -528,6 +530,40 @@ pub struct LabelFont(pub Handle<Font>);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fitted_folder_uses_the_exact_same_body_at_every_window_size() {
+        let tree = FileTree::deep(6);
+        let settings = crate::settings::Settings::default();
+        let folder = tree
+            .nodes
+            .iter()
+            .position(|node| node.name == "底")
+            .unwrap();
+        for (width, height) in [
+            (500.0, 400.0),
+            (960.0, 600.0),
+            (1280.0, 800.0),
+            (1920.0, 1080.0),
+        ] {
+            for panel in [0.0, 240.0] {
+                let viewport = Vec2::new(width - panel, height - 32.0);
+                let (spec, ears) = crate::view::ear_spec_for_view(&settings, viewport);
+                for anchor in [folder, tree.nodes[folder].parent.unwrap()] {
+                    let layouts =
+                        crate::layout::layout(&tree, anchor, crate::layout::anchor_body(), spec);
+                    let slot = slot_of(&tree, &layouts, folder);
+                    let scale = crate::layout::fit_scale(layouts[folder].fit.size(), viewport);
+                    for scale in [scale, scale * 0.65] {
+                        let live = size_of(&tree, &layouts, &ears, folder, true);
+                        let capture = size_of(&tree, &layouts, &ears, folder, false);
+                        assert_eq!(slot.yielded(live.height(scale)), (1.0, slot.body));
+                        assert_eq!(slot.yielded(capture.height(scale)), (1.0, slot.body));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn only_parent_and_grandparent_can_spawn_shells() {

@@ -30,6 +30,7 @@ const MIN_TEXT_PX: f32 = 4.0;
 /// 耳の大きさを決める値。
 #[derive(Resource, Clone, Copy)]
 pub struct EarSizes {
+    pub viewport: Vec2,
     /// 開いたフォルダの本体を画面に収めたときの幅（論理ピクセル）。
     pub fitted_width: f32,
     /// 開いたときの耳の高さ（論理ピクセル）。
@@ -39,23 +40,32 @@ pub struct EarSizes {
 }
 
 impl EarSizes {
-    /// 本体の幅が `body_width`、親の本体の幅が `parent_width` のフォルダの耳の高さ
-    /// （ワールド座標）。`in_list` は親を開いたときの耳の高さの上限（ワールド座標）。`scale` はカメラの倍率（1 論理ピクセルあたりのワールドの長さ）。
-    pub fn height(&self, body_width: f32, parent_width: f32, in_list: f32, scale: f32) -> f32 {
-        // そのフォルダを開いたときの倍率と、親を開いたときの倍率。
-        let selected = body_width / self.fitted_width;
-        let preview = parent_width / self.fitted_width;
-        let in_list = in_list.min(self.preview_px * preview);
+    fn height(&self, of: EarOf, scale: f32) -> f32 {
+        let (selected, selected_height) = of.selected_fit.map_or_else(
+            || {
+                let selected = of.size_width / self.fitted_width;
+                (selected, self.selected_px * selected)
+            },
+            |fit| {
+                (
+                    crate::layout::fit_scale(fit, self.viewport),
+                    of.selected_height,
+                )
+            },
+        );
+        let preview = of.parent_width / self.fitted_width;
+        let in_list = of.in_list.min(self.preview_px * preview);
         if scale <= selected {
-            return self.selected_px * selected;
+            return selected_height;
         }
         if scale >= preview || preview <= selected {
             return in_list;
         }
         // 画面上の高さを、倍率の対数に沿って変える。
+        let selected_px = selected_height / selected;
         let preview_px = in_list / preview;
         let t = (scale / selected).ln() / (preview / selected).ln();
-        (self.selected_px + (preview_px - self.selected_px) * t) * scale
+        (selected_px + (preview_px - selected_px) * t) * scale
     }
 
     /// 名前を作るときの文字の大きさ（ピクセル）。ズームで拡大縮小するので、大きめに作る。
@@ -78,6 +88,15 @@ pub struct Slot {
 impl Slot {
     /// 耳（名前）に高さ `h` を取ったときの、本体の縮み（倍率）と、見えている本体の四角。
     pub fn yielded(&self, h: f32) -> (f32, Rect) {
+        let reserved = if self.name_below {
+            self.body.min.y - self.cell.min.y
+        } else {
+            self.cell.max.y - self.body.max.y
+        };
+        if h <= reserved {
+            // 中心と大きさから組み立て直すと、本体が丸めでわずかにずれる。
+            return (1.0, self.body);
+        }
         let room = (self.cell.height() - h).max(self.body.height() * 0.05);
         let k = (room / self.body.height()).min(1.0);
         let size = self.body.size() * k;
@@ -103,6 +122,8 @@ impl Slot {
 pub struct EarOf {
     /// 耳の高さを決めるときの本体の幅（ファイルの名前は、同じ一覧のフォルダの本体の幅）。
     pub size_width: f32,
+    pub selected_fit: Option<Vec2>,
+    pub selected_height: f32,
     /// 親の本体の幅。
     pub parent_width: f32,
     /// 親を開いたときの耳の高さの上限（ワールド座標）。
@@ -111,7 +132,7 @@ pub struct EarOf {
 
 impl EarOf {
     fn height(&self, sizes: &EarSizes, scale: f32) -> f32 {
-        sizes.height(self.size_width, self.parent_width, self.in_list, scale)
+        sizes.height(*self, scale)
     }
 }
 

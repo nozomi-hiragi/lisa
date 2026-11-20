@@ -12,7 +12,9 @@ use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
 use bevy::window::{PrimaryWindow, RequestRedraw, WindowFocused, WindowOccluded, WindowResized};
 use bevy::winit::{UpdateMode, WinitSettings};
 
-use crate::layout::{EarSpec, Layouts, Rebase, anchor_body, fitted_size, layout, valid_frame};
+use crate::layout::{
+    BODY_ASPECT, EarSpec, FIT_MARGIN, Layouts, Rebase, anchor_body, layout, valid_frame,
+};
 use crate::model::tree::{FileTree, NodeId};
 use crate::preview::PreviewRegistry;
 use crate::render::cache::{self, FolderImages, ThumbnailCapture};
@@ -438,14 +440,18 @@ pub(crate) fn ear_spec(settings: &Settings, window: &Window) -> (EarSpec, EarSiz
     )
 }
 
-fn ear_spec_for_view(settings: &Settings, viewport: Vec2) -> (EarSpec, EarSizes) {
-    let fitted = fitted_size(viewport, settings.ear_selected_px);
+pub(crate) fn ear_spec_for_view(settings: &Settings, viewport: Vec2) -> (EarSpec, EarSizes) {
+    let spec = EarSpec::new(settings);
+    let height = (viewport.x / FIT_MARGIN / BODY_ASPECT)
+        .min(viewport.y / FIT_MARGIN / (1.0 + spec.selected))
+        .max(1.0);
     let ears = EarSizes {
-        fitted_width: fitted.x,
-        selected_px: settings.ear_selected_px,
-        preview_px: settings.ear_preview_px,
+        viewport,
+        fitted_width: height * BODY_ASPECT,
+        selected_px: height * spec.selected,
+        preview_px: height * spec.preview,
     };
-    (EarSpec::new(settings), ears)
+    (spec, ears)
 }
 
 /// 右の一覧が開け閉めされたら、木を映す領域（カメラの viewport）を狭め、今のものを収め直す。
@@ -867,6 +873,11 @@ fn rebase_anchor(
     true
 }
 
+fn urgent_reanchor(placed: bool, depth: usize, height: f32) -> bool {
+    let unit = crate::layout::ANCHOR_HEIGHT;
+    !placed || depth >= 3 || !(unit / 1000.0..=unit * 1000.0).contains(&height)
+}
+
 /// 操作中でも基準が遠くなったら、見え方を保ったまま新しい基準へ付け替える。
 #[allow(clippy::too_many_arguments)]
 fn reanchor(
@@ -896,9 +907,7 @@ fn reanchor(
     let depth = tree.nodes[folder]
         .depth
         .abs_diff(tree.nodes[layouts.anchor].depth);
-    let unit = crate::layout::ANCHOR_HEIGHT;
-    let urgent =
-        !layouts.contains(folder) || depth >= 2 || !(unit / 10.0..=unit * 10.0).contains(&height);
+    let urgent = urgent_reanchor(layouts.contains(folder), depth, height);
     let interacting = animating.is_some()
         || gesture.active()
         || gesture.parent_scene_entity().is_some()
@@ -1242,6 +1251,34 @@ pub(crate) fn parse_update_mode(raw: Option<&str>) -> (WinitSettings, &'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_zoom_into_a_dense_folder_does_not_interrupt_with_a_reanchor() {
+        let tree = FileTree::wide(1, 200);
+        let folder = tree.nodes[FileTree::ROOT].children[0];
+        let layouts = layout(
+            &tree,
+            FileTree::ROOT,
+            anchor_body(),
+            EarSpec::new(&Settings::default()),
+        );
+        let small_body = layouts[tree.nodes[folder].children[0]].frame.height();
+        assert!(small_body < crate::layout::ANCHOR_HEIGHT / 10.0);
+        assert!(!urgent_reanchor(true, 1, small_body));
+        assert!(!urgent_reanchor(true, 2, small_body));
+        assert!(urgent_reanchor(true, 3, small_body));
+        assert!(urgent_reanchor(
+            true,
+            1,
+            crate::layout::ANCHOR_HEIGHT / 1001.0
+        ));
+        assert!(urgent_reanchor(
+            true,
+            1,
+            crate::layout::ANCHOR_HEIGHT * 1001.0
+        ));
+        assert!(urgent_reanchor(false, 1, small_body));
+    }
 
     #[test]
     fn resizing_and_side_panels_only_change_the_screen_ear_sizes() {

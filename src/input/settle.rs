@@ -54,6 +54,17 @@ pub(super) enum PanGoal {
     Grid(Vec2),
 }
 
+fn should_refocus(zoom: Option<ZoomGoal>, pan: Option<PanGoal>, current: NodeId) -> bool {
+    if matches!(pan, Some(PanGoal::Grid(_))) {
+        return false;
+    }
+    let goal = zoom.map(|goal| goal.node).or(match pan {
+        Some(PanGoal::Node(node)) => Some(node),
+        _ => None,
+    });
+    goal != Some(current)
+}
+
 /// 縮小して今の枠より外が見えてきたら、親の場面を下に描いておく。
 pub(super) fn show_parent_if_zoomed_out(
     parent_scene: &mut Option<Entity>,
@@ -201,17 +212,19 @@ pub(super) fn coast_step(
         return true;
     }
 
-    // 動いている途中でも、いちばん近い行き先が変わったら、開いている場所をそちらへ切り替える。
-    refocus(
-        &mut coast.parent_scene,
-        location,
-        nav,
-        current,
-        maker,
-        window,
-        pos,
-        ortho.scale,
-    );
+    // 行き先が確定した押し戻し中は、一瞬境界を越えても場面を入れ替えない。
+    if should_refocus(coast.zoom_goal, coast.pan_goal, nav.top().node) {
+        refocus(
+            &mut coast.parent_scene,
+            location,
+            nav,
+            current,
+            maker,
+            window,
+            pos,
+            ortho.scale,
+        );
+    }
     let ln = ortho.scale.ln();
 
     // 勢いは指数関数的に弱める（終わり際ほどよく効く摩擦）。
@@ -591,6 +604,23 @@ pub(super) fn switch_focus(
 #[cfg(test)]
 mod root_limit_tests {
     use super::*;
+
+    #[test]
+    fn coast_keeps_the_scene_once_the_return_target_is_current() {
+        let goal = |node| {
+            Some(ZoomGoal {
+                node,
+                scale: 1.0,
+                grid: false,
+            })
+        };
+        assert!(!should_refocus(None, Some(PanGoal::Grid(Vec2::ONE)), 3));
+        assert!(!should_refocus(goal(3), None, 3));
+        assert!(!should_refocus(None, Some(PanGoal::Node(3)), 3));
+        assert!(should_refocus(goal(4), None, 3));
+        assert!(should_refocus(None, Some(PanGoal::Node(4)), 3));
+        assert!(should_refocus(None, None, 3));
+    }
 
     #[test]
     fn zoom_out_has_no_root_limit_when_the_root_is_too_far_to_lay_out() {

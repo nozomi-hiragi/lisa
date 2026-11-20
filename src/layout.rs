@@ -210,14 +210,9 @@ const GAP: f32 = 0.08;
 /// タイルの幅の上限（並べる場所の幅に対する割合）。中身が少なくても、入れ子に見えるように。
 const MAX_CELL: f32 = 0.5;
 
-/// 開いたフォルダを画面に収めたときの、本体の大きさ（論理ピクセル）。
-/// `view` はメニューバーの下の領域の大きさ、`ear_px` は開いたフォルダの耳の高さ。
-/// 本体の上に耳の分を取り、全体を余白つきで収める。
-pub fn fitted_size(view: Vec2, ear_px: f32) -> Vec2 {
-    let width = (view.x / FIT_MARGIN)
-        .min((view.y / FIT_MARGIN - ear_px) * BODY_ASPECT)
-        .max(1.0);
-    Vec2::new(width, width / BODY_ASPECT)
+/// ワールドの枠を、与えられた描画領域に余白付きで収める倍率。
+pub(crate) fn fit_scale(size: Vec2, viewport: Vec2) -> f32 {
+    (size.x / viewport.x).max(size.y / viewport.y) * FIT_MARGIN
 }
 
 /// 耳の大きさの設定を、開いたフォルダの本体の高さ `fitted_height` に対する割合に直したもの。
