@@ -198,7 +198,30 @@ fn paper_frame(frame: Rect, portrait_a4: bool) -> Rect {
     Rect::from_center_size(frame.center(), size)
 }
 
-/// 紙の形の背景（右上が折れている）と、選んだカートリッジの絵を描く。`background` は下の色。
+fn preview_geometry(
+    frame: Rect,
+    portrait_a4: bool,
+    loaded: Option<&Preview>,
+) -> (Option<Rect>, Rect) {
+    if matches!(loaded, Some(Preview::Image(_, size)) if size.x > 0 && size.y > 0) {
+        return (None, frame);
+    }
+    let paper = paper_frame(frame, portrait_a4);
+    let pad = if portrait_a4 {
+        paper.size().min_element()
+    } else {
+        paper.height()
+    } * 0.14;
+    (
+        Some(paper),
+        Rect {
+            min: paper.min + pad,
+            max: paper.max - pad,
+        },
+    )
+}
+
+/// カートリッジの絵を描く。画像がまだ無い場合やテキストには、折れ耳の紙を敷く。
 pub fn draw(
     registry: &PreviewRegistry,
     painter: &mut Painter,
@@ -210,45 +233,37 @@ pub fn draw(
 ) {
     let cartridge = registry.pick(name);
     let portrait_a4 = cartridge.portrait_a4();
-    let frame = paper_frame(frame, portrait_a4);
+    let (paper_rect, inner) = preview_geometry(frame, portrait_a4, loaded.as_ref());
     let paper = Color::srgb(0.85, 0.87, 0.95);
     let page = over(background, paper, 0.10);
-    let fold = over(background, paper, 0.22);
-    let short_side = frame.width().min(frame.height());
-    let c = if portrait_a4 {
-        short_side * 0.22
-    } else {
-        frame.height() * 0.15
-    };
-    painter.rect(
-        Rect::new(frame.min.x, frame.min.y, frame.max.x - c, frame.max.y),
-        page,
-        z,
-    );
-    painter.rect(
-        Rect::new(frame.max.x - c, frame.min.y, frame.max.x, frame.max.y - c),
-        page,
-        z,
-    );
-    painter.triangle(
-        [
-            Vec2::new(frame.max.x - c, frame.max.y),
-            Vec2::new(frame.max.x - c, frame.max.y - c),
-            Vec2::new(frame.max.x, frame.max.y - c),
-        ],
-        fold,
-        z,
-    );
+    if let Some(frame) = paper_rect {
+        let fold = over(background, paper, 0.22);
+        let c = if portrait_a4 {
+            frame.size().min_element() * 0.22
+        } else {
+            frame.height() * 0.15
+        };
+        painter.rect(
+            Rect::new(frame.min.x, frame.min.y, frame.max.x - c, frame.max.y),
+            page,
+            z,
+        );
+        painter.rect(
+            Rect::new(frame.max.x - c, frame.min.y, frame.max.x, frame.max.y - c),
+            page,
+            z,
+        );
+        painter.triangle(
+            [
+                Vec2::new(frame.max.x - c, frame.max.y),
+                Vec2::new(frame.max.x - c, frame.max.y - c),
+                Vec2::new(frame.max.x, frame.max.y - c),
+            ],
+            fold,
+            z,
+        );
+    }
 
-    let pad = if portrait_a4 {
-        short_side
-    } else {
-        frame.height()
-    } * 0.14;
-    let inner = Rect {
-        min: frame.min + pad,
-        max: frame.max - pad,
-    };
     let mut ctx = DrawContext {
         painter,
         name,
@@ -501,6 +516,47 @@ mod tests {
         }
 
         fn draw(&self, _ctx: &mut DrawContext<'_, '_, '_, '_>) {}
+    }
+
+    #[test]
+    fn a_loaded_image_uses_the_full_frame_without_paper() {
+        let frame = Rect::new(10.0, 20.0, 170.0, 140.0);
+        let image = Preview::Image(Handle::default(), UVec2::new(1024, 768));
+        for portrait in [false, true] {
+            assert_eq!(
+                preview_geometry(frame, portrait, Some(&image)),
+                (None, frame)
+            );
+        }
+    }
+
+    #[test]
+    fn missing_text_and_invalid_image_previews_keep_the_padded_paper() {
+        let frame = Rect::new(10.0, 20.0, 170.0, 140.0);
+        let text = Preview::Text(vec!["sample".to_string()].into());
+        let invalid = Preview::Image(Handle::default(), UVec2::new(100, 0));
+        for loaded in [None, Some(&text), Some(&invalid)] {
+            for portrait in [false, true] {
+                let (paper, inner) = preview_geometry(frame, portrait, loaded);
+                let paper = paper.unwrap();
+                let pad = if portrait {
+                    paper.width()
+                } else {
+                    frame.height()
+                } * 0.14;
+                assert_eq!(paper.center(), frame.center());
+                assert_eq!(inner.min, paper.min + pad);
+                assert_eq!(inner.max, paper.max - pad);
+                if portrait {
+                    assert!(
+                        (paper.width() / paper.height() - std::f32::consts::FRAC_1_SQRT_2).abs()
+                            < 1e-6
+                    );
+                } else {
+                    assert_eq!(paper, frame);
+                }
+            }
+        }
     }
 
     #[test]
