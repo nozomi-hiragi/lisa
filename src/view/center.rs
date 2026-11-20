@@ -311,7 +311,8 @@ pub(super) fn choose(
     current: Res<CurrentScene>,
     nav: Res<Nav>,
     tree: Res<FileTree>,
-    layouts: Res<Layouts>,
+    mut layouts: ResMut<Layouts>,
+    settings: Res<Settings>,
     camera: Single<(&Transform, &Projection), With<MainCamera>>,
     window: Single<&Window, With<PrimaryWindow>>,
     animating: Option<Res<Animating>>,
@@ -380,6 +381,9 @@ pub(super) fn choose(
             progress,
             animating.as_ref().map(|anim| anim.then_show && priority),
         );
+        if requested || progress > REQUEST_AT {
+            layouts.ensure_children(&tree, folder, EarSpec::new(&settings));
+        }
         approach.0 = Some(Focus {
             tile,
             folder,

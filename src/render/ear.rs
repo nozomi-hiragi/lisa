@@ -40,12 +40,12 @@ pub struct EarSizes {
 
 impl EarSizes {
     /// 本体の幅が `body_width`、親の本体の幅が `parent_width` のフォルダの耳の高さ
-    /// （ワールド座標）。`in_list` は親を開いたときの耳の高さ（ワールド座標、タイルが小さいと
-    /// 設定より小さくなる）。`scale` はカメラの倍率（1 論理ピクセルあたりのワールドの長さ）。
+    /// （ワールド座標）。`in_list` は親を開いたときの耳の高さの上限（ワールド座標）。`scale` はカメラの倍率（1 論理ピクセルあたりのワールドの長さ）。
     pub fn height(&self, body_width: f32, parent_width: f32, in_list: f32, scale: f32) -> f32 {
         // そのフォルダを開いたときの倍率と、親を開いたときの倍率。
         let selected = body_width / self.fitted_width;
         let preview = parent_width / self.fitted_width;
+        let in_list = in_list.min(self.preview_px * preview);
         if scale <= selected {
             return self.selected_px * selected;
         }
@@ -105,7 +105,7 @@ pub struct EarOf {
     pub size_width: f32,
     /// 親の本体の幅。
     pub parent_width: f32,
-    /// 親を開いたときの耳の高さ（ワールド座標）。
+    /// 親を開いたときの耳の高さの上限（ワールド座標）。
     pub in_list: f32,
 }
 

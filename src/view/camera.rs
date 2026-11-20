@@ -30,6 +30,15 @@ pub(crate) struct Animating {
     pub(crate) ease: Ease,
 }
 
+impl Animating {
+    pub(super) fn rebase(&mut self, rebase: Rebase) {
+        self.from_pos = rebase.position(self.from_pos);
+        self.to_pos = rebase.position(self.to_pos);
+        self.from_scale = rebase.scale(self.from_scale);
+        self.to_scale = rebase.scale(self.to_scale);
+    }
+}
+
 /// 右に開いている一覧の幅（論理ピクセル、`f32` のビット列）。その分だけ、木を映す領域が狭くなる。
 static SIDE_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -91,11 +100,17 @@ pub(crate) fn refit_on_resize(
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
     layouts: Res<Layouts>,
+    settings: Res<Settings>,
+    mut ears: ResMut<EarSizes>,
     nav: Res<Nav>,
     animating: Option<Res<Animating>>,
     gesture: Res<crate::input::gesture::Gesture>,
 ) {
-    if resized.read().last().is_none() || animating.is_some() || gesture.active() {
+    if resized.read().last().is_none() {
+        return;
+    }
+    *ears = ear_spec(&settings, &window).1;
+    if animating.is_some() || gesture.active() {
         return;
     }
     let (pos, scale) = fit(nav.top().frame(&layouts), &window);
@@ -151,6 +166,7 @@ pub(super) fn animate_camera(
     if anim.then_show {
         // 中身が準備できていればそのまま本シーンへ切り替える。未読込時は従来のフェードを使う。
         let path = scene_path(&nav, &maker.tree);
+        maker.ensure_folder(path.last().unwrap().node);
         let (_, scene_scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
         let scene_scale = if scene_scale > 0.0 && scene_scale.is_finite() {
             scene_scale

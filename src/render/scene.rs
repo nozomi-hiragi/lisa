@@ -485,7 +485,9 @@ pub(super) fn size_of<'a>(
 ) -> ear::Size<'a> {
     let node = &tree.nodes[id];
     let parent = node.parent.map(|p| &layouts[p]);
-    let in_list = parent.map_or(0.0, |p| p.grid.ear);
+    let in_list = parent.map_or(0.0, |_| {
+        layouts[id].cell.height() * crate::layout::MAX_EAR_IN_CELL
+    });
     let size_width = if node.is_dir {
         layouts[id].frame.width()
     } else {

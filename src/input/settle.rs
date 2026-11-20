@@ -163,6 +163,15 @@ pub(super) fn targets(
 /// 寄せる。行き先は、ピンチなら `zoom_goal`、2本指なら `pan_goal`、どちらも無ければ（Root より
 /// 縮めたときなど）いちばん近いもの。途中でも、いちばん近いものが変われば開いている場所を切り替える。
 #[allow(clippy::too_many_arguments)]
+pub(super) fn root_fit_scale(layouts: &crate::layout::Layouts, window: &Window) -> Option<f32> {
+    let root = layouts[FileTree::ROOT].fit;
+    if !crate::layout::valid_frame(root) {
+        return None;
+    }
+    let scale = fit(root, window).1;
+    (scale.is_finite() && scale > 0.0).then_some(scale)
+}
+
 pub(super) fn coast_step(
     coast: &mut Coast,
     location: &mut Location,
@@ -180,13 +189,11 @@ pub(super) fn coast_step(
     coast.last = now;
 
     let pos = transform.translation.truncate();
-    let root_scale = fit(maker.layouts[FileTree::ROOT].fit, window).1;
-    if !(ortho.scale > 0.0
-        && ortho.scale.is_finite()
-        && pos.is_finite()
-        && root_scale > 0.0
-        && root_scale.is_finite())
-    {
+    let root_ln = root_fit_scale(&maker.layouts, window).map(f32::ln);
+    if !maker.layouts.contains(nav.top().node) && maker.tree.is_attached(nav.top().node) {
+        return false;
+    }
+    if !(ortho.scale > 0.0 && ortho.scale.is_finite() && pos.is_finite()) {
         if let Some(parent) = coast.parent_scene.take() {
             maker.commands.entity(parent).despawn();
         }
@@ -223,8 +230,9 @@ pub(super) fn coast_step(
     {
         ln += (goal.scale.ln() - ln) * pull;
     }
-    let root_ln = root_scale.ln();
-    if ln > root_ln {
+    if let Some(root_ln) = root_ln
+        && ln > root_ln
+    {
         ln += (root_ln - ln) * pull;
     }
     let scale = ln.exp();
@@ -276,7 +284,7 @@ pub(super) fn coast_step(
     let at_rest = coast.velocity.length() / scale < REST_PX_PER_SECOND
         && coast.velocity_ln.abs() < REST_LN_PER_SECOND
         && (goal - pos).length() / scale < REST_PX
-        && ln <= root_ln + 1e-3
+        && root_ln.is_none_or(|root| ln <= root + 1e-3)
         && coast.zoom_goal.is_none_or(|goal| {
             goal.scale <= 0.0 || !goal.scale.is_finite() || (ln - goal.scale.ln()).abs() < 0.002
         });
@@ -394,8 +402,8 @@ pub(super) fn focus_node(
         sync.request_reset();
         return;
     };
+    maker.ensure_folder(node);
     if !maker.layouts.contains(node) {
-        sync.request_reset();
         return;
     }
     if nav.top().node == node {
@@ -521,6 +529,7 @@ pub(super) fn switch_focus(
     // 開いている場所の本物の場面を作り直す。ファイルなら親の場面。
     let respawn = |current: &mut CurrentScene, maker: &mut SceneMaker, nav: &Nav| {
         let path = scene_path(nav, &maker.tree).to_vec();
+        maker.ensure_folder(path.last().unwrap().node);
         let (_, scale) = fit(path[path.len() - 1].frame(&maker.layouts), window);
         maker.commands.entity(current.0).despawn();
         current.0 = maker.spawn(&path, scale);
@@ -528,6 +537,7 @@ pub(super) fn switch_focus(
     match target {
         Target::Current => return,
         Target::Child(child) => {
+            maker.ensure_folder(child);
             if !maker.tree.is_attached(child) || !maker.layouts.contains(child) {
                 return;
             }
@@ -559,6 +569,7 @@ pub(super) fn switch_focus(
             }
         }
         Target::Sibling(sibling) => {
+            maker.ensure_folder(sibling);
             if !maker.tree.is_attached(sibling) || !maker.layouts.contains(sibling) {
                 return;
             }
@@ -575,4 +586,22 @@ pub(super) fn switch_focus(
     }
     *location = Location::from_tree(&maker.tree, nav.top().node);
     show_breadcrumb(&mut maker.commands, &maker.tree, nav.top().node);
+}
+
+#[cfg(test)]
+mod root_limit_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_out_has_no_root_limit_when_the_root_is_too_far_to_lay_out() {
+        let tree = FileTree::deep(160);
+        let bottom = tree
+            .nodes
+            .iter()
+            .position(|node| node.name == "底")
+            .unwrap();
+        let spec = crate::layout::EarSpec::new(&crate::settings::Settings::default());
+        let layouts = crate::layout::layout(&tree, bottom, crate::layout::anchor_body(), spec);
+        assert_eq!(root_fit_scale(&layouts, &Window::default()), None);
+    }
 }

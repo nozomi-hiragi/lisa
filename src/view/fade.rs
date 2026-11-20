@@ -7,7 +7,7 @@ use crate::render::scene::FolderShell;
 const FADE_SECONDS: f32 = 0.1;
 
 /// 場面のフェード。終わったら、フェードアウトなら場面を消し、フェードインなら `replaces` を消す。
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub(crate) struct Fade {
     pub(crate) started: Instant,
     pub(crate) fade_in: bool,

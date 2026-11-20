@@ -25,14 +25,14 @@ use bevy::window::PrimaryWindow;
 
 use crate::input::mac_scroll;
 use crate::input::scroll_input::{Action, ScrollMachine};
-use crate::model::tree::{FileTree, NodeId};
+use crate::model::tree::NodeId;
 use crate::ui::menu::{BAR_PX, Popup};
 use crate::view::{
     Animating, CurrentScene, Fade, Location, MainCamera, Nav, SceneMaker, SyncRequest, fit,
     scene_path, ui_has_pointer,
 };
 
-use super::settle::{Coast, choose_pan, coast_step, refocus, show_parent_if_zoomed_out};
+use super::settle::{Coast, PanGoal, choose_pan, coast_step, refocus, show_parent_if_zoomed_out};
 use super::zoom_levels::{choose_zoom, zoom_ladder};
 
 /// ピンチの指が乗っているか分からないとき（macOS 以外）、入力がこれだけ途切れたら離したとみなす。
@@ -107,6 +107,36 @@ impl Gesture {
     /// 親の場面を差し替える（`sync_view` の再描画時）。
     pub(crate) fn set_parent_scene(&mut self, entity: Option<Entity>) {
         self.parent_scene = entity;
+    }
+
+    /// 位置と速度の単位を、カメラと同じフレームで付け替える。
+    pub(crate) fn rebase(&mut self, rebase: crate::layout::Rebase) {
+        self.raw_pos = rebase.position(self.raw_pos);
+        self.raw_scale = rebase.scale(self.raw_scale);
+        for (_, ln, pos) in &mut self.history {
+            *ln = rebase.log_scale(*ln);
+            *pos = rebase.position(*pos);
+        }
+        if let Some((_, ln)) = &mut self.zoom_start {
+            *ln = rebase.log_scale(*ln);
+        }
+        if let Some(coast) = &mut self.coast {
+            coast.velocity = rebase.vector(coast.velocity);
+            if let Some(goal) = &mut coast.zoom_goal {
+                goal.scale = rebase.scale(goal.scale);
+            }
+            if let Some(PanGoal::Grid(pos)) = &mut coast.pan_goal {
+                *pos = rebase.position(*pos);
+            }
+        }
+    }
+
+    pub(crate) fn rebase_parent_scene(&mut self, parent: Option<Entity>) {
+        if let Some(coast) = &mut self.coast {
+            coast.parent_scene = parent;
+        } else {
+            self.parent_scene = parent;
+        }
     }
 
     /// ジェスチャー・慣性移動をすべて初期化し、保持していた親の場面があれば返す。
@@ -342,14 +372,13 @@ pub fn gesture(
         return;
     };
     let top = *nav.top();
+    maker.ensure_folder(top.node);
+    if !maker.layouts.contains(top.node) && maker.tree.is_attached(top.node) {
+        return;
+    }
     let (_, rest_scale) = fit(top.frame(&maker.layouts), &window);
-    let root_scale = fit(maker.layouts[FileTree::ROOT].fit, &window).1;
-    if !(rest_scale > 0.0
-        && rest_scale.is_finite()
-        && root_scale > 0.0
-        && root_scale.is_finite()
-        && ortho.scale > 0.0
-        && ortho.scale.is_finite())
+    let root_scale = super::settle::root_fit_scale(&maker.layouts, &window);
+    if !(rest_scale > 0.0 && rest_scale.is_finite() && ortho.scale > 0.0 && ortho.scale.is_finite())
     {
         if let Some(parent) = state.clear_and_take_parent_scene() {
             maker.commands.entity(parent).despawn();
@@ -462,8 +491,13 @@ pub fn gesture(
         // カーソルの下の点が動かないように拡大縮小する。
         let factor = (-pinch).exp();
         // 縮める上限は Root を基準にする（開いている場所が途中で変わっても、急に止まらない）。
-        let new_scale =
-            (state.raw_scale * factor).clamp(rest_scale / MAX_ZOOM_IN, root_scale * MAX_ZOOM_OUT);
+        let mut new_scale = (state.raw_scale * factor).max(rest_scale / MAX_ZOOM_IN);
+        if let Some(root) = root_scale {
+            new_scale = new_scale.min(root * MAX_ZOOM_OUT);
+        }
+        if !new_scale.is_finite() {
+            new_scale = state.raw_scale;
+        }
         let anchor = cursor_world.unwrap_or(state.raw_pos);
         state.raw_pos = anchor + (state.raw_pos - anchor) * (new_scale / state.raw_scale);
         state.raw_scale = new_scale;
@@ -551,6 +585,11 @@ pub fn gesture(
         let zoom_goal = state.zoom_start.and_then(|(from, start_ln)| {
             let amount = scale.ln() - start_ln + velocity_ln * ZOOM_LOOKAHEAD;
             let point = cursor_world.unwrap_or(pos - Vec2::new(0.0, BAR_PX / 2.0 * scale));
+            let from = if maker.layouts.contains(from) {
+                from
+            } else {
+                nav.top().node
+            };
             let ladder = zoom_ladder(from, &maker, &window, point);
             if ladder.is_empty() {
                 None
@@ -697,4 +736,56 @@ fn release_velocity(history: &[(Instant, f32, Vec2)]) -> (f32, Vec2) {
         (last_ln - first_ln) / seconds,
         (last_pos - first_pos) / seconds,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rebase_preserves_gesture_and_momentum_in_screen_units() {
+        let old = Rect::from_center_size(Vec2::new(100.0, -80.0), Vec2::splat(20.0));
+        let new = crate::layout::anchor_body();
+        let rebase = crate::layout::Rebase::new(old, new).unwrap();
+        let pos = Vec2::new(101.0, -82.0);
+        let scale = 0.125_f32;
+        let now = Instant::now();
+        let mut gesture = Gesture {
+            raw_pos: pos,
+            raw_scale: scale,
+            history: vec![(now, scale.ln(), pos)],
+            zoom_start: Some((3, scale.ln())),
+            coast: Some(Coast {
+                velocity: Vec2::new(2.0, -3.0),
+                velocity_ln: 0.3,
+                last: now,
+                parent_scene: None,
+                zoom_goal: Some(super::super::zoom_levels::ZoomGoal {
+                    node: 3,
+                    scale,
+                    grid: true,
+                }),
+                pan_goal: Some(PanGoal::Grid(pos + Vec2::ONE)),
+            }),
+            ..default()
+        };
+        gesture.rebase(rebase);
+        assert_eq!(
+            (gesture.raw_pos - new.center()) / gesture.raw_scale,
+            (pos - old.center()) / scale
+        );
+        assert!((gesture.history[0].1.exp() - gesture.raw_scale).abs() < 0.0001);
+        assert_eq!(gesture.history[0].2, gesture.raw_pos);
+        assert_eq!(gesture.zoom_start.unwrap().1, gesture.history[0].1);
+        let coast = gesture.coast.unwrap();
+        assert_eq!(
+            coast.velocity / gesture.raw_scale,
+            Vec2::new(2.0, -3.0) / scale
+        );
+        assert_eq!(coast.velocity_ln, 0.3);
+        assert_eq!(coast.zoom_goal.unwrap().scale, gesture.raw_scale);
+        assert!(
+            matches!(coast.pan_goal, Some(PanGoal::Grid(p)) if p == rebase.position(pos + Vec2::ONE))
+        );
+    }
 }
