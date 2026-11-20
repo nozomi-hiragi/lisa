@@ -26,15 +26,40 @@ pub struct DrawContext<'a, 'b, 'w, 's> {
     /// 紙の元の色。
     pub paper: Color,
     pub z: f32,
-    /// 裏で読めた画像と、その縦横（まだ・読めないときは None）。
-    pub loaded: Option<(Handle<Image>, UVec2)>,
+    /// 裏で読めたもの（まだ・読めないときは None）。
+    pub loaded: Option<Preview>,
 }
 
-/// カートリッジが裏で読んだ小さな RGBA の絵。
-pub struct LoadedPreview {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
+/// 読めて、描くときに引けるプレビュー。
+#[derive(Clone)]
+pub enum Preview {
+    /// 絵と、その縦横。
+    Image(Handle<Image>, UVec2),
+    /// テキストの先頭の行。
+    Text(Arc<Vec<String>>),
+}
+
+/// カートリッジが裏で読んだもの。
+pub enum LoadedPreview {
+    /// 小さな RGBA の絵。
+    Image {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    /// テキストの先頭の行。
+    Text { lines: Vec<String> },
+}
+
+impl LoadedPreview {
+    /// RGBA の絵の縦横（テキストなら None）。
+    #[cfg(test)]
+    pub fn size(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Image { width, height, .. } => Some((*width, *height)),
+            Self::Text { .. } => None,
+        }
+    }
 }
 
 /// ファイルのプレビューを描くカートリッジ。
@@ -162,7 +187,7 @@ pub fn draw(
     frame: Rect,
     background: Color,
     z: f32,
-    loaded: Option<(Handle<Image>, UVec2)>,
+    loaded: Option<Preview>,
 ) {
     let paper = Color::srgb(0.85, 0.87, 0.95);
     let page = over(background, paper, 0.10);
@@ -295,7 +320,7 @@ type Done = (PreviewKey, Option<LoadedPreview>);
 pub struct PreviewImages {
     /// パス → 今のファイルの鍵（フォルダを開き直すたびに作り直す）。
     current: HashMap<PathBuf, PreviewKey>,
-    images: HashMap<PreviewKey, (Handle<Image>, UVec2)>,
+    images: HashMap<PreviewKey, Preview>,
     /// 入れた順（上限を超えたら先頭から捨てる）。
     order: VecDeque<PreviewKey>,
     /// 読みを頼んだ鍵（読み中・読めなかったものも含む。捨てるまで頼み直さない）。
@@ -318,6 +343,11 @@ impl Default for PreviewImages {
                         Err(_) => return,
                     };
                     let Ok(job) = job else { return };
+                    // macOS の読み込み（ImageIO・AVFoundation）が返す autorelease のものを、
+                    // 1 枚ごとに解放する（裏のスレッドには自前の autorelease pool が無い）。
+                    #[cfg(target_os = "macos")]
+                    let loaded = objc2::rc::autoreleasepool(|_| job.cartridge.load(&job.key.path));
+                    #[cfg(not(target_os = "macos"))]
                     let loaded = job.cartridge.load(&job.key.path);
                     if loaded.is_none() {
                         warn!("プレビューを読めませんでした: {}", job.key.path.display());
@@ -341,7 +371,7 @@ impl Default for PreviewImages {
 
 impl PreviewImages {
     /// 描くときに引く。読めていれば、絵と縦横。
-    pub fn get(&self, path: &Path) -> Option<(Handle<Image>, UVec2)> {
+    pub fn get(&self, path: &Path) -> Option<Preview> {
         self.images.get(self.current.get(path)?).cloned()
     }
 
@@ -376,25 +406,33 @@ impl PreviewImages {
         }
         let mut changed = false;
         for (key, loaded) in done {
-            let Some(l) = loaded else { continue };
-            if l.rgba.len() != (l.width * l.height * 4) as usize || l.width == 0 || l.height == 0 {
-                continue;
-            }
-            let mut image = Image::new(
-                Extent3d {
-                    width: l.width,
-                    height: l.height,
-                    depth_or_array_layers: 1,
-                },
-                TextureDimension::D2,
-                l.rgba,
-                TextureFormat::Rgba8UnormSrgb,
-                RenderAssetUsages::RENDER_WORLD,
-            );
-            image.texture_view_descriptor = None;
-            let handle = assets.add(image);
-            self.images
-                .insert(key.clone(), (handle, UVec2::new(l.width, l.height)));
+            let preview = match loaded {
+                None => continue,
+                Some(LoadedPreview::Text { lines }) => Preview::Text(Arc::new(lines)),
+                Some(LoadedPreview::Image {
+                    width,
+                    height,
+                    rgba,
+                }) => {
+                    if rgba.len() != (width * height * 4) as usize || width == 0 || height == 0 {
+                        continue;
+                    }
+                    let mut image = Image::new(
+                        Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                        TextureDimension::D2,
+                        rgba,
+                        TextureFormat::Rgba8UnormSrgb,
+                        RenderAssetUsages::RENDER_WORLD,
+                    );
+                    image.texture_view_descriptor = None;
+                    Preview::Image(assets.add(image), UVec2::new(width, height))
+                }
+            };
+            self.images.insert(key.clone(), preview);
             self.order.push_back(key);
             changed = true;
         }
