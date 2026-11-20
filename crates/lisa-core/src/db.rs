@@ -603,6 +603,11 @@ impl Db {
         Ok(())
     }
 
+    /// `begin` してまだ確定していないか。
+    pub fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
     /// まとめて書いたものを確定する。
     pub fn commit(&mut self) -> Result<()> {
         if self.in_transaction {

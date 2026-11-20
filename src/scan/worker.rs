@@ -480,6 +480,14 @@ impl Worker {
             if background.rest() == Rest::No {
                 return true;
             }
+            // 休む間は書き込みの鍵を手放す（ほかのつなぎの名前の変更などを待たせない）。
+            if self.db.as_ref().is_some_and(Db::in_transaction) {
+                if let Some(Err(error)) = self.db.as_mut().map(Db::commit) {
+                    warn!("DB に確定できませんでした: {error}");
+                } else if !self.send(Message::Committed) {
+                    return false;
+                }
+            }
             match self.requests.recv_timeout(NAP) {
                 Ok(request) => {
                     if !self.handle(request) {
