@@ -16,6 +16,7 @@ use crate::catalog::CatalogView;
 use crate::dups::Dups;
 use crate::lan::PairBanner;
 use crate::organize::{ConfirmPurge, OrganizeState, PendingPlan, PlanDetails};
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::JumpTo;
 use crate::ui::menu::BAR_PX;
@@ -26,21 +27,24 @@ pub const PANEL_PX: f32 = 380.0;
 /// 許可ポップアップに出す危ない操作の最大件数。
 const MAX_SHOWN_RISKY: usize = 20;
 
-const PANEL_COLOR: Color = Color::srgb(0.11, 0.11, 0.14);
-const POPUP_COLOR: Color = Color::srgba(0.13, 0.13, 0.16, 0.96);
-const POPUP_BORDER: Color = Color::srgb(0.28, 0.28, 0.35);
-const ROW_COLOR: Color = Color::srgb(0.16, 0.16, 0.2);
-const SELECTED_COLOR: Color = Color::srgb(0.22, 0.22, 0.28);
-const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
-const ALLOW_COLOR: Color = Color::srgb(0.22, 0.38, 0.28);
-const WARN_BTN_COLOR: Color = Color::srgb(0.42, 0.33, 0.18);
-const REJECT_COLOR: Color = Color::srgb(0.42, 0.22, 0.24);
-const ACTIVE_BTN_COLOR: Color = Color::srgb(0.32, 0.28, 0.18);
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const DIM_COLOR: Color = Color::srgb(0.6, 0.6, 0.66);
-const RISKY_COLOR: Color = Color::srgb(0.95, 0.45, 0.42);
-const OK_COLOR: Color = Color::srgb(0.55, 0.85, 0.62);
-const ACCENT: Color = Color::srgb(0.949, 0.784, 0.443);
+const PANEL_COLOR: Color = palette::BASE_100;
+const POPUP_COLOR: Color = palette::base_100_alpha(0.96);
+const POPUP_BORDER: Color = palette::NEUTRAL;
+const ROW_COLOR: Color = palette::BASE_200;
+const SELECTED_COLOR: Color = palette::NEUTRAL;
+const BUTTON_COLOR: Color = palette::NEUTRAL;
+const ALLOW_COLOR: Color = palette::SUCCESS;
+const ALLOW_TEXT_COLOR: Color = palette::SUCCESS_CONTENT;
+const WARN_BTN_COLOR: Color = palette::WARNING;
+const WARN_BTN_TEXT_COLOR: Color = palette::WARNING_CONTENT;
+const REJECT_COLOR: Color = palette::ERROR;
+const REJECT_TEXT_COLOR: Color = palette::ERROR_CONTENT;
+const ACTIVE_BTN_COLOR: Color = palette::ACCENT_CONTENT;
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const DIM_COLOR: Color = palette::MUTED;
+const RISKY_COLOR: Color = palette::ERROR;
+const OK_COLOR: Color = palette::SUCCESS;
+const ACCENT: Color = palette::WARNING;
 
 /// すべり出しにかける時間（秒）。
 const SLIDE_SECONDS: f32 = 0.22;
@@ -470,7 +474,7 @@ fn build_approval_popup(
                         align_self: AlignSelf::Stretch,
                         ..default()
                     },
-                    BackgroundColor(Color::srgba(0.32, 0.12, 0.13, 0.65)),
+                    BackgroundColor(palette::ERROR_CONTENT.with_alpha(0.85)),
                 ))
                 .with_children(|box_node| {
                     box_node.spawn((
@@ -528,7 +532,7 @@ fn build_approval_popup(
                     children![(
                         Text::new(if busy { "実行中…" } else { "許可" }),
                         text_font.clone(),
-                        TextColor(TEXT_COLOR)
+                        TextColor(ALLOW_TEXT_COLOR)
                     )],
                 ))
                 .observe(
@@ -554,7 +558,7 @@ fn build_approval_popup(
                         children![(
                             Text::new("危ないものを除いて許可"),
                             text_font.clone(),
-                            TextColor(TEXT_COLOR)
+                            TextColor(WARN_BTN_TEXT_COLOR)
                         )],
                     ))
                     .observe(
@@ -577,7 +581,11 @@ fn build_approval_popup(
                         ..default()
                     },
                     BackgroundColor(REJECT_COLOR),
-                    children![(Text::new("断る"), text_font.clone(), TextColor(TEXT_COLOR))],
+                    children![(
+                        Text::new("断る"),
+                        text_font.clone(),
+                        TextColor(REJECT_TEXT_COLOR)
+                    )],
                 ))
                 .observe(
                     move |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
@@ -607,7 +615,11 @@ fn build_approval_popup(
                             "場所を見る"
                         }),
                         text_font.clone(),
-                        TextColor(if highlighted { ACCENT } else { TEXT_COLOR })
+                        TextColor(if highlighted {
+                            palette::ACCENT
+                        } else {
+                            TEXT_COLOR
+                        })
                     )],
                 ))
                 .observe(
@@ -739,7 +751,7 @@ fn fill_panel(
                 ..default()
             })
             .insert((
-                BackgroundColor(Color::srgba(0.32, 0.12, 0.13, 0.75)),
+                BackgroundColor(palette::ERROR_CONTENT.with_alpha(0.85)),
                 BorderColor::all(RISKY_COLOR),
             ))
             .with_children(|box_node| {
@@ -758,7 +770,7 @@ fn fill_panel(
                                     ..default()
                                 },
                                 BackgroundColor(REJECT_COLOR),
-                                children![(Text::new("送る"), small.clone(), TextColor(TEXT_COLOR))],
+                                children![(Text::new("送る"), small.clone(), TextColor(REJECT_TEXT_COLOR))],
                             ))
                             .observe(
                                 move |mut click: On<PointerClick>,
@@ -974,7 +986,7 @@ fn spawn_plan_card(
                             children![(
                                 Text::new("ゴミ箱へ送る"),
                                 small.clone(),
-                                TextColor(TEXT_COLOR)
+                                TextColor(REJECT_TEXT_COLOR)
                             )],
                         ))
                         .observe(
@@ -1109,11 +1121,11 @@ fn plan_state_label(state: PlanState) -> &'static str {
 
 fn plan_state_color(state: PlanState) -> Color {
     match state {
-        PlanState::Pending | PlanState::Approved | PlanState::Running => ACCENT,
+        PlanState::Pending | PlanState::Approved | PlanState::Running => palette::ACCENT,
         PlanState::Done => OK_COLOR,
-        PlanState::Partial => Color::srgb(0.95, 0.72, 0.4),
+        PlanState::Partial => palette::WARNING,
         PlanState::Rejected | PlanState::Cancelled | PlanState::Expired => DIM_COLOR,
-        PlanState::Undone => Color::srgb(0.65, 0.78, 0.95),
+        PlanState::Undone => palette::INFO,
     }
 }
 

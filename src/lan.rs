@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 
 use crate::layout::Layouts;
 use crate::model::tree::{FileTree, LoadState, NodeId, RemoteDrive};
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::TreeChanged;
 use crate::settings::Settings;
@@ -58,12 +59,14 @@ const FETCH_PER_FRAME: usize = 16;
 /// 同時に頼んでおく数の上限。多すぎると相手が接続を切ることがあった（Windows で 10054 が並んだ）。
 const MAX_IN_FLIGHT: usize = 6;
 
-const PANEL_COLOR: Color = Color::srgba(0.13, 0.13, 0.16, 0.95);
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const DIM_COLOR: Color = Color::srgb(0.6, 0.6, 0.66);
-const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
-const ALLOW_COLOR: Color = Color::srgb(0.22, 0.38, 0.28);
-const REJECT_COLOR: Color = Color::srgb(0.42, 0.22, 0.24);
+const PANEL_COLOR: Color = palette::base_100_alpha(0.95);
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const DIM_COLOR: Color = palette::MUTED;
+const BUTTON_COLOR: Color = palette::NEUTRAL;
+const ALLOW_COLOR: Color = palette::SUCCESS;
+const ALLOW_TEXT_COLOR: Color = palette::SUCCESS_CONTENT;
+const REJECT_COLOR: Color = palette::ERROR;
+const REJECT_TEXT_COLOR: Color = palette::ERROR_CONTENT;
 
 /// 自分が覚えておく相手（`peers.json` の 1 行）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1545,7 +1548,7 @@ fn spawn_lan_ui(
                             children![(
                                 Text::new("許可"),
                                 text_font.clone(),
-                                TextColor(TEXT_COLOR)
+                                TextColor(ALLOW_TEXT_COLOR)
                             )],
                         ))
                         .observe(
@@ -1610,7 +1613,7 @@ fn spawn_lan_ui(
                             children![(
                                 Text::new("断る"),
                                 text_font.clone(),
-                                TextColor(TEXT_COLOR)
+                                TextColor(REJECT_TEXT_COLOR)
                             )],
                         ))
                         .observe(

@@ -8,6 +8,7 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
 use crate::preview::{Cartridge, DrawContext, LoadedPreview, Preview, extension};
+use crate::render::palette;
 use crate::render::shapes::{em_width, over};
 
 pub struct Text;
@@ -60,7 +61,6 @@ impl Cartridge for Text {
             let widest = lines.iter().map(|l| em_width(l)).fold(1.0, f32::max);
             // 全部の行を同じ大きさにして、いちばん長い行が紙に収まるようにする。
             let height = (pitch * 0.8).min(inner.width() * 0.95 / widest);
-            let color = over(ctx.page, Color::srgb(0.8, 0.8, 0.85), 0.8);
             for (i, line) in lines.iter().enumerate() {
                 if line.trim().is_empty() {
                     continue;
@@ -71,7 +71,7 @@ impl Cartridge for Text {
                     Anchor::TOP_LEFT,
                     height,
                     f32::MAX / 4.0,
-                    color,
+                    palette::BASE_300,
                     ctx.z,
                 );
             }
@@ -91,7 +91,7 @@ pub fn grey_lines(ctx: &mut DrawContext<'_, '_, '_, '_>) {
         let width = inner.width() * [1.0, 0.92, 0.97, 0.85, 0.95, 0.6][i];
         ctx.painter.rect(
             Rect::new(inner.min.x, top - line_h, inner.min.x + width, top),
-            over(ctx.page, Color::srgb(0.8, 0.8, 0.85), 0.35),
+            over(ctx.page, palette::NEUTRAL, 0.9),
             ctx.z,
         );
     }

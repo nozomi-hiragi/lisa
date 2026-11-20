@@ -19,13 +19,12 @@ use bevy::window::RequestRedraw;
 use crate::model::tree::LoadState;
 use crate::preview::{self, PreviewRegistry};
 use crate::render::ear::{self, Size, Slot};
+use crate::render::palette;
 use crate::render::scene::{BACKGROUND, FolderPreview, OVERLAY_LAYER};
 use crate::render::shapes::{Painter, over};
 
 /// 失敗の赤（パレットの error）。
-const ERROR: Color = Color::srgb(0.941, 0.478, 0.478);
-/// 読み込み中の点の色（パレットの accent）。
-const SPINNER_COLOR: Color = Color::srgb_u8(168, 230, 255);
+const ERROR: Color = palette::ERROR;
 const SPINNER_SECONDS: f64 = 0.95;
 const SPINNER_DOTS: usize = 12;
 /// 古いときに重ねる暗い膜の不透明度。
@@ -60,7 +59,7 @@ pub fn draw_file(
     match state {
         LoadState::Unloaded => {
             outline(painter, frame, background, z);
-            ellipsis(painter, frame, background, z + 0.1);
+            ellipsis(painter, frame, z + 0.1);
         }
         LoadState::Loading => {
             outline(painter, frame, background, z);
@@ -122,7 +121,7 @@ pub(crate) fn draw_folder(
     live: bool,
 ) {
     let color = match state {
-        LoadState::Unloaded => color.with_alpha(0.65),
+        LoadState::Unloaded => palette::MUTED.with_alpha(0.8),
         LoadState::Failed => ERROR,
         _ => color,
     };
@@ -153,7 +152,7 @@ pub(crate) fn draw_folder(
         .entity(painter.parent)
         .insert(FolderPreview);
     match body {
-        FolderBodyState::UnloadedDots => ellipsis(painter, slot.body, color, z + 0.11),
+        FolderBodyState::UnloadedDots => ellipsis(painter, slot.body, z + 0.11),
         FolderBodyState::LoadingSpinner => spinner(painter, slot.body, z + 0.1),
         FolderBodyState::Failed => painter.text(
             "×".to_string(),
@@ -170,8 +169,8 @@ pub(crate) fn draw_folder(
 }
 
 /// 枠だけ。中は下の色のまま。
-fn outline(painter: &mut Painter, frame: Rect, background: Color, z: f32) {
-    let color = over(background, Color::WHITE, 0.22);
+fn outline(painter: &mut Painter, frame: Rect, _background: Color, z: f32) {
+    let color = palette::MUTED;
     let w = (frame.height() * 0.025).max(painter.scale * 1.5);
     let (min, max) = (frame.min, frame.max);
     for rect in [
@@ -191,9 +190,9 @@ fn ellipsis_geometry(frame: Rect) -> ([Vec2; 3], f32) {
     ([center - step, center, center + step], short_side * 0.045)
 }
 
-fn ellipsis(painter: &mut Painter, frame: Rect, color: Color, z: f32) {
+fn ellipsis(painter: &mut Painter, frame: Rect, z: f32) {
     let (dots, radius) = ellipsis_geometry(frame);
-    let color = over(color, Color::WHITE, 0.55).with_alpha(0.7);
+    let color = palette::MUTED;
     for dot in dots {
         painter.circle(dot, radius, color, z);
     }
@@ -215,6 +214,7 @@ fn spinner(painter: &mut Painter, frame: Rect, z: f32) {
         ))
         .id();
     let short_side = frame.size().min_element();
+    let spinner_color = palette::loading_color();
     for index in 0..SPINNER_DOTS {
         let fraction = index as f32 / SPINNER_DOTS as f32;
         let angle = FRAC_PI_2 + fraction * TAU;
@@ -223,7 +223,7 @@ fn spinner(painter: &mut Painter, frame: Rect, z: f32) {
         painter.circle(
             offset,
             short_side * 0.025,
-            SPINNER_COLOR.with_alpha(alpha),
+            spinner_color.with_alpha(alpha),
             0.0,
         );
     }

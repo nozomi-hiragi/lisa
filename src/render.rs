@@ -2,6 +2,7 @@
 pub mod cache;
 pub mod diag;
 pub mod ear;
+pub mod palette;
 pub mod scene;
 pub mod shapes;
 pub mod status;

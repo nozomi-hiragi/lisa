@@ -19,6 +19,7 @@ use bevy::window::{PrimaryWindow, RequestRedraw};
 
 use crate::layout::Layouts;
 use crate::model::tree::{FileTree, NodeId};
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::ui::menu::MenuSystems;
 use crate::ui::tooltip::{
@@ -26,11 +27,11 @@ use crate::ui::tooltip::{
 };
 use crate::view::{MainCamera, Nav};
 
-const PANEL_COLOR: Color = Color::srgb(0.11, 0.11, 0.14);
-const BORDER_COLOR: Color = Color::srgb(0.26, 0.26, 0.32);
-const HOVER_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const DISABLED_COLOR: Color = Color::srgb(0.45, 0.45, 0.5);
+const PANEL_COLOR: Color = palette::BASE_100;
+const BORDER_COLOR: Color = palette::NEUTRAL;
+const HOVER_COLOR: Color = palette::NEUTRAL;
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const DISABLED_COLOR: Color = palette::MUTED;
 
 pub struct ContextMenuPlugin;
 

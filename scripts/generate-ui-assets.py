@@ -6,19 +6,19 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 OUTPUT = Path(__file__).resolve().parents[1] / "assets" / "ui"
-PLATE = (10, 20, 31, 120)
+PLATE = (28, 29, 32, 160)
 RAIL = (255, 255, 255, 230)
-INNER = (223, 246, 255, 100)
+INNER = (255, 255, 255, 100)
 
 
 def background():
     size = 256
     grid = Image.new("RGBA", (size, size))
     draw = ImageDraw.Draw(grid)
-    draw.line((0, 0, size - 1, 0), fill=(24, 72, 98, 130))
-    draw.line((0, 0, 0, size - 1), fill=(24, 72, 98, 130))
+    draw.line((0, 0, size - 1, 0), fill=(30, 32, 36, 120))
+    draw.line((0, 0, 0, size - 1), fill=(30, 32, 36, 120))
     center = size // 2
-    cross = (85, 175, 205, 136)
+    cross = (80, 100, 120, 130)
     draw.line((center - 5, center, center + 5, center), fill=cross)
     draw.line((center, center - 5, center, center + 5), fill=cross)
     return grid

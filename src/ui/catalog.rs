@@ -19,6 +19,7 @@ use lisa_core::catalog::{Role, State};
 use crate::catalog::{CatalogView, Hit};
 use crate::dups::Dups;
 use crate::model::tree::FileTree;
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::JumpTo;
 use crate::ui::menu::BAR_PX;
@@ -27,13 +28,13 @@ use crate::view::Nav;
 /// パネルの幅（論理ピクセル）。
 pub const PANEL_PX: f32 = 380.0;
 
-const PANEL_COLOR: Color = Color::srgb(0.11, 0.11, 0.14);
-const ROW_COLOR: Color = Color::srgb(0.16, 0.16, 0.2);
-const SELECTED_COLOR: Color = Color::srgb(0.22, 0.22, 0.28);
-const CHIP_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const DIM_COLOR: Color = Color::srgb(0.6, 0.6, 0.66);
-const ERROR_COLOR: Color = Color::srgb(0.95, 0.55, 0.5);
+const PANEL_COLOR: Color = palette::BASE_100;
+const ROW_COLOR: Color = palette::BASE_200;
+const SELECTED_COLOR: Color = palette::NEUTRAL;
+const CHIP_COLOR: Color = palette::NEUTRAL;
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const DIM_COLOR: Color = palette::MUTED;
+const ERROR_COLOR: Color = palette::ERROR;
 /// すべり出しにかける時間（秒）。
 const SLIDE_SECONDS: f32 = 0.22;
 /// 1 回のホイールで動かす量（行単位のとき）。

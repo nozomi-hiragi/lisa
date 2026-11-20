@@ -3,7 +3,7 @@
 use bevy::sprite::Anchor;
 
 use crate::preview::{Cartridge, DrawContext, extension};
-use crate::render::shapes::over;
+use crate::render::palette;
 
 pub struct Other;
 
@@ -33,7 +33,7 @@ impl Cartridge for Other {
             Anchor::CENTER,
             ctx.inner.height() * 0.4,
             ctx.inner.width(),
-            over(ctx.page, ctx.paper, 0.5),
+            palette::BASE_300,
             ctx.z,
         );
     }
