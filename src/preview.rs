@@ -13,6 +13,7 @@ use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
+use crate::render::palette;
 use crate::render::shapes::{Painter, over};
 
 /// カートリッジが紙の内側を描くための材料。
@@ -23,8 +24,6 @@ pub struct DrawContext<'a, 'b, 'w, 's> {
     pub inner: Rect,
     /// 紙の色（背景に重ねた結果）。
     pub page: Color,
-    /// 紙の元の色。
-    pub paper: Color,
     pub z: f32,
     /// 裏で読めたもの（まだ・読めないときは None）。
     pub loaded: Option<Preview>,
@@ -234,34 +233,56 @@ pub fn draw(
     let cartridge = registry.pick(name);
     let portrait_a4 = cartridge.portrait_a4();
     let (paper_rect, inner) = preview_geometry(frame, portrait_a4, loaded.as_ref());
-    let paper = Color::srgb(0.85, 0.87, 0.95);
-    let page = over(background, paper, 0.10);
-    if let Some(frame) = paper_rect {
-        let fold = over(background, paper, 0.22);
+    let file_accent = palette::file_color();
+    let base = over(background, palette::BASE_100, 0.80);
+    let page = over(base, file_accent, 0.55);
+    if let Some(paper_frame) = paper_rect {
+        let fold = over(base, file_accent, 0.88);
+        let border = over(page, file_accent, 0.38);
+        let border_w = (frame.height() * 0.015).max(painter.scale);
         let c = if portrait_a4 {
-            frame.size().min_element() * 0.22
+            paper_frame.size().min_element() * 0.22
         } else {
-            frame.height() * 0.15
+            paper_frame.height() * 0.15
         };
         painter.rect(
-            Rect::new(frame.min.x, frame.min.y, frame.max.x - c, frame.max.y),
+            Rect::new(
+                paper_frame.min.x,
+                paper_frame.min.y,
+                paper_frame.max.x - c,
+                paper_frame.max.y,
+            ),
             page,
             z,
         );
         painter.rect(
-            Rect::new(frame.max.x - c, frame.min.y, frame.max.x, frame.max.y - c),
+            Rect::new(
+                paper_frame.max.x - c,
+                paper_frame.min.y,
+                paper_frame.max.x,
+                paper_frame.max.y - c,
+            ),
             page,
             z,
         );
         painter.triangle(
             [
-                Vec2::new(frame.max.x - c, frame.max.y),
-                Vec2::new(frame.max.x - c, frame.max.y - c),
-                Vec2::new(frame.max.x, frame.max.y - c),
+                Vec2::new(paper_frame.max.x - c, paper_frame.max.y),
+                Vec2::new(paper_frame.max.x - c, paper_frame.max.y - c),
+                Vec2::new(paper_frame.max.x, paper_frame.max.y - c),
             ],
             fold,
             z,
         );
+        let (min, max) = (paper_frame.min, paper_frame.max);
+        for rect in [
+            Rect::new(min.x, min.y, max.x, min.y + border_w),
+            Rect::new(min.x, min.y + border_w, min.x + border_w, max.y),
+            Rect::new(min.x + border_w, max.y - border_w, max.x - c, max.y),
+            Rect::new(max.x - border_w, min.y + border_w, max.x, max.y - c),
+        ] {
+            painter.rect(rect, border, z + 0.02);
+        }
     }
 
     let mut ctx = DrawContext {
@@ -269,7 +290,6 @@ pub fn draw(
         name,
         inner,
         page,
-        paper,
         z: z + 0.05,
         loaded,
     };
@@ -527,6 +547,51 @@ mod tests {
                 preview_geometry(frame, portrait, Some(&image)),
                 (None, frame)
             );
+        }
+    }
+
+    #[test]
+    fn loaded_image_pdf_and_video_draw_without_paper_or_border() {
+        let mut registry = PreviewRegistry::default();
+        cartridges::register(&mut registry);
+        let mut world = World::new();
+        let theme = crate::render::shapes::UiThemeAssets::load(&mut Assets::default());
+        let mut meshes = Assets::default();
+        let mut materials = Assets::default();
+        let mut images = Assets::default();
+        let thumbnail = images.add(Image::default());
+        let frame = Rect::new(10.0, 20.0, 170.0, 140.0);
+
+        for (name, expected_parts) in [("photo.png", 1), ("document.pdf", 1), ("clip.mp4", 2)] {
+            let parent = world.spawn_empty().id();
+            draw(
+                &registry,
+                &mut Painter {
+                    commands: &mut world.commands(),
+                    meshes: &mut meshes,
+                    materials: &mut materials,
+                    parent,
+                    layer: default(),
+                    scale: 1.0,
+                    font: default(),
+                    theme: &theme,
+                    no_cull: false,
+                },
+                name,
+                frame,
+                palette::BASE_200,
+                0.0,
+                Some(Preview::Image(thumbnail.clone(), UVec2::new(160, 90))),
+            );
+            world.flush();
+
+            let children = world.get::<Children>(parent).unwrap();
+            assert_eq!(children.len(), expected_parts, "{name}");
+            let sprite = world.get::<Sprite>(children[0]).unwrap();
+            assert_eq!(sprite.image, thumbnail, "{name}");
+            if expected_parts == 2 {
+                assert!(world.get::<Mesh2d>(children[1]).is_some(), "{name}");
+            }
         }
     }
 

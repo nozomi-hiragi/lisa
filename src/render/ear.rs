@@ -210,7 +210,7 @@ pub fn draw_folder(
             slot,
             size,
             name,
-            Color::srgb_u8(230, 247, 255),
+            crate::render::palette::BASE_CONTENT,
             z,
             Part::Text,
         );
@@ -407,7 +407,7 @@ pub fn draw_tag(
         z,
         Part::TagBack { name_em },
     );
-    let text = over(color, Color::srgb(0.06, 0.06, 0.08), 0.92);
+    let text = over(color, crate::render::palette::BASE_300, 0.92);
     draw_part(
         painter,
         slot,

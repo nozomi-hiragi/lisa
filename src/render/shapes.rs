@@ -330,13 +330,13 @@ pub fn em_width(text: &str) -> f32 {
 
 /// 耳の画像と同じ色・不透明度を使った本体プレート。
 pub fn hud_plate_color(tint: Color) -> Color {
-    let plate = LinearRgba::from(Color::srgb_u8(10, 20, 31));
+    let plate = LinearRgba::from(crate::render::palette::BASE_100);
     let tint = LinearRgba::from(tint);
     Color::from(LinearRgba::new(
         plate.red * tint.red,
         plate.green * tint.green,
         plate.blue * tint.blue,
-        tint.alpha * (120.0 / 255.0),
+        tint.alpha * (160.0 / 255.0),
     ))
 }
 

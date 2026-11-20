@@ -2,14 +2,16 @@
 
 use bevy::prelude::*;
 
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 
 /// メニューバーの高さ（論理ピクセル）。ズームの目標はこの下の領域に合わせる。
 pub const BAR_PX: f32 = 32.0;
 
-const BAR_COLOR: Color = Color::srgb(0.13, 0.13, 0.16);
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
+const BAR_COLOR: Color = palette::BASE_300;
+const POPUP_COLOR: Color = palette::BASE_100;
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const BUTTON_COLOR: Color = palette::NEUTRAL;
 
 pub struct MenuPlugin;
 
@@ -185,7 +187,7 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                 display: Display::None,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+            BackgroundColor(palette::BASE_300.with_alpha(0.65)),
             GlobalZIndex(20),
         ))
         .observe(|_: On<PointerClick>, mut popup: ResMut<Popup>| {
@@ -202,7 +204,7 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                         border_radius: BorderRadius::all(Val::Px(8.0)),
                         ..default()
                     },
-                    BackgroundColor(BAR_COLOR),
+                    BackgroundColor(POPUP_COLOR),
                 ))
                 // パネルの中を押しても、後ろ（外側）を押したことにはしない。
                 .observe(|mut click: On<PointerClick>| click.propagate(false))

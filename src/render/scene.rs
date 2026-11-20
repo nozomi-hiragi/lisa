@@ -11,11 +11,12 @@ use crate::model::tree::{FileTree, NodeId};
 use crate::preview::PreviewRegistry;
 use crate::render::cache::FolderImages;
 use crate::render::ear::{self, EarSizes};
+use crate::render::palette;
 use crate::render::shapes::{Painter, UiThemeAssets, over};
 use crate::render::status::{self, FolderBodyState};
 use crate::render::tag;
 
-pub const BACKGROUND: Color = Color::srgb_u8(5, 12, 20);
+pub const BACKGROUND: Color = palette::BASE_200;
 
 /// フォルダの枠・中身・耳・プレビューを描くレイヤー（本物の描画とサムネ撮影の両方で映す）。
 pub const CONTENT_LAYER: usize = 0;
@@ -369,7 +370,7 @@ fn draw_children(
                 );
             });
             // 名前はプレビューの下に、同じフォルダの中のフォルダの耳の名前と同じ大きさで書く。
-            let color = Color::WHITE.with_alpha(0.92);
+            let color = palette::BASE_CONTENT.with_alpha(0.92);
             ear::draw_name(painter, slot, size, &child_node.name, color, z);
             mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
@@ -410,8 +411,8 @@ fn mark_catalog(
     painter.layer = prev_layer;
 }
 
-/// 重複の印の色（暖かい黄色。読み込み中の青い光とは別の色）。
-const DUPLICATE: Color = Color::srgb(0.949, 0.784, 0.443);
+/// 重複の印の色（パレットの warning）。
+const DUPLICATE: Color = palette::WARNING;
 
 /// 重複の一覧で選んだ組のコピーなら太い枠と薄い色、コピーを中に含むなら細い枠を描く（`OVERLAY_LAYER`、サムネには入れない）。
 fn mark_duplicate(
@@ -507,18 +508,27 @@ pub(super) fn size_of<'a>(
     }
 }
 
-/// フォルダの枠の色。親の枠の上に、端末の色を薄く重ねる（不透明な色として求める）。
+/// 端末ごとのフォルダ基準色（ローカル端末は `PRIMARY`、LAN の相手端末はパレットの別色で識別する）。
+const DEVICE_COLORS: [Color; 4] = [
+    palette::PRIMARY,
+    palette::ACCENT,
+    palette::INFO,
+    palette::SUCCESS,
+];
+
+/// フォルダの枠の色。親の枠の上に端末の色を重ね、既知の空フォルダは彩度を抑える。
 pub fn folder_color(tree: &FileTree, id: NodeId) -> Color {
     let node = &tree.nodes[id];
     match node.parent {
         None => BACKGROUND,
         Some(parent) => {
-            let hue = [210.0, 140.0, 30.0, 290.0][node.device % 4];
-            over(
-                folder_color(tree, parent),
-                Color::hsl(hue, 0.83, 0.72),
-                0.85,
-            )
+            let device_color = DEVICE_COLORS[node.device % DEVICE_COLORS.len()];
+            let color = over(folder_color(tree, parent), device_color, 0.85);
+            if node.is_dir && node.loaded && node.children.is_empty() {
+                over(palette::NEUTRAL, color, 0.40)
+            } else {
+                color
+            }
         }
     }
 }
@@ -571,5 +581,27 @@ mod tests {
         assert_eq!(drawn_ancestors(&ancestors).collect::<Vec<_>>(), [20, 30]);
         assert_eq!(drawn_ancestors(&ancestors[..2]).collect::<Vec<_>>(), [10]);
         assert_eq!(drawn_ancestors(&ancestors[..1]).count(), 0);
+    }
+
+    #[test]
+    fn local_populated_folder_converges_to_primary_and_empty_is_subdued() {
+        let mut tree = FileTree::deep(4);
+        assert_eq!(folder_color(&tree, FileTree::ROOT), palette::BASE_200);
+        let populated = tree
+            .nodes
+            .iter()
+            .position(|node| node.is_dir && !node.children.is_empty() && node.depth >= 3)
+            .unwrap();
+        let populated_rgb = folder_color(&tree, populated).to_srgba();
+        let primary_rgb = palette::PRIMARY.to_srgba();
+        assert!((populated_rgb.red - primary_rgb.red).abs() < 0.02);
+        assert!((populated_rgb.green - primary_rgb.green).abs() < 0.02);
+        assert!((populated_rgb.blue - primary_rgb.blue).abs() < 0.02);
+
+        tree.nodes[populated].loaded = true;
+        tree.nodes[populated].children.clear();
+        let empty_rgb = folder_color(&tree, populated).to_srgba();
+        assert!(empty_rgb.green < populated_rgb.green);
+        assert!(empty_rgb.red < populated_rgb.red);
     }
 }

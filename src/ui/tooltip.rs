@@ -23,6 +23,7 @@ use lisa_core::db::Db;
 use crate::lan::{LanState, SavedPeer};
 use crate::layout::Layouts;
 use crate::model::tree::{FileTree, LoadState, NodeId};
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::{Store, TreeChanged};
 use crate::ui::context_menu::ContextMenu;
@@ -48,10 +49,10 @@ const MAX_PATH_CHARS: usize = 120;
 /// 長いエラー文は途中を「…」で省く上限。枠が縦に伸びすぎるのを防ぐ。
 const MAX_ERROR_CHARS: usize = 120;
 
-const PANEL_COLOR: Color = Color::srgba(0.09, 0.09, 0.12, 0.96);
-const BORDER_COLOR: Color = Color::srgb(0.26, 0.26, 0.32);
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const DIM_COLOR: Color = Color::srgb(0.6, 0.6, 0.66);
+const PANEL_COLOR: Color = palette::base_100_alpha(0.96);
+const BORDER_COLOR: Color = palette::NEUTRAL;
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const DIM_COLOR: Color = palette::MUTED;
 
 pub struct TooltipPlugin;
 

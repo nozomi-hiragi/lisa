@@ -8,11 +8,12 @@ use bevy::prelude::*;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::ui::menu::{PopupBody, spawn_menu};
 
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const BUTTON_COLOR: Color = Color::srgb(0.22, 0.22, 0.27);
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const BUTTON_COLOR: Color = palette::NEUTRAL;
 
 #[derive(Resource, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]

@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 
+use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::ScanProgress;
 
-const PANEL_COLOR: Color = Color::srgba(0.13, 0.13, 0.16, 0.88);
-const TEXT_COLOR: Color = Color::srgb(0.9, 0.9, 0.92);
-const DIM_COLOR: Color = Color::srgb(0.6, 0.6, 0.66);
+const PANEL_COLOR: Color = palette::base_100_alpha(0.92);
+const TEXT_COLOR: Color = palette::BASE_CONTENT;
+const DIM_COLOR: Color = palette::MUTED;
 /// 書き換える間隔の下限（毎フレーム文字を組み直さないように）。
 const UPDATE_EVERY: Duration = Duration::from_millis(200);
 /// 読み終えてから消すまで。
