@@ -2,6 +2,7 @@
 //!
 //! 許可する道具は作らない。計画の許可は人が Lisa の画面か CLI で行う。
 
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,58 @@ impl Server {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
+        self.create_organize_plan(auth, note, &ops, dry_run)
+    }
+
+    /// 親フォルダを変えない move の計画を作る。
+    pub(super) fn rename(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
+        let new_name = args
+            .get("new_name")
+            .and_then(Value::as_str)
+            .ok_or("new_name が要ります")?;
+        if let Some(path) = args.get("path").and_then(Value::as_str)
+            && !Path::new(path).is_absolute()
+        {
+            return Err("path には絶対パスが必要です".into());
+        }
+        let db = self.db()?;
+        let target = self.target(&db, args)?;
+        if target.chain.len() <= 1 {
+            return Err("ドライブの名前は変更できません".into());
+        }
+        let from = target.path;
+        let to = organize::rename_destination(&from, new_name)?;
+        if from == to {
+            return Err("変更前と同じ名前です".into());
+        }
+        let default_note = format!(
+            "MCPから名前変更: {} -> {new_name}",
+            from.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let note = args
+            .get("note")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_note);
+        let dry_run = args
+            .get("dry_run")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        drop(db);
+        let mut result =
+            self.create_organize_plan(auth, Some(note), &[OpInput::Move { from, to }], dry_run)?;
+        if result["created"] == true {
+            result["state"] = json!(PlanState::Pending);
+        }
+        Ok(result)
+    }
+
+    fn create_organize_plan(
+        &self,
+        auth: &Auth,
+        note: Option<&str>,
+        ops: &[OpInput],
+        dry_run: bool,
+    ) -> Result<Value, String> {
         let by = match auth {
             Auth::Peer { name, .. } => format!("mcp:{name}"),
             Auth::Token => "mcp:http".to_string(),
@@ -46,7 +99,7 @@ impl Server {
 
         let mut db = self.db()?;
         let ctx = self.organize_context();
-        let res = organize::create_plan(&mut db, &ctx, &by, note, &ops, dry_run)?;
+        let res = organize::create_plan(&mut db, &ctx, &by, note, ops, dry_run)?;
 
         let mut out = serde_json::to_value(&res).map_err(err)?;
         if res.created {
@@ -306,6 +359,7 @@ mod tests {
             .collect();
         for required in [
             "lisa_plan_create",
+            "lisa_rename",
             "lisa_plan_status",
             "lisa_plans",
             "lisa_plan_cancel",
@@ -317,6 +371,72 @@ mod tests {
             !names.iter().any(|n| n.contains("approve")),
             "approve tool must not exist in MCP"
         );
+    }
+
+    #[test]
+    fn mcp_rename_validates_and_creates_a_pending_plan() {
+        let env = Env::new("rename");
+        let path = env.drive.join("old.txt");
+        fs::write(&path, b"old").unwrap();
+        fs::write(env.drive.join("taken.txt"), b"taken").unwrap();
+        env.scan();
+        for name in ["", ".", "..", "a/b", "a\\b", "old.txt"] {
+            let result = env.call("lisa_rename", json!({"path": path, "new_name": name}));
+            assert_eq!(result["isError"], true, "{result}");
+        }
+        let collision = env.call(
+            "lisa_rename",
+            json!({"path": path, "new_name": "taken.txt"}),
+        );
+        assert_eq!(
+            collision["structuredContent"]["created"], false,
+            "{collision}"
+        );
+        assert_eq!(collision["structuredContent"]["summary"]["refused"], 1);
+        let db = env.server.db().unwrap();
+        let id = *lisa_core::query::locate(&db, &path)
+            .unwrap()
+            .unwrap()
+            .chain
+            .last()
+            .unwrap();
+        drop(db);
+        let dry = env.call(
+            "lisa_rename",
+            json!({"id": id, "new_name": "new.txt", "dry_run": true}),
+        );
+        assert_eq!(dry["structuredContent"]["created"], false, "{dry}");
+        assert_eq!(dry["structuredContent"]["dry_run"], true);
+        assert_eq!(dry["structuredContent"]["summary"]["ok"], 1);
+        assert_eq!(dry["structuredContent"]["id"], Value::Null);
+        let result = env.call("lisa_rename", json!({"path": path, "new_name": "new.txt"}));
+        let plan = &result["structuredContent"];
+        assert_eq!(plan["created"], true, "{result}");
+        assert!(plan["id"].is_i64());
+        assert_eq!(plan["state"], "pending");
+        let renamed = env.drive.join("new.txt");
+        assert!(path.exists());
+        assert!(!renamed.exists());
+
+        let plan_id = plan["id"].as_i64().unwrap();
+        let mut db = env.server.db().unwrap();
+        let ctx = env.server.organize_context();
+        let (pending, _) = organize::get_plan(&db, plan_id).unwrap().unwrap();
+        assert_eq!(pending.state, PlanState::Pending);
+        assert_eq!(
+            pending.note.as_deref(),
+            Some("MCPから名前変更: old.txt -> new.txt")
+        );
+        organize::approve_plan(&mut db, plan_id, false).unwrap();
+        let applied = organize::execute_plan(&mut db, &ctx, plan_id).unwrap();
+        assert_eq!(applied.done, 1);
+        assert_eq!(applied.touched_folders, vec![env.drive.clone()]);
+        assert!(!path.exists());
+        assert_eq!(fs::read(&renamed).unwrap(), b"old");
+        let undone = organize::undo_plan(&mut db, &ctx, plan_id).unwrap();
+        assert_eq!(undone.state, PlanState::Undone);
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert!(!renamed.exists());
     }
 
     #[test]

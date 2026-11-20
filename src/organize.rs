@@ -17,10 +17,14 @@ use bevy::prelude::*;
 use bevy::window::RequestRedraw;
 use bevy::winit::{EventLoopProxy, EventLoopProxyWrapper, WinitUserEvent};
 use lisa_core::db::Db;
-use lisa_core::organize::{self, Context, DEFAULT_TRASH_DAYS, OpInput, Plan, PlanOp, PlanState};
+use lisa_core::organize::{
+    self, Context, DEFAULT_TRASH_DAYS, OpInput, OpKind, OpState, Plan, PlanOp, PlanState,
+};
 use lisa_core::query;
 
-use crate::scan::ScanControl;
+use crate::model::tree::FileTree;
+use crate::scan::{ScanControl, Store};
+use crate::view::{Location, Nav};
 
 /// `pending` の計画を見に行く間隔。
 const POLL_EVERY: Duration = Duration::from_secs(2);
@@ -96,6 +100,7 @@ pub struct OrganizeState {
     pub confirming_purge: Option<ConfirmPurge>,
     /// 裏のスレッドで実行・取り消し・掃除が動いているか。
     pub busy: bool,
+    rename_pending: bool,
     /// 一時的なお知らせ（結果やエラー）。
     pub notice: Option<(String, Instant)>,
     sender: Option<Mutex<Sender<Action>>>,
@@ -162,6 +167,24 @@ impl OrganizeState {
         self.send(Action::UserMove { from, dest_dir });
     }
 
+    /// 右クリックの「名前の変更…」で確定した名前を適用する。
+    pub fn user_rename(&mut self, from: PathBuf, new_name: String) -> Result<(), String> {
+        if self.busy || self.rename_pending {
+            return Err("整理処理中です。完了までお待ちください".into());
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .and_then(|sender| sender.lock().ok())
+            .ok_or("今は名前を変更できません")?;
+        sender
+            .send(Action::UserRename { from, new_name })
+            .map_err(|_| "今は名前を変更できません")?;
+        self.rename_pending = true;
+        self.busy = true;
+        Ok(())
+    }
+
     pub fn set_notice(&mut self, message: impl Into<String>) {
         self.notice = Some((message.into(), Instant::now()));
     }
@@ -183,6 +206,7 @@ enum Action {
     LoadDetails { id: i64 },
     UserTrash { path: PathBuf },
     UserMove { from: PathBuf, dest_dir: PathBuf },
+    UserRename { from: PathBuf, new_name: String },
 }
 
 enum Event {
@@ -191,9 +215,19 @@ enum Event {
         history: Vec<Plan>,
     },
     Details(PlanDetails),
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// 移動した（名前の変更も含む）。プレビューの絵を付け替える。
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
+    },
     Touched(Vec<PathBuf>),
     Notice(String),
     Idle,
+    RenameIdle,
 }
 
 fn start_worker(mut state: ResMut<OrganizeState>, proxy: Res<EventLoopProxyWrapper>) {
@@ -212,10 +246,17 @@ fn start_worker(mut state: ResMut<OrganizeState>, proxy: Res<EventLoopProxyWrapp
     }
 }
 
-fn receive_events(
+pub(crate) fn receive_events(
     mut state: ResMut<OrganizeState>,
     mut highlight: ResMut<PlanHighlightChains>,
     control: Option<Res<ScanControl>>,
+    (tree, nav, store, mut location): (
+        Res<FileTree>,
+        Res<Nav>,
+        Option<Res<Store>>,
+        ResMut<Location>,
+    ),
+    mut previews: Option<ResMut<crate::preview::PreviewRegistry>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     let events: Vec<Event> = match &state.receiver {
@@ -245,6 +286,24 @@ fn receive_events(
                     state.selected_details = Some(details);
                 }
             }
+            Event::Moved { from, to } => {
+                if let Some(previews) = previews.as_deref_mut() {
+                    previews.images.moved(&from, &to);
+                }
+            }
+            Event::Renamed { from, to } => {
+                // 表示名は NFC に正規化される。再走査では実パスから新しい entry.id を引く。
+                if let Some(path) =
+                    crate::ui::tooltip::local_item_path(&tree, store.as_deref(), nav.top().node)
+                    && let Ok(suffix) = path.strip_prefix(&from)
+                {
+                    *location = Location::Renamed(if suffix.as_os_str().is_empty() {
+                        to
+                    } else {
+                        to.join(suffix)
+                    });
+                }
+            }
             Event::Touched(folders) => {
                 if let Some(control) = &control {
                     for folder in folders {
@@ -255,6 +314,10 @@ fn receive_events(
             }
             Event::Notice(msg) => {
                 state.set_notice(msg);
+            }
+            Event::RenameIdle => {
+                state.rename_pending = false;
+                state.busy = false;
             }
             Event::Idle => {
                 state.busy = false;
@@ -341,7 +404,11 @@ fn run_worker(
                     if !send(Event::Notice("DB がまだありません".into())) {
                         return;
                     }
-                    send(Event::Idle);
+                    send(if matches!(action, Action::UserRename { .. }) {
+                        Event::RenameIdle
+                    } else {
+                        Event::Idle
+                    });
                     continue;
                 };
                 match action {
@@ -350,6 +417,7 @@ fn run_worker(
                             .and_then(|_| organize::execute_plan(&mut db, &ctx, id))
                         {
                             Ok(report) => {
+                                notify_plan_moves(&db, id, OpState::Done, &send);
                                 if !report.touched_folders.is_empty() {
                                     send(Event::Touched(report.touched_folders));
                                 }
@@ -359,6 +427,7 @@ fn run_worker(
                                 )));
                             }
                             Err(err) => {
+                                warn!("計画 #{id} を実行できませんでした: {err}");
                                 send(Event::Notice(format!(
                                     "計画 #{id} を実行できませんでした: {err}"
                                 )));
@@ -379,6 +448,7 @@ fn run_worker(
                     Action::Undo { id } => {
                         match organize::undo_plan(&mut db, &ctx, id) {
                             Ok(report) => {
+                                notify_plan_moves(&db, id, OpState::Undone, &send);
                                 if !report.touched_folders.is_empty() {
                                     send(Event::Touched(report.touched_folders));
                                 }
@@ -395,6 +465,7 @@ fn run_worker(
                                 send(Event::Notice(notice));
                             }
                             Err(err) => {
+                                warn!("計画 #{id} を取り消せませんでした: {err}");
                                 send(Event::Notice(format!(
                                     "計画 #{id} を取り消せませんでした: {err}"
                                 )));
@@ -456,6 +527,11 @@ fn run_worker(
                     Action::UserTrash { path } => {
                         handle_user_trash(&mut db, &ctx, path, &send);
                         send(Event::Idle);
+                        last_fp = None;
+                    }
+                    Action::UserRename { from, new_name } => {
+                        handle_user_rename(&mut db, &ctx, from, &new_name, &send);
+                        send(Event::RenameIdle);
                         last_fp = None;
                     }
                     Action::UserMove { from, dest_dir } => {
@@ -574,6 +650,7 @@ fn handle_user_move(
                     .and_then(|_| organize::execute_plan(db, ctx, id))
                 {
                     Ok(report) => {
+                        notify_plan_moves(db, id, OpState::Done, send);
                         if !report.touched_folders.is_empty() {
                             send(Event::Touched(report.touched_folders));
                         }
@@ -582,6 +659,7 @@ fn handle_user_move(
                         )));
                     }
                     Err(err) => {
+                        warn!("右クリックからの移動（計画 #{id}）に失敗しました: {err}");
                         send(Event::Notice(format!("移動できませんでした: {err}")));
                     }
                 }
@@ -593,12 +671,104 @@ fn handle_user_move(
                 .first()
                 .map(|c| c.check.as_str())
                 .unwrap_or("断られました");
+            warn!("右クリックからの移動を断られました（{label}）: {reason}");
             send(Event::Notice(format!("移動できません: {reason}")));
         }
         Err(err) => {
+            warn!("右クリックからの移動の計画を作れませんでした（{label}）: {err}");
             send(Event::Notice(format!("移動できません: {err}")));
         }
     }
+}
+
+/// 計画で動いたものを知らせる（プレビューの付け替え。親が同じなら名前の変更として場所も追う）。
+fn notify_plan_moves(db: &Db, id: i64, state: OpState, send: &impl Fn(Event) -> bool) {
+    let Ok(ops) = organize::plan_ops(db, id) else {
+        return;
+    };
+    for op in ops {
+        if op.op != OpKind::Move || op.state != state {
+            continue;
+        }
+        let Some(dst) = op.dst else {
+            continue;
+        };
+        let renamed = dst.parent() == op.src.parent();
+        let (from, to) = if state == OpState::Undone {
+            (dst, op.src)
+        } else {
+            (op.src, dst)
+        };
+        // ファイルシステムが名前を正規化した場合は、実際に保存された綴りを使う。
+        let to = if to.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+            to.canonicalize()
+                .ok()
+                .and_then(|path| path.file_name().map(|name| to.with_file_name(name)))
+                .unwrap_or(to)
+        } else {
+            to
+        };
+        send(Event::Moved {
+            from: from.clone(),
+            to: to.clone(),
+        });
+        if renamed {
+            send(Event::Renamed { from, to });
+        }
+    }
+}
+
+fn handle_user_rename(
+    db: &mut Db,
+    ctx: &Context,
+    from: PathBuf,
+    new_name: &str,
+    send: &impl Fn(Event) -> bool,
+) {
+    let label = from.display().to_string();
+    let result = (|| {
+        let to = organize::rename_destination(&from, new_name)?;
+        let old_name = from.file_name().unwrap_or_default().to_string_lossy();
+        let note = format!("右クリックから名前変更: {old_name} -> {new_name}");
+        let res = organize::create_plan(
+            db,
+            ctx,
+            "user",
+            Some(&note),
+            &[OpInput::Move { from, to }],
+            false,
+        )?;
+        let id = res.id.ok_or_else(|| {
+            res.checks
+                .first()
+                .map(|c| c.check.clone())
+                .unwrap_or_else(|| "断られました".into())
+        })?;
+        if res.summary.risky > 0 {
+            return Ok(format!("名前の変更には確認が必要です（計画 #{id}）"));
+        }
+        organize::approve_plan(db, id, false)?;
+        let report = organize::execute_plan(db, ctx, id)?;
+        if report.done != 0 {
+            notify_plan_moves(db, id, OpState::Done, send);
+        }
+        if !report.touched_folders.is_empty() {
+            send(Event::Touched(report.touched_folders));
+        }
+        if report.done == 0 {
+            return Err(format!(
+                "計画 #{id} の実行に失敗しました。整理履歴を確認してください"
+            ));
+        }
+        Ok(format!(
+            "「{new_name}」に名前を変更しました（計画 #{id}。取り消せます）"
+        ))
+    })();
+    let notice = result.unwrap_or_else(|e| {
+        warn!("名前を変更できませんでした（{label} -> {new_name}）: {e}");
+        format!("名前を変更できません: {e}")
+    });
+    send(Event::Notice(notice));
 }
 
 fn run_daily_purge(db: &mut Db, data_dir: &Path, settings_path: Option<&Path>) {
@@ -715,4 +885,25 @@ fn open_env() -> Option<(Db, Context, Option<PathBuf>)> {
     let settings = crate::settings::settings_path();
     let ctx = Context::load(data_dir, settings.as_deref());
     Some((db, ctx, settings))
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn only_one_rename_can_be_queued_until_it_finishes() {
+        let mut state = OrganizeState::default();
+        let path = PathBuf::from("before.txt");
+        assert!(state.user_rename(path.clone(), "after.txt".into()).is_err());
+        assert!(!state.busy);
+
+        let (tx, rx) = channel();
+        state.sender = Some(Mutex::new(tx));
+        assert!(state.user_rename(path.clone(), "after.txt".into()).is_ok());
+        assert!(matches!(rx.try_recv(), Ok(Action::UserRename { .. })));
+        state.busy = false; // 別件の Idle が先に届いても名前変更はまだ完了していない。
+        assert!(state.user_rename(path, "another.txt".into()).is_err());
+        assert!(rx.try_recv().is_err());
+    }
 }

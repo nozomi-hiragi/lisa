@@ -236,7 +236,7 @@ pub fn gesture(
     camera: Single<(&Camera, &GlobalTransform, &mut Transform, &mut Projection), With<MainCamera>>,
     animating: Option<Res<Animating>>,
     mut fades: Query<&mut Fade>,
-    popup: Res<Popup>,
+    (popup, dialog): (Res<Popup>, Option<Res<crate::ui::dialog::DialogState>>),
     banners: Query<&bevy::picking::hover::Hovered, With<crate::lan::PairBanner>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut input: ResMut<TrackpadInput>,
@@ -328,7 +328,8 @@ pub fn gesture(
         || line_zoom != 0.0
         || buttons.just_pressed(MouseButton::Middle);
     let busy = animating.is_some() || !fades.is_empty();
-    if busy && new_input && !popup.open {
+    let dialog_open = dialog.as_ref().is_some_and(|dialog| dialog.busy());
+    if busy && new_input && !popup.open && !dialog_open {
         if let Some(anim) = &animating {
             maker.commands.remove_resource::<Animating>();
             // 着いたら本物に切り替える予定だったなら、今すぐ切り替える。
@@ -360,7 +361,7 @@ pub fn gesture(
             state.middle = window.cursor_position();
         }
         return;
-    } else if busy || (popup.open && !state.active()) {
+    } else if busy || dialog_open || (popup.open && !state.active()) {
         // 切り替えの途中やメニューの操作中は、入力を捨てる。慣性はこの先も使わない。
         if !momentum.is_empty() || lifted_now {
             input.drop_momentum();
