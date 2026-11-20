@@ -12,7 +12,7 @@ use crate::preview::PreviewRegistry;
 use crate::render::cache::FolderImages;
 use crate::render::ear::{self, EarSizes};
 use crate::render::shapes::{Painter, UiThemeAssets, over};
-use crate::render::status;
+use crate::render::status::{self, FolderBodyState};
 use crate::render::tag;
 
 pub const BACKGROUND: Color = Color::srgb_u8(5, 12, 20);
@@ -78,6 +78,56 @@ fn draw_shell(painter: &mut Painter, source: &SceneSource, folder: NodeId, z: f3
 
 /// 裏撮影だけが映すレイヤー。
 pub const CAPTURE_LAYER: usize = 4;
+
+/// 本体の状態が変わったときだけ、一覧の該当タイルを作り直す。
+#[derive(Component)]
+pub(crate) struct FolderDisplay {
+    pub folder: NodeId,
+    pub appearance: Entity,
+    pub body: FolderBodyState,
+    pub load_state: crate::model::tree::LoadState,
+    pub no_cull: bool,
+    pub scale: f32,
+}
+
+pub(crate) fn folder_body(
+    tree: &FileTree,
+    images: &FolderImages,
+    id: NodeId,
+    pending: bool,
+) -> FolderBodyState {
+    let node = &tree.nodes[id];
+    FolderBodyState::new(
+        node.state,
+        images.ready(tree, id),
+        node.loaded && node.children.is_empty(),
+        pending,
+    )
+}
+
+pub(crate) fn draw_folder(
+    painter: &mut Painter,
+    source: &SceneSource,
+    child: NodeId,
+    body: &FolderBodyState,
+    live: bool,
+) {
+    let tree = source.tree;
+    let node = &tree.nodes[child];
+    let slot = slot_of(tree, source.layouts, child);
+    let size = size_of(tree, source.layouts, source.ears, child, live);
+    status::draw_folder(
+        painter,
+        node.state,
+        body,
+        slot,
+        size,
+        &node.name,
+        folder_color(tree, child),
+        node.depth as f32,
+        live,
+    );
+}
 
 #[derive(Component)]
 pub(crate) struct FolderTile {
@@ -269,34 +319,36 @@ fn draw_children(
         );
         if child_node.is_dir {
             let parent = painter.parent;
-            if let Some(scene) = tile_scene {
-                painter.parent = painter
+            let body = folder_body(tree, source.images, child, false);
+            if live {
+                let tile = painter
                     .commands
-                    .spawn((
-                        FolderTile {
-                            scene,
-                            folder: child,
-                        },
-                        ChildOf(parent),
-                        Transform::default(),
-                        Visibility::default(),
-                    ))
+                    .spawn((ChildOf(parent), Transform::default(), Visibility::default()))
                     .id();
+                let appearance = painter
+                    .commands
+                    .spawn((ChildOf(tile), Transform::default(), Visibility::default()))
+                    .id();
+                painter.commands.entity(tile).insert(FolderDisplay {
+                    folder: child,
+                    appearance,
+                    body: body.clone(),
+                    load_state: child_node.state,
+                    no_cull: painter.no_cull,
+                    scale: painter.scale,
+                });
+                if let Some(scene) = tile_scene {
+                    painter.commands.entity(tile).insert(FolderTile {
+                        scene,
+                        folder: child,
+                    });
+                }
+                painter.parent = appearance;
+                draw_folder(painter, source, child, &body, true);
+                painter.parent = tile;
+            } else {
+                draw_folder(painter, source, child, &body, false);
             }
-            let color = folder_color(tree, child);
-            let image = source.images.ready(tree, child);
-            status::draw_folder(
-                painter,
-                child_node.state,
-                child_node.loaded && child_node.children.is_empty(),
-                slot,
-                size,
-                &child_node.name,
-                image,
-                color,
-                z,
-                live,
-            );
             mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
             painter.parent = parent;

@@ -1,6 +1,6 @@
 //! フォルダの中身を画像（サムネ）にキャッシュする。
 //!
-//! 先読みで焼く仕組み（`Bake`）は持たない。フォルダを開いて本物の場面が描かれたら、
+//! フォルダを開いたとき、または中心のフォルダへ寄り始めたときに、
 //! そのフォルダの本体の範囲（耳に譲った後の矩形）を裏撮影専用レイヤーだけ
 //! 映す一時カメラ 1 台で 1024×724 の `Rgba8UnormSrgb` 画像へ撮り、`ReadbackOnce` で読み戻して
 //! WebP に保存し、そのままメモリにも載せる。重複の印・カタログの札や暗い膜・読み込み中のスピナーは
@@ -34,7 +34,8 @@ use crate::render::scene::{self, CAPTURE_LAYER, LabelFont, SceneSource, size_of,
 use crate::render::shapes::UiThemeAssets;
 use crate::settings::Settings;
 use crate::view::{
-    Animating, Fade, Nav, SceneVisit, SyncRequest, WindowOccludedState, ear_spec, fit, scene_path,
+    Animating, CenterApproach, Fade, Nav, SceneVisit, SyncRequest, WindowOccludedState, ear_spec,
+    fit, scene_path,
 };
 
 /// 画像の幅（ピクセル）。高さは本体の縦横比（√2:1）に合わせる。
@@ -368,11 +369,12 @@ pub struct ThumbnailCapture {
     /// 撮影中のカメラ。
     active: Option<ActiveCapture>,
     /// ディスクから読み込み中の枚数。
-    in_flight_reads: usize,
+    in_flight_reads: HashSet<Key>,
+    in_flight_captures: HashSet<Key>,
 }
 
 struct ActiveCapture {
-    visit: u64,
+    visit: Option<u64>,
     folder: NodeId,
     key: Key,
     camera: Entity,
@@ -383,11 +385,22 @@ struct ActiveCapture {
 }
 
 impl ThumbnailCapture {
+    pub(crate) fn is_pending(&self, tree: &FileTree, id: NodeId) -> bool {
+        folder_key(tree, id).is_some_and(|key| {
+            self.in_flight_reads.contains(&key)
+                || self.in_flight_captures.contains(&key)
+                || self.active.as_ref().is_some_and(|active| active.key == key)
+        })
+    }
+
     pub fn status_label(&self) -> String {
         if let Some(a) = &self.active {
             format!("Capturing(f={},rb={})", a.frames, a.readback_sent)
-        } else if self.in_flight_reads > 0 {
-            format!("Loading({})", self.in_flight_reads)
+        } else if !self.in_flight_reads.is_empty() || !self.in_flight_captures.is_empty() {
+            format!(
+                "Loading({})",
+                self.in_flight_reads.len() + self.in_flight_captures.len()
+            )
         } else {
             "Idle".to_string()
         }
@@ -408,6 +421,7 @@ pub(crate) struct ThumbContext<'w, 's> {
     materials: ResMut<'w, Assets<bevy::sprite_render::ColorMaterial>>,
     nav: Res<'w, Nav>,
     visit: Res<'w, SceneVisit>,
+    approach: Res<'w, CenterApproach>,
     window: Single<'w, 's, &'static Window, With<PrimaryWindow>>,
     animating: Option<Res<'w, Animating>>,
     fades: Query<'w, 's, (), With<Fade>>,
@@ -438,6 +452,7 @@ pub(crate) fn update_thumbnails(
     let mut updated_keys: Vec<Key> = Vec::new();
     if let Ok(rx) = cache.capture_rx.lock() {
         for (key, rgba) in rx.try_iter() {
+            capture.in_flight_captures.remove(&key);
             let expected = (IMAGE_WIDTH * image_height() * 4) as usize;
             if rgba.len() == expected {
                 let handle = assets.add(loaded_image(rgba));
@@ -450,7 +465,7 @@ pub(crate) fn update_thumbnails(
     // 1b. ディスクから読めた WebP を反映する。
     if let Ok(rx) = cache.read_res.lock() {
         for (key, opt_rgba) in rx.try_iter() {
-            capture.in_flight_reads = capture.in_flight_reads.saturating_sub(1);
+            capture.in_flight_reads.remove(&key);
             if let Some(rgba) = opt_rgba
                 && !images.images.contains_key(&key)
             {
@@ -506,20 +521,26 @@ pub(crate) fn update_thumbnails(
                 && let Ok(tx) = cache.read_req.lock()
                 && tx.send((key, path)).is_ok()
             {
-                capture.in_flight_reads += 1;
+                capture.in_flight_reads.insert(key);
             }
         }
     }
 
     // 裏読込や GPU 読み戻しが進行中なら、reactive の 1 秒待ちを待たずに次のフレームを回す。
-    if (capture.in_flight_reads > 0 || !ctx.readbacks.is_empty()) && !ctx.occluded.0 {
+    if (!capture.in_flight_reads.is_empty() || !ctx.readbacks.is_empty()) && !ctx.occluded.0 {
         redraw.write(RequestRedraw);
     }
 
     // 3. 今開いているフォルダのサムネ撮影を進める・始める。
 
+    let requested = ctx.approach.requested();
     if let Some(active) = capture.active.as_mut() {
-        let stale = active.folder != scene_folder || active.visit != ctx.visit.0;
+        let still_requested = requested == Some(active.folder);
+        let current_visit = active.folder == scene_folder;
+        if active.visit.is_none() && current_visit {
+            active.visit = Some(ctx.visit.0);
+        }
+        let stale = !still_requested && (!current_visit || active.visit != Some(ctx.visit.0));
         if !active.readback_sent && stale {
             commands.entity(active.camera).despawn();
             commands.entity(active.scene).despawn();
@@ -544,40 +565,60 @@ pub(crate) fn update_thumbnails(
                     commands.entity(event.entity).despawn();
                 });
             active.readback_sent = true;
+            capture.in_flight_captures.insert(key);
+            return;
         }
         if active.frames > CAPTURE_FRAMES {
-            let done_visit = active.visit;
-            let cam = active.camera;
-            commands.entity(cam).despawn();
+            let active = capture.active.take().unwrap();
+            commands.entity(active.camera).despawn();
             commands.entity(active.scene).despawn();
-            capture.last_visit = done_visit;
-            capture.active = None;
+            if let Some(visit) = active.visit {
+                capture.last_visit = visit;
+            }
         }
         return;
     }
 
-    // 訪問先の読み込みが終わったら、操作中でも本体だけ別のカメラで撮る。
-    if !ctx.fonts.contains(&ctx.font.0)
-        || ctx.visit.0 == capture.last_visit
-        || scene_folder == FileTree::ROOT
-        || !ctx.tree.nodes[scene_folder].is_dir
-        || !ctx.tree.nodes[scene_folder].loaded
-        || !ctx.layouts.contains(scene_folder)
-    {
+    // 開いた場所を優先し、次に今まさに寄っている子だけを撮る。
+    if !ctx.fonts.contains(&ctx.font.0) {
         return;
     }
+    let capture_key = |folder: NodeId| {
+        let node = &ctx.tree.nodes[folder];
+        if folder == FileTree::ROOT || !node.is_dir || !node.loaded || !ctx.layouts.contains(folder)
+        {
+            return None;
+        }
+        let key = folder_key(&ctx.tree, folder)?;
+        (!capture.in_flight_captures.contains(&key) && !capture.in_flight_reads.contains(&key))
+            .then_some(key)
+    };
+    let current = (ctx.visit.0 != capture.last_visit)
+        .then(|| capture_key(scene_folder))
+        .flatten()
+        .map(|key| (scene_folder, key, Some(ctx.visit.0)));
+    let target_folder = current.or_else(|| {
+        let folder = requested?;
+        let node = &ctx.tree.nodes[folder];
+        if node.children.is_empty()
+            || node.state == crate::model::tree::LoadState::Failed
+            || images.ready(&ctx.tree, folder).is_some()
+        {
+            return None;
+        }
+        capture_key(folder).map(|key| (folder, key, None))
+    });
+    let Some((folder, key, visit)) = target_folder else {
+        return;
+    };
     let (spec, ears) = ear_spec(&ctx.settings, &ctx.window);
-    let layouts = layout(&ctx.tree, scene_folder, anchor_body(), spec);
-    let (_, fit_scale) = fit(layouts[scene_folder].fit, &ctx.window);
+    let layouts = layout(&ctx.tree, folder, anchor_body(), spec);
+    let (_, fit_scale) = fit(layouts[folder].fit, &ctx.window);
     if !(fit_scale > 0.0 && fit_scale.is_finite()) {
         return;
     }
-    let Some(key) = folder_key(&ctx.tree, scene_folder) else {
-        capture.last_visit = ctx.visit.0;
-        return;
-    };
-    let slot = slot_of(&ctx.tree, &layouts, scene_folder);
-    let size = size_of(&ctx.tree, &layouts, &ears, scene_folder, false);
+    let slot = slot_of(&ctx.tree, &layouts, folder);
+    let size = size_of(&ctx.tree, &layouts, &ears, folder, false);
     let (_, shown) = slot.yielded(size.height(fit_scale));
     if !(shown.width() > 0.0 && shown.height() > 0.0) {
         return;
@@ -602,7 +643,7 @@ pub(crate) fn update_thumbnails(
         &mut ctx.meshes,
         &mut ctx.materials,
         &source,
-        scene_folder,
+        folder,
         scene,
         layer.clone(),
         fit_scale,
@@ -633,8 +674,8 @@ pub(crate) fn update_thumbnails(
         ))
         .id();
     capture.active = Some(ActiveCapture {
-        visit: ctx.visit.0,
-        folder: scene_folder,
+        visit,
+        folder,
         key,
         camera: cam_entity,
         scene,

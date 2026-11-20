@@ -27,6 +27,7 @@ use crate::ui::menu::{BAR_PX, MenuBreadcrumb, MenuSystems, Popup};
 mod background;
 mod camera;
 mod center;
+pub(crate) use center::CenterApproach;
 mod fade;
 mod shell;
 mod title;
@@ -70,6 +71,7 @@ impl Plugin for TreeViewPlugin {
             .insert_resource(SceneVisit(1))
             .init_resource::<LastSceneKey>()
             .init_resource::<ThumbnailCapture>()
+            .init_resource::<CenterApproach>()
             .insert_resource(cache::ImageCache::new())
             .insert_resource(ClearColor(BACKGROUND))
             .insert_resource(Breadcrumb("Root".into()))
@@ -95,11 +97,16 @@ impl Plugin for TreeViewPlugin {
                     follow_side_panel,
                     animate_camera,
                     background::follow,
+                    (
+                        center::choose,
+                        cache::update_thumbnails,
+                        center::refresh_displays,
+                    )
+                        .chain(),
                     update_ears,
                     shell::update,
                     fade_scenes,
                     center::update,
-                    cache::update_thumbnails,
                     crate::preview::update_previews,
                     crate::render::status::animate_spinners,
                     keep_redrawing,

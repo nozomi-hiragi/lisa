@@ -160,9 +160,10 @@ pub(super) fn animate_camera(
         let old = current.0;
         current.0 = maker.spawn(path, scene_scale);
         let target = path[path.len() - 1].node;
-        if prepared
-            .iter()
-            .any(|item| item.scene == old && item.folder == target)
+        if maker.images.ready(&maker.tree, target).is_none()
+            || prepared
+                .iter()
+                .any(|item| item.scene == old && item.folder == target)
         {
             maker.commands.entity(old).despawn();
             return;

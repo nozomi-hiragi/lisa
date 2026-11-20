@@ -77,81 +77,96 @@ pub fn draw_file(
     }
 }
 
-/// フォルダの枠と耳を描く。キャッシュ画像は枠の中央に載せる。
+/// フォルダの中央には、このいずれかひとつを描く。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum FolderBodyState {
+    Failed,
+    Thumbnail(Handle<Image>),
+    Empty,
+    LoadingSpinner,
+    UnloadedDots,
+}
+
+impl FolderBodyState {
+    pub(crate) fn new(
+        state: LoadState,
+        image: Option<Handle<Image>>,
+        known_empty: bool,
+        pending: bool,
+    ) -> Self {
+        if state == LoadState::Failed {
+            Self::Failed
+        } else if let Some(image) = image {
+            Self::Thumbnail(image)
+        } else if known_empty {
+            Self::Empty
+        } else if state == LoadState::Loading || pending {
+            Self::LoadingSpinner
+        } else {
+            Self::UnloadedDots
+        }
+    }
+}
+
+/// フォルダの外装と、現在の中央表示を描く。
 #[allow(clippy::too_many_arguments)]
-pub fn draw_folder(
+pub(crate) fn draw_folder(
     painter: &mut Painter,
     state: LoadState,
-    known_empty: bool,
+    body: &FolderBodyState,
     slot: Slot,
     size: Size,
     name: &str,
-    image: Option<Handle<Image>>,
     color: Color,
     z: f32,
     live: bool,
 ) {
-    let (color, image) = match state {
-        LoadState::Unloaded => (color.with_alpha(0.65), None),
-        LoadState::Failed => (ERROR, None),
-        _ => (color, image),
+    let color = match state {
+        LoadState::Unloaded => color.with_alpha(0.65),
+        LoadState::Failed => ERROR,
+        _ => color,
     };
-    let has_image = image.is_some();
-    let show_placeholder = folder_needs_ellipsis(state, has_image, known_empty);
+    let image = match body {
+        FolderBodyState::Thumbnail(image) => Some(image.clone()),
+        _ => None,
+    };
     ear::draw_folder(painter, slot, size, Some(name), color, image, z);
-    if show_placeholder {
-        let parent = painter.parent;
-        let placeholder = ear::body_group(painter, slot, size);
-        painter.commands.entity(placeholder).insert(FolderPreview);
-        painter.parent = placeholder;
-        // 古いフォルダの暗い膜より手前に置く。
-        ellipsis(painter, slot.body, color, z + 0.11);
-        painter.parent = parent;
+    if state == LoadState::Stale && matches!(body, FolderBodyState::Thumbnail(_)) {
+        ear::draw_folder_overlay(
+            painter,
+            slot,
+            size,
+            name,
+            BACKGROUND.with_alpha(STALE_ALPHA),
+            z + 0.1,
+        );
     }
-    match state {
-        LoadState::Loading if folder_needs_spinner(live, has_image) => {
-            let parent = painter.parent;
-            let placeholder = ear::body_group(painter, slot, size);
-            painter.commands.entity(placeholder).insert(FolderPreview);
-            painter.parent = placeholder;
-            spinner(painter, slot.body, z + 0.1);
-            painter.parent = parent;
-        }
-        LoadState::Stale => {
-            ear::draw_folder_overlay(
-                painter,
-                slot,
-                size,
-                name,
-                BACKGROUND.with_alpha(STALE_ALPHA),
-                z + 0.1,
-            );
-        }
-        LoadState::Failed => {
-            let parent = painter.parent;
-            painter.parent = ear::body_group(painter, slot, size);
-            painter.text(
-                "×".to_string(),
-                slot.body.center(),
-                Anchor::CENTER,
-                slot.body.height() * 0.6,
-                slot.body.width(),
-                ERROR,
-                z + 0.1,
-            );
-            painter.parent = parent;
-        }
+    if matches!(body, FolderBodyState::Empty | FolderBodyState::Thumbnail(_))
+        || (!live && *body == FolderBodyState::LoadingSpinner)
+    {
+        return;
+    }
+    let parent = painter.parent;
+    painter.parent = ear::body_group(painter, slot, size);
+    painter
+        .commands
+        .entity(painter.parent)
+        .insert(FolderPreview);
+    match body {
+        FolderBodyState::UnloadedDots => ellipsis(painter, slot.body, color, z + 0.11),
+        FolderBodyState::LoadingSpinner => spinner(painter, slot.body, z + 0.1),
+        FolderBodyState::Failed => painter.text(
+            "×".to_string(),
+            slot.body.center(),
+            Anchor::CENTER,
+            slot.body.height() * 0.6,
+            slot.body.width(),
+            ERROR,
+            z + 0.1,
+        ),
         _ => {}
     }
-}
-
-fn folder_needs_ellipsis(state: LoadState, has_image: bool, known_empty: bool) -> bool {
-    state == LoadState::Unloaded
-        || (matches!(state, LoadState::Loaded | LoadState::Stale) && !has_image && !known_empty)
-}
-
-fn folder_needs_spinner(live: bool, has_image: bool) -> bool {
-    live && !has_image
+    painter.parent = parent;
 }
 
 /// 枠だけ。中は下の色のまま。
@@ -262,22 +277,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loading_folder_spins_only_without_a_thumbnail_in_the_live_scene() {
-        assert!(folder_needs_spinner(true, false));
-        assert!(!folder_needs_spinner(true, true));
-        assert!(!folder_needs_spinner(false, false));
-    }
-
-    #[test]
-    fn folder_without_a_preview_shows_dots_only_when_appropriate() {
-        for state in [LoadState::Loaded, LoadState::Stale] {
-            assert!(folder_needs_ellipsis(state, false, false));
-            assert!(!folder_needs_ellipsis(state, false, true));
-            assert!(!folder_needs_ellipsis(state, true, false));
+    fn folder_body_selects_exactly_one_display() {
+        use FolderBodyState::*;
+        let image = Handle::<Image>::default();
+        for state in [LoadState::Loaded, LoadState::Stale, LoadState::Unloaded] {
+            assert_eq!(
+                FolderBodyState::new(state, None, false, false),
+                UnloadedDots
+            );
+            assert_eq!(FolderBodyState::new(state, None, true, false), Empty);
+            assert_eq!(
+                FolderBodyState::new(state, None, false, true),
+                LoadingSpinner
+            );
         }
-        assert!(folder_needs_ellipsis(LoadState::Unloaded, false, false));
-        assert!(!folder_needs_ellipsis(LoadState::Loading, false, false));
-        assert!(!folder_needs_ellipsis(LoadState::Failed, false, false));
+        assert_eq!(
+            FolderBodyState::new(LoadState::Loading, None, false, false),
+            LoadingSpinner
+        );
+        assert_eq!(
+            FolderBodyState::new(LoadState::Loading, Some(image.clone()), false, true),
+            Thumbnail(image.clone())
+        );
+        assert_eq!(
+            FolderBodyState::new(LoadState::Failed, Some(image), false, true),
+            Failed
+        );
     }
 
     #[test]
