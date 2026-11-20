@@ -18,7 +18,7 @@ use bevy::window::{PrimaryWindow, RequestRedraw, WindowFocused, WindowOccluded};
 
 use crate::model::tree::FileTree;
 use crate::render::cache::{FolderImages, ThumbnailCapture};
-use crate::render::status::Pulse;
+use crate::render::status::Spinner;
 use crate::view::{Animating, Busy, CurrentScene, Fade, MainCamera, Nav, WindowOccludedState};
 
 pub struct RenderDiagPlugin;
@@ -67,7 +67,7 @@ fn diag_events(
     mut clock: Local<DiagClock>,
     mut redraw_count: Local<u64>,
     occluded: Res<WindowOccludedState>,
-    pulses: Query<(), With<Pulse>>,
+    spinners: Query<(), With<Spinner>>,
 ) {
     for ev in occluded_events.read() {
         info!(
@@ -85,9 +85,9 @@ fn diag_events(
     if let Some((frame, df)) = clock.tick() {
         let redraws = std::mem::take(&mut *redraw_count);
         info!(
-            "[DIAG activity] f={frame}(+{df}/s) occluded={} redraws={redraws} pulses={}",
+            "[DIAG activity] f={frame}(+{df}/s) occluded={} redraws={redraws} spinners={}",
             occluded.0,
-            pulses.iter().count()
+            spinners.iter().count()
         );
     }
 }

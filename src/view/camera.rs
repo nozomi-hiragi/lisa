@@ -109,13 +109,14 @@ pub(crate) fn refit_on_resize(
     }
 }
 
-pub(crate) fn animate_camera(
+pub(super) fn animate_camera(
     animating: Option<Res<Animating>>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
     nav: Res<Nav>,
     window: Single<&Window, With<PrimaryWindow>>,
+    prepared: Query<&super::center::Contents>,
 ) {
     let Some(anim) = animating else {
         return;
@@ -148,7 +149,7 @@ pub(crate) fn animate_camera(
     }
     maker.commands.remove_resource::<Animating>();
     if anim.then_show {
-        // 画像の上に本物の場面を重ねてフェードインし、終わったら古い場面を消す。
+        // 中身が準備できていればそのまま本シーンへ切り替える。未読込時は従来のフェードを使う。
         let path = scene_path(&nav, &maker.tree);
         let (_, scene_scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
         let scene_scale = if scene_scale > 0.0 && scene_scale.is_finite() {
@@ -158,6 +159,14 @@ pub(crate) fn animate_camera(
         };
         let old = current.0;
         current.0 = maker.spawn(path, scene_scale);
+        let target = path[path.len() - 1].node;
+        if prepared
+            .iter()
+            .any(|item| item.scene == old && item.folder == target)
+        {
+            maker.commands.entity(old).despawn();
+            return;
+        }
         maker.commands.entity(current.0).insert((
             Fade {
                 started: Instant::now(),

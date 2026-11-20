@@ -1,10 +1,10 @@
 //! フォルダの中身を画像（サムネ）にキャッシュする。
 //!
 //! 先読みで焼く仕組み（`Bake`）は持たない。フォルダを開いて本物の場面が描かれたら、
-//! そのフォルダの本体の範囲（`layouts[folder].frame`）を `RenderLayers::layer(CONTENT_LAYER)` のみ
+//! そのフォルダの本体の範囲（耳に譲った後の矩形）を裏撮影専用レイヤーだけ
 //! 映す一時カメラ 1 台で 1024×724 の `Rgba8UnormSrgb` 画像へ撮り、`ReadbackOnce` で読み戻して
-//! WebP に保存し、そのままメモリにも載せる。重複の印・カタログの札や暗い膜・読み込み中の光は
-//! `OVERLAY_LAYER` に分けてあるため、サムネには入らない。
+//! WebP に保存し、そのままメモリにも載せる。重複の印・カタログの札や暗い膜・読み込み中のスピナーは
+//! `OVERLAY_LAYER` に分けてあるため、サムネには入らない。開いたフォルダ自身の外枠と耳も別レイヤーに置く。
 //!
 //! もう一度そのフォルダを開き直したら撮り直して上書きする。まだ一度も開いていないフォルダは
 //! ディスクに前回の画像があれば裏スレッドで読み込み、無ければ画像なし（空の枠）で描く。
@@ -19,19 +19,22 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, SystemTime};
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::RenderTarget;
 use bevy::camera::visibility::RenderLayers;
+use bevy::camera::{RenderTarget, ScalingMode};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::gpu_readback::{ReadbackComplete, ReadbackOnce};
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::window::{PrimaryWindow, RequestRedraw};
 
-use crate::layout::{BODY_ASPECT, Layouts};
+use crate::layout::{BODY_ASPECT, Layouts, anchor_body, layout};
 use crate::model::tree::{FileTree, NodeId};
-use crate::render::scene::{CONTENT_LAYER, LabelFont};
+use crate::preview::PreviewRegistry;
+use crate::render::scene::{self, CAPTURE_LAYER, LabelFont, SceneSource, size_of, slot_of};
+use crate::render::shapes::UiThemeAssets;
+use crate::settings::Settings;
 use crate::view::{
-    Animating, Fade, MainCamera, Nav, SceneVisit, SyncRequest, WindowOccludedState, fit, scene_path,
+    Animating, Fade, Nav, SceneVisit, SyncRequest, WindowOccludedState, ear_spec, fit, scene_path,
 };
 
 /// 画像の幅（ピクセル）。高さは本体の縦横比（√2:1）に合わせる。
@@ -40,14 +43,12 @@ const IMAGE_WIDTH: u32 = 1024;
 const MAX_CACHED_IMAGES: usize = 300;
 /// 撮影カメラを何フレーム動かしてから読み戻すか（描き終わるまでの余裕）。
 const CAPTURE_FRAMES: u32 = 2;
-/// 描き方・色空間の版。`Rgba8UnormSrgb` 統一とフォルダ単位の鍵への変更に伴い 2 へ上げた。
-const DRAW_VERSION: u32 = 2;
+/// 描き方・色空間の版。本体の中身を透明背景で撮影する。
+const DRAW_VERSION: u32 = 8;
 /// 使わないまま、これより経った画像は消す。
 const KEEP_UNUSED: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// 画像のキャッシュの大きさの上限（超えた分は、使っていない古いものから消す）。
 const KEEP_BYTES: u64 = 1 << 30;
-/// WebP の品質（0〜100）。
-const WEBP_QUALITY: f32 = 85.0;
 
 /// フォルダごとのサムネの鍵（パスまたはリモート識別子の blake3）。
 pub type Key = [u8; 32];
@@ -252,6 +253,30 @@ fn file_name(key: &Key) -> String {
     format!("{hex}.webp")
 }
 
+/// 透明な描画先では RGB にアルファが乗っている。貼り直しでは通常のアルファ合成を使う
+/// ので、sRGB を線形値に戻してから除算し、二重に暗くなるのを防ぐ。
+fn straighten_alpha(rgba: &mut [u8]) {
+    let linear: [f32; 256] =
+        std::array::from_fn(|i| LinearRgba::from(Srgba::new(i as f32 / 255.0, 0.0, 0.0, 1.0)).red);
+    for pixel in rgba.chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        if alpha == 0 {
+            pixel[..3].fill(0);
+        } else if alpha < 255 {
+            for channel in &mut pixel[..3] {
+                let value = linear[*channel as usize] * (255.0 / f32::from(alpha));
+                let nearest = linear.partition_point(|&x| x < value).clamp(1, 255);
+                let prev = nearest - 1;
+                *channel = if value - linear[prev] < linear[nearest] - value {
+                    prev as u8
+                } else {
+                    nearest as u8
+                };
+            }
+        }
+    }
+}
+
 fn write_webp(dir: &std::path::Path, key: &Key, rgba: &[u8]) {
     let expected = (IMAGE_WIDTH * image_height() * 4) as usize;
     if rgba.len() != expected {
@@ -261,7 +286,7 @@ fn write_webp(dir: &std::path::Path, key: &Key, rgba: &[u8]) {
         );
         return;
     }
-    let encoded = webp::Encoder::from_rgba(rgba, IMAGE_WIDTH, image_height()).encode(WEBP_QUALITY);
+    let encoded = webp::Encoder::from_rgba(rgba, IMAGE_WIDTH, image_height()).encode_lossless();
     let path = dir.join(file_name(key));
     let tmp = path.with_extension("webp.tmp");
     if std::fs::write(&tmp, &*encoded).is_ok() {
@@ -351,6 +376,7 @@ struct ActiveCapture {
     folder: NodeId,
     key: Key,
     camera: Entity,
+    scene: Entity,
     target: Handle<Image>,
     frames: u32,
     readback_sent: bool,
@@ -375,10 +401,14 @@ pub(crate) struct ThumbContext<'w, 's> {
     font: Res<'w, LabelFont>,
     tree: Res<'w, FileTree>,
     layouts: Res<'w, Layouts>,
+    settings: Res<'w, Settings>,
+    theme: Res<'w, UiThemeAssets>,
+    previews: Res<'w, PreviewRegistry>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<bevy::sprite_render::ColorMaterial>>,
     nav: Res<'w, Nav>,
     visit: Res<'w, SceneVisit>,
     window: Single<'w, 's, &'static Window, With<PrimaryWindow>>,
-    camera: Single<'w, 's, &'static Projection, With<MainCamera>>,
     animating: Option<Res<'w, Animating>>,
     fades: Query<'w, 's, (), With<Fade>>,
     gesture: Res<'w, crate::input::gesture::Gesture>,
@@ -389,7 +419,7 @@ pub(crate) struct ThumbContext<'w, 's> {
 /// 毎フレーム:
 /// 1. 読み戻し完了したサムネ・ディスクから読めたサムネを `FolderImages` へ反映し、見えるタイルに必要なら再描画を頼む。
 /// 2. 今開いている場面の直下の子（と隣）のうち、まだメモリに無くディスクにある WebP を裏で読む。
-/// 3. 今開いているフォルダが落ち着いて描かれたら、`CONTENT_LAYER`（レイヤー 0）だけを 1 枚撮って保存する。
+/// 3. 今開いたフォルダの中身を裏撮影レイヤーに作り、1 枚撮って保存する。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn update_thumbnails(
     mut commands: Commands,
@@ -399,7 +429,7 @@ pub(crate) fn update_thumbnails(
     mut assets: ResMut<Assets<Image>>,
     mut sync: ResMut<SyncRequest>,
     mut redraw: MessageWriter<RequestRedraw>,
-    ctx: ThumbContext,
+    mut ctx: ThumbContext,
 ) {
     let path = scene_path(&ctx.nav, &ctx.tree);
     let scene_folder = path[path.len() - 1].node;
@@ -421,7 +451,9 @@ pub(crate) fn update_thumbnails(
     if let Ok(rx) = cache.read_res.lock() {
         for (key, opt_rgba) in rx.try_iter() {
             capture.in_flight_reads = capture.in_flight_reads.saturating_sub(1);
-            if let Some(rgba) = opt_rgba {
+            if let Some(rgba) = opt_rgba
+                && !images.images.contains_key(&key)
+            {
                 let handle = assets.add(loaded_image(rgba));
                 images.insert(key, handle);
                 updated_keys.push(key);
@@ -488,8 +520,9 @@ pub(crate) fn update_thumbnails(
 
     if let Some(active) = capture.active.as_mut() {
         let stale = active.folder != scene_folder || active.visit != ctx.visit.0;
-        if !active.readback_sent && (busy || ctx.occluded.0 || stale) {
+        if !active.readback_sent && stale {
             commands.entity(active.camera).despawn();
+            commands.entity(active.scene).despawn();
             capture.active = None;
             return;
         }
@@ -504,7 +537,8 @@ pub(crate) fn update_thumbnails(
             commands
                 .spawn(ReadbackOnce::texture(active.target.clone()))
                 .observe(move |event: On<ReadbackComplete>, mut commands: Commands| {
-                    let data = event.data.clone();
+                    let mut data = event.data.clone();
+                    straighten_alpha(&mut data);
                     let _ = save.send((key, data.clone()));
                     let _ = mem.send((key, data));
                     commands.entity(event.entity).despawn();
@@ -515,48 +549,67 @@ pub(crate) fn update_thumbnails(
             let done_visit = active.visit;
             let cam = active.camera;
             commands.entity(cam).despawn();
+            commands.entity(active.scene).despawn();
             capture.last_visit = done_visit;
             capture.active = None;
         }
         return;
     }
 
-    // 新規撮影の条件: 操作停止中・可視・フォント読込済・まだこの訪問を撮っていない・anchor 一致・通常倍率。
-    if busy
-        || ctx.occluded.0
-        || !ctx.fonts.contains(&ctx.font.0)
+    // 訪問先の読み込みが終わったら、操作中でも本体だけ別のカメラで撮る。
+    if !ctx.fonts.contains(&ctx.font.0)
         || ctx.visit.0 == capture.last_visit
-    {
-        return;
-    }
-    if scene_folder == FileTree::ROOT
+        || scene_folder == FileTree::ROOT
         || !ctx.tree.nodes[scene_folder].is_dir
         || !ctx.tree.nodes[scene_folder].loaded
-        || ctx.layouts.anchor != scene_folder
         || !ctx.layouts.contains(scene_folder)
     {
         return;
     }
-    let cam_scale = match *ctx.camera {
-        Projection::Orthographic(o) => o.scale,
-        _ => return,
-    };
-    let (_, fit_scale) = fit(ctx.layouts[scene_folder].fit, &ctx.window);
-    if !(fit_scale > 0.0 && cam_scale.is_finite())
-        || (cam_scale - fit_scale).abs() > fit_scale * 0.05
-    {
+    let (spec, ears) = ear_spec(&ctx.settings, &ctx.window);
+    let layouts = layout(&ctx.tree, scene_folder, anchor_body(), spec);
+    let (_, fit_scale) = fit(layouts[scene_folder].fit, &ctx.window);
+    if !(fit_scale > 0.0 && fit_scale.is_finite()) {
         return;
     }
     let Some(key) = folder_key(&ctx.tree, scene_folder) else {
         capture.last_visit = ctx.visit.0;
         return;
     };
-    let frame = ctx.layouts[scene_folder].frame;
-    if !(frame.width() > 0.0 && frame.height() > 0.0) {
+    let slot = slot_of(&ctx.tree, &layouts, scene_folder);
+    let size = size_of(&ctx.tree, &layouts, &ears, scene_folder, false);
+    let (_, shown) = slot.yielded(size.height(fit_scale));
+    if !(shown.width() > 0.0 && shown.height() > 0.0) {
         return;
     }
+    let layer = RenderLayers::layer(CAPTURE_LAYER);
+    let scene = commands
+        .spawn((Transform::default(), Visibility::default(), layer.clone()))
+        .id();
+    let source = SceneSource {
+        tree: &ctx.tree,
+        layouts: &layouts,
+        images: &images,
+        previews: &ctx.previews,
+        font: &ctx.font.0,
+        ears: &ears,
+        theme: &ctx.theme,
+        highlight: None,
+        catalog: None,
+    };
+    scene::draw_contents(
+        &mut commands,
+        &mut ctx.meshes,
+        &mut ctx.materials,
+        &source,
+        scene_folder,
+        scene,
+        layer.clone(),
+        fit_scale,
+        false,
+    );
     let target = assets.add(target_image());
-    let scale = frame.width() / IMAGE_WIDTH as f32;
+    let scale = shown.width() / IMAGE_WIDTH as f32;
     let cam_entity = commands
         .spawn((
             Camera2d,
@@ -568,11 +621,15 @@ pub(crate) fn update_thumbnails(
             RenderTarget::Image(target.clone().into()),
             Projection::Orthographic(OrthographicProjection {
                 scale,
+                // ピクセル単位に丸めた撮影先の縦横比にかかわらず、本体全体を写す。
+                scaling_mode: ScalingMode::Fixed {
+                    width: IMAGE_WIDTH as f32,
+                    height: shown.height() / scale,
+                },
                 ..OrthographicProjection::default_2d()
             }),
-            Transform::from_translation(frame.center().extend(0.0)),
-            // レイヤー 0（中身のみ）を撮る。レイヤー 1 の重複・カタログ印やパルスは入らない。
-            RenderLayers::layer(CONTENT_LAYER),
+            Transform::from_translation(shown.center().extend(0.0)),
+            layer,
         ))
         .id();
     capture.active = Some(ActiveCapture {
@@ -580,6 +637,7 @@ pub(crate) fn update_thumbnails(
         folder: scene_folder,
         key,
         camera: cam_entity,
+        scene,
         target,
         frames: 0,
         readback_sent: false,
@@ -608,6 +666,14 @@ fn visible_contains_any(tree: &FileTree, scene_folder: NodeId, keys: &[Key]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_capture_is_converted_to_straight_alpha() {
+        let mut rgba = [188, 0, 0, 128, 255, 10, 60, 0, 10, 20, 31, 255];
+        straighten_alpha(&mut rgba);
+        assert!(rgba[0] >= 254);
+        assert_eq!(rgba[1..], [0, 0, 128, 0, 0, 0, 0, 10, 20, 31, 255]);
+    }
 
     #[test]
     fn sweep_removes_old_and_over_budget_images_only() {

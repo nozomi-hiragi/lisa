@@ -1,9 +1,6 @@
 //! カメラのズーム、場面の切り替え、描画頻度の切り替え。
 //!
-//! 画面に本物として描くのは、今開いているフォルダの場面ひとつだけ。その中の子フォルダは
-//! キャッシュした画像で見せる。子フォルダを押すと、画像のままズームし、ズームが終わったら
-//! 子フォルダの本物の場面をフェードインさせる。戻るときは、先に親の場面を本物で描いておき、
-//! 今の場面をフェードアウトさせながらズームアウトする。
+//! 開いた場面の一覧では子フォルダをサムネで表示し、近づいた子だけ本物の中身に切り替える。
 
 use std::time::{Duration, Instant};
 
@@ -21,20 +18,24 @@ use crate::preview::PreviewRegistry;
 use crate::render::cache::{self, FolderImages, ThumbnailCapture};
 use crate::render::ear::{EarSizes, update_ears};
 use crate::render::scene::{
-    self, BACKGROUND, CONTENT_LAYER, LabelFont, OVERLAY_LAYER, SceneRoot, SceneSource,
+    self, BACKGROUND, CONTENT_LAYER, LabelFont, OVERLAY_LAYER, SHELL_LAYER, SceneRoot, SceneSource,
 };
-use crate::render::shapes::BaseAlpha;
+use crate::render::shapes::{BaseAlpha, UiThemeAssets};
 use crate::settings::Settings;
 use crate::ui::menu::{BAR_PX, MenuBreadcrumb, MenuSystems, Popup};
 
+mod background;
 mod camera;
+mod center;
 mod fade;
+mod shell;
 mod title;
 
 pub use camera::Busy;
+use camera::animate_camera;
 pub(crate) use camera::{
-    Animating, Ease, MainCamera, ZOOM_SECONDS, animate_camera, fit, keep_redrawing,
-    refit_on_resize, set_catalog_side_px, set_organize_side_px, set_side_px, side_px, view_width,
+    Animating, Ease, MainCamera, ZOOM_SECONDS, fit, keep_redrawing, refit_on_resize,
+    set_catalog_side_px, set_organize_side_px, set_side_px, side_px, view_width,
 };
 pub(crate) use fade::{Fade, fade_scenes};
 pub use title::TitleSuffix;
@@ -74,7 +75,7 @@ impl Plugin for TreeViewPlugin {
             .insert_resource(Breadcrumb("Root".into()))
             .init_resource::<Busy>()
             .init_resource::<WindowOccludedState>()
-            .init_resource::<crate::render::status::PulseClock>()
+            .init_resource::<crate::render::status::SpinnerClock>()
             .init_resource::<crate::input::gesture::Gesture>()
             .init_resource::<crate::input::gesture::TrackpadInput>()
             .add_systems(
@@ -93,11 +94,14 @@ impl Plugin for TreeViewPlugin {
                     refit_on_resize,
                     follow_side_panel,
                     animate_camera,
+                    background::follow,
                     update_ears,
+                    shell::update,
                     fade_scenes,
+                    center::update,
                     cache::update_thumbnails,
                     crate::preview::update_previews,
-                    crate::render::status::pulse_loading,
+                    crate::render::status::animate_spinners,
                     keep_redrawing,
                     update_title,
                 )
@@ -274,6 +278,7 @@ pub(crate) struct SceneMaker<'w, 's> {
     pub(crate) previews: Res<'w, PreviewRegistry>,
     pub(crate) font: Res<'w, LabelFont>,
     pub(crate) ears: Res<'w, EarSizes>,
+    pub(crate) theme: Res<'w, UiThemeAssets>,
     pub(crate) highlight: Res<'w, crate::dups::DupHighlight>,
     pub(crate) catalog: Res<'w, crate::catalog::CatalogMarks>,
 }
@@ -301,6 +306,7 @@ impl SceneMaker<'_, '_> {
             previews: &self.previews,
             font: &self.font.0,
             ears: &self.ears,
+            theme: &self.theme,
             highlight: Some(&self.highlight),
             catalog: Some(&self.catalog),
         };
@@ -326,6 +332,7 @@ fn setup(
     settings: Res<Settings>,
     previews: Res<PreviewRegistry>,
     mut fonts: ResMut<Assets<Font>>,
+    mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -341,6 +348,10 @@ fn setup(
     let folder_images = FolderImages::default();
 
     let (pos, scale) = fit(layouts[FileTree::ROOT].frame, &window);
+    let theme = UiThemeAssets::load(&mut images);
+    if let Some(image) = &theme.background {
+        background::spawn(&mut commands, image);
+    }
     // UI（メニューバーや一覧）は、木を映すカメラとは別のカメラで、ウィンドウ全体に描く
     // （木のカメラは、右の一覧が開くと映す領域を狭めるため）。
     commands.spawn((
@@ -356,14 +367,21 @@ fn setup(
     commands.spawn((
         MainCamera,
         Camera2d,
+        Camera {
+            clear_color: if theme.background.is_some() {
+                ClearColorConfig::None
+            } else {
+                ClearColorConfig::Default
+            },
+            ..default()
+        },
         Projection::Orthographic(OrthographicProjection {
             scale,
             ..OrthographicProjection::default_2d()
         }),
         Transform::from_translation(pos.extend(0.0)),
-        // 画面にはレイヤー 0（中身）とレイヤー 1（重複・カタログ印・パルス）の両方を映す。
-        // サムネ撮影カメラはレイヤー 0 のみを映す。
-        RenderLayers::from_layers(&[CONTENT_LAYER, OVERLAY_LAYER]),
+        // 画面には中身と外装と印を映す。サムネ撮影カメラは中身だけを映す。
+        RenderLayers::from_layers(&[CONTENT_LAYER, OVERLAY_LAYER, SHELL_LAYER]),
     ));
 
     let source = SceneSource {
@@ -373,6 +391,7 @@ fn setup(
         previews: &previews,
         font: &font,
         ears: &ears,
+        theme: &theme,
         highlight: None,
         catalog: None,
     };
@@ -394,10 +413,11 @@ fn setup(
     commands.insert_resource(folder_images);
     commands.insert_resource(LabelFont(font));
     commands.insert_resource(ears);
+    commands.insert_resource(theme);
 }
 
 /// 設定と今のウィンドウから、耳の大きさを決める。
-fn ear_spec(settings: &Settings, window: &Window) -> (EarSpec, EarSizes) {
+pub(crate) fn ear_spec(settings: &Settings, window: &Window) -> (EarSpec, EarSizes) {
     let fitted = fitted_size(
         Vec2::new(window.width(), window.height() - BAR_PX),
         settings.ear_selected_px,
@@ -507,6 +527,7 @@ struct SyncDrawAssets<'w> {
     previews: Res<'w, PreviewRegistry>,
     font: Res<'w, LabelFont>,
     ears: ResMut<'w, EarSizes>,
+    theme: Res<'w, UiThemeAssets>,
     highlight: Res<'w, crate::dups::DupHighlight>,
     catalog: Res<'w, crate::catalog::CatalogMarks>,
 }
@@ -581,6 +602,7 @@ fn sync_view(
     let (mut cam_tf, mut cam_proj) = camera.into_inner();
     match mode {
         SyncMode::Reset => {
+            commands.insert_resource(background::CameraReset);
             if animating.is_some() {
                 commands.remove_resource::<Animating>();
             }
@@ -777,6 +799,7 @@ fn spawn_scene_raw(
         previews: &draw.previews,
         font: &draw.font.0,
         ears: &draw.ears,
+        theme: &draw.theme,
         highlight: Some(&draw.highlight),
         catalog: Some(&draw.catalog),
     };
@@ -1080,6 +1103,9 @@ fn change_scene(
         let focus = old_scene[new_scene.len()].node;
         maker.commands.entity(current.0).despawn();
         current.0 = maker.spawn_around(&new_scene, scale_of(&new_scene, maker), Some(focus));
+        if old_folder == focus && maker.tree.nodes[focus].loaded && maker.layouts.contains(focus) {
+            return false;
+        }
         let leaving = maker.spawn(&old_scene, scale_of(&old_scene, maker));
         maker.commands.entity(leaving).insert((
             Fade {
@@ -1091,8 +1117,7 @@ fn change_scene(
         ));
         return false;
     }
-    // 中や隣へ進む: 行き先を含むフォルダの場面で見せ、画像のままズームして、着いてから本物に
-    // 切り替える。ファイルは含むフォルダの場面にそのまま描いてあるので切り替えない。
+    // 中や隣へ進む: 行き先を含む一覧で実物に切り替え、着いたら本シーンにする。
     let target = nav.top().node;
     let container = &nav.stack[..nav.stack.len() - 1];
     if container.last().map(|l| l.node) != Some(old_folder) {
