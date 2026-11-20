@@ -611,6 +611,16 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
                 undone_ops.push(marked);
             }
             Err(reason) => {
+                plan::set_op_state(
+                    db,
+                    plan_id,
+                    op.seq,
+                    OpState::Skipped,
+                    None,
+                    Some(&reason),
+                    Some(db::now_ms()),
+                )
+                .map_err(|e| e.to_string())?;
                 skipped.push(UndoSkipped {
                     seq: op.seq,
                     src: op.src,

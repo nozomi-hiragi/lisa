@@ -15,7 +15,7 @@ use lisa_core::organize::{OpKind, OpState, Plan, PlanState};
 use crate::catalog::CatalogView;
 use crate::dups::Dups;
 use crate::lan::PairBanner;
-use crate::organize::{OrganizeState, PendingPlan, PlanDetails};
+use crate::organize::{ConfirmPurge, OrganizeState, PendingPlan, PlanDetails};
 use crate::render::scene::LabelFont;
 use crate::scan::JumpTo;
 use crate::ui::menu::BAR_PX;
@@ -283,9 +283,9 @@ fn update_banners(
     let text_font = TextFont::from_font_size(14.0).with_font(font.0.clone());
     let small_font = TextFont::from_font_size(12.0).with_font(font.0.clone());
 
-    // 1. 移動先を選ぶ案内。
+    // 1. 切り取り中の案内。
     commands.entity(move_banner.0).despawn_children();
-    if let Some(src) = &state.pick_move_source {
+    if let Some(src) = &state.cut_source {
         move_banner.1.display = Display::Flex;
         let name = src
             .file_name()
@@ -294,7 +294,7 @@ fn update_banners(
         commands.entity(move_banner.0).with_children(|b| {
             b.spawn((
                 Text::new(format!(
-                    "「{name}」の移動先のフォルダを押してください（Esc でやめる）"
+                    "「{name}」を切り取り中 — 移動先で右クリックして「ここに貼り付け」"
                 )),
                 text_font.clone(),
                 TextColor(ACCENT),
@@ -317,7 +317,7 @@ fn update_banners(
             .observe(
                 |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
                     click.propagate(false);
-                    state.pick_move_source = None;
+                    state.cut_source = None;
                 },
             );
         });
@@ -363,7 +363,7 @@ fn update_banners(
 
 #[derive(PartialEq, Eq)]
 struct BannerKey {
-    pick_move: Option<std::path::PathBuf>,
+    cut_source: Option<std::path::PathBuf>,
     pending_id: Option<i64>,
     pending_count: usize,
     highlighted: bool,
@@ -376,7 +376,7 @@ impl BannerKey {
     fn from_state(state: &OrganizeState) -> Self {
         let pending_id = state.pending.first().map(|p| p.plan.id);
         Self {
-            pick_move: state.pick_move_source.clone(),
+            cut_source: state.cut_source.clone(),
             pending_id,
             pending_count: state.pending.len(),
             highlighted: pending_id.is_some() && state.highlighted_plan == pending_id,
@@ -635,12 +635,18 @@ fn fill_panel(
     state: Res<OrganizeState>,
     font: Res<LabelFont>,
     list: Single<Entity, With<List>>,
+    mut rendered_key: Local<Option<PanelKey>>,
 ) {
-    if !state.is_changed() || !state.panel_open {
+    let key = PanelKey::from_state(&state);
+    if rendered_key.as_ref() == Some(&key) {
         return;
     }
+    *rendered_key = Some(key);
     let list = *list;
     commands.entity(list).despawn_children();
+    if !state.panel_open {
+        return;
+    }
     let big = TextFont::from_font_size(13.0).with_font(font.0.clone());
     let small = TextFont::from_font_size(11.0).with_font(font.0.clone());
 
@@ -688,7 +694,7 @@ fn fill_panel(
                     |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
                         click.propagate(false);
                         if !state.busy {
-                            state.purge_all();
+                            state.confirming_purge = Some(ConfirmPurge::All);
                         }
                     },
                 );
@@ -714,6 +720,86 @@ fn fill_panel(
             ));
         }
 
+        if let Some(confirming) = state.confirming_purge {
+            let message = match confirming {
+                ConfirmPurge::Plan(id) => format!(
+                    "計画 #{id} の隔離ファイルを OS のゴミ箱へ送りますか？（取り消せなくなります）"
+                ),
+                ConfirmPurge::All => {
+                    "すべての隔離ファイルを OS のゴミ箱へ送りますか？（取り消せなくなります）".to_string()
+                }
+            };
+            list.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                padding: UiRect::all(Val::Px(7.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                flex_shrink: 0.0,
+                ..default()
+            })
+            .insert((
+                BackgroundColor(Color::srgba(0.32, 0.12, 0.13, 0.75)),
+                BorderColor::all(RISKY_COLOR),
+            ))
+            .with_children(|box_node| {
+                box_node.spawn((Text::new(message), small.clone(), TextColor(RISKY_COLOR)));
+                box_node
+                    .spawn(Node {
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|buttons| {
+                        buttons
+                            .spawn((
+                                Node {
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(REJECT_COLOR),
+                                children![(Text::new("送る"), small.clone(), TextColor(TEXT_COLOR))],
+                            ))
+                            .observe(
+                                move |mut click: On<PointerClick>,
+                                      mut state: ResMut<OrganizeState>| {
+                                    click.propagate(false);
+                                    if state.confirming_purge == Some(confirming) && !state.busy {
+                                        state.confirming_purge = None;
+                                        match confirming {
+                                            ConfirmPurge::Plan(id) => state.purge_plan(id),
+                                            ConfirmPurge::All => state.purge_all(),
+                                        }
+                                    }
+                                },
+                            );
+                        buttons
+                            .spawn((
+                                Node {
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(BUTTON_COLOR),
+                                children![(
+                                    Text::new("やめる"),
+                                    small.clone(),
+                                    TextColor(TEXT_COLOR)
+                                )],
+                            ))
+                            .observe(
+                                move |mut click: On<PointerClick>,
+                                      mut state: ResMut<OrganizeState>| {
+                                    click.propagate(false);
+                                    if state.confirming_purge == Some(confirming) {
+                                        state.confirming_purge = None;
+                                    }
+                                },
+                            );
+                });
+            });
+        }
+
         if state.history.is_empty() {
             list.spawn((
                 Node {
@@ -721,7 +807,7 @@ fn fill_panel(
                     ..default()
                 },
                 children![(
-                    Text::new("まだ整理の計画はありません。右クリックの「移動…」「削除…」や MCP から計画を作れます。"),
+                    Text::new("まだ整理の計画はありません。右クリックの「切り取り」「ここに貼り付け」「削除…」や MCP から計画を作れます。"),
                     small.clone(),
                     TextColor(DIM_COLOR),
                 )],
@@ -740,6 +826,39 @@ fn fill_panel(
     });
 }
 
+#[derive(PartialEq, Eq)]
+struct PanelKey {
+    panel_open: bool,
+    busy: bool,
+    selected_plan: Option<i64>,
+    notice: Option<String>,
+    history: Vec<(i64, PlanState, Option<i64>)>,
+    details_id: Option<i64>,
+    details_ops: Option<Vec<(usize, OpState)>>,
+    confirming_purge: Option<ConfirmPurge>,
+}
+
+impl PanelKey {
+    fn from_state(state: &OrganizeState) -> Self {
+        Self {
+            panel_open: state.panel_open,
+            busy: state.busy,
+            selected_plan: state.selected_plan,
+            notice: state.current_notice().map(str::to_string),
+            history: state
+                .history
+                .iter()
+                .map(|p| (p.id, p.state, p.purged_at))
+                .collect(),
+            details_id: state.selected_details.as_ref().map(|d| d.plan_id),
+            details_ops: state.selected_details.as_ref().map(|d| {
+                d.ops.iter().map(|o| (o.seq as usize, o.state)).collect()
+            }),
+            confirming_purge: state.confirming_purge,
+        }
+    }
+}
+
 fn spawn_plan_card(
     list: &mut ChildSpawnerCommands,
     plan: &Plan,
@@ -750,7 +869,9 @@ fn spawn_plan_card(
     small: &TextFont,
 ) {
     let plan_id = plan.id;
-    let can_undo = matches!(plan.state, PlanState::Done | PlanState::Partial);
+    let can_undo = matches!(plan.state, PlanState::Done | PlanState::Partial)
+        && plan.purged_at.is_none();
+    let undo_busy = busy;
     let can_purge = matches!(
         plan.state,
         PlanState::Done | PlanState::Partial | PlanState::Undone
@@ -825,11 +946,11 @@ fn spawn_plan_card(
                                 border_radius: BorderRadius::all(Val::Px(4.0)),
                                 ..default()
                             },
-                            BackgroundColor(BUTTON_COLOR),
+                            BackgroundColor(if undo_busy { ROW_COLOR } else { BUTTON_COLOR }),
                             children![(
-                                Text::new("取り消す"),
+                                Text::new(if undo_busy { "取り消し中…" } else { "取り消す" }),
                                 small.clone(),
-                                TextColor(TEXT_COLOR)
+                                TextColor(if undo_busy { DIM_COLOR } else { TEXT_COLOR })
                             )],
                         ))
                         .observe(
@@ -860,7 +981,7 @@ fn spawn_plan_card(
                             move |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
                                 click.propagate(false);
                                 if !busy && !state.busy {
-                                    state.purge_plan(plan_id);
+                                    state.confirming_purge = Some(ConfirmPurge::Plan(plan_id));
                                 }
                             },
                         );

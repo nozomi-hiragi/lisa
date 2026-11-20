@@ -931,7 +931,7 @@ pub(crate) fn ui_has_pointer(window: &Window, popup: &Popup, over_banner: bool) 
 #[allow(clippy::too_many_arguments)]
 fn navigate(
     mouse: Res<ButtonInput<MouseButton>>,
-    mut keys: ResMut<ButtonInput<KeyCode>>,
+    keys: Res<ButtonInput<KeyCode>>,
     window: Single<&mut Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform, &Transform, &Projection), With<MainCamera>>,
     mut location: ResMut<Location>,
@@ -945,27 +945,12 @@ fn navigate(
     mut gesture: ResMut<crate::input::gesture::Gesture>,
     context_menu: Res<crate::ui::context_menu::ContextMenu>,
     request: Option<Res<crate::ui::context_menu::NavRequest>>,
-    mut organize: Option<ResMut<crate::organize::OrganizeState>>,
 ) {
     use crate::ui::context_menu::NavRequest;
     // 右クリックのメニューで選んだ「開く」「親へ戻る」。
     let request = request.map(|r| *r);
     if request.is_some() {
         maker.commands.remove_resource::<NavRequest>();
-    }
-    // 右クリック「移動…」の移動先を選んでいるか。`ResMut` は書き換えるまで借りない（借りるだけで「変わった」に
-    // なり、履歴パネルが毎フレーム作り直されてボタンが押せなくなるため）。
-    let picking_move = request.is_none()
-        && organize
-            .as_ref()
-            .is_some_and(|o| o.pick_move_source.is_some());
-    // 移動先選び中は、カーソルの位置によらず Esc でやめられるようにする。
-    if picking_move
-        && keys.clear_just_pressed(KeyCode::Escape)
-        && let Some(organize) = organize.as_deref_mut()
-    {
-        organize.pick_move_source = None;
-        return;
     }
     // 切り替えの途中や、メニューやジェスチャーを操作しているときは受け付けない。
     let over_banner = banners.iter().any(|h| h.get());
@@ -983,35 +968,6 @@ fn navigate(
         return;
     };
 
-    // 右クリック「移動…」の移動先を選んでいるあいだは、Esc でやめる・左クリックで移動先フォルダを確定する。
-    if picking_move && let Some(organize) = organize.as_deref_mut() {
-        if keys.just_pressed(KeyCode::Escape) {
-            organize.pick_move_source = None;
-            return;
-        }
-        if mouse.just_pressed(MouseButton::Left) {
-            if let Some(world) = window
-                .cursor_position()
-                .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
-            {
-                let path = hit_path(&maker, &nav, world);
-                let picked = *path.last().unwrap_or(&FileTree::ROOT);
-                let node = &maker.tree.nodes[picked];
-                if node.is_dir
-                    && node.remote.is_none()
-                    && node.depth >= 2
-                    && let Some(dest_dir) = crate::ui::tooltip::local_path(&maker.tree, picked)
-                    && let Some(from) = organize.pick_move_source.take()
-                {
-                    organize.user_move(from, dest_dir);
-                } else {
-                    organize.set_notice("移動先は手元のフォルダを押してください（Esc でやめる）");
-                }
-            }
-            return;
-        }
-        return;
-    }
     let old = nav.stack.clone();
     let click_at = match request {
         Some(NavRequest::ClickAt(world)) => Some(world),

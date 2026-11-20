@@ -4,7 +4,7 @@
 //! `Popover`。項目は `ContextAction` に並べ、押せるかは `availability` で決め、押したら
 //! `ContextCommand` を流して `run_command` で処理する。項目を足すときは、この 3 か所に足す。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bevy::clipboard::Clipboard;
 use bevy::input_focus::InputFocus;
@@ -76,7 +76,8 @@ pub enum ContextAction {
     CopyPath,
     Reveal,
     Rename,
-    Move,
+    Cut,
+    Paste,
     Delete,
     Details,
 }
@@ -90,7 +91,8 @@ const ITEMS: &[Option<ContextAction>] = &[
     Some(ContextAction::Reveal),
     None,
     Some(ContextAction::Rename),
-    Some(ContextAction::Move),
+    Some(ContextAction::Cut),
+    Some(ContextAction::Paste),
     Some(ContextAction::Delete),
     Some(ContextAction::Details),
 ];
@@ -109,7 +111,8 @@ impl ContextAction {
                 }
             }
             Self::Rename => "名前の変更…（準備中）",
-            Self::Move => "移動…",
+            Self::Cut => "切り取り",
+            Self::Paste => "ここに貼り付け",
             Self::Delete => "削除…",
             Self::Details => "詳細…（準備中）",
         }
@@ -124,10 +127,14 @@ pub struct Target {
     pub is_open: bool,
     /// 開いているのが Root（それより上へ戻れない）。
     pub at_root: bool,
+    /// 対象がフォルダか。
+    pub is_dir: bool,
     /// 手元のディスク上のパス。
     pub local_path: Option<PathBuf>,
     /// 手元のドライブの中のファイル・フォルダか（Root・端末・ドライブの一番上や LAN の相手は false）。
     pub local_movable: bool,
+    /// 切り取り中の手元パス。
+    pub cut_source: Option<PathBuf>,
     /// コピーするパス（手元なら絶対パス、LAN の相手なら「端末名: パス」）。
     pub path_text: Option<String>,
 }
@@ -139,8 +146,17 @@ pub fn availability(action: ContextAction, target: &Target) -> bool {
         ContextAction::Up => !target.at_root,
         ContextAction::CopyPath => target.path_text.is_some(),
         ContextAction::Reveal => target.local_path.as_ref().is_some_and(|p| p.exists()),
-        ContextAction::Move | ContextAction::Delete => {
+        ContextAction::Cut | ContextAction::Delete => {
             target.local_movable && target.local_path.as_ref().is_some_and(|p| p.exists())
+        }
+        ContextAction::Paste => {
+            let Some(from) = target.cut_source.as_ref().filter(|p| p.exists()) else { return false };
+            let dest_dir = if target.is_dir { target.local_path.clone() } else {
+                target.local_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
+            };
+            let Some(dest_dir) = dest_dir else { return false };
+            dest_dir.is_dir() && from.parent() != Some(dest_dir.as_path())
+                && !(from.is_dir() && dest_dir.starts_with(from))
         }
         // まだ作っていない。
         ContextAction::Rename | ContextAction::Details => false,
@@ -181,6 +197,7 @@ fn open_menu(
     tree: Res<FileTree>,
     layouts: Res<Layouts>,
     nav: Res<Nav>,
+    organize: Option<Res<crate::organize::OrganizeState>>,
     blocked: PointerBlocked,
     mut menu: ResMut<ContextMenu>,
     font: Res<LabelFont>,
@@ -217,7 +234,9 @@ fn open_menu(
         is_open: nav.top().node == node,
         at_root: nav.stack.len() < 2,
         local_path: local,
+        is_dir: tree.nodes[node].is_dir,
         local_movable,
+        cut_source: organize.as_ref().and_then(|o| o.cut_source.clone()),
         path_text,
     };
     let window_size = Vec2::new(window.width(), window.height());
@@ -298,9 +317,20 @@ fn run_command(
                     reveal(path);
                 }
             }
-            ContextAction::Move => {
+            ContextAction::Cut => {
                 if let (Some(path), Some(organize)) = (&target.local_path, organize.as_mut()) {
-                    organize.pick_move_source = Some(path.clone());
+                    organize.cut_source = Some(path.clone());
+                }
+            }
+            ContextAction::Paste => {
+                let from = organize.as_mut().and_then(|o| o.cut_source.take());
+                if let (Some(organize), Some(from)) = (organize.as_mut(), from) {
+                    let dest_dir = if target.is_dir { target.local_path.clone() } else {
+                        target.local_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
+                    };
+                    if let Some(dest_dir) = dest_dir {
+                        organize.user_move(from, dest_dir);
+                    }
                 }
             }
             ContextAction::Delete => {
@@ -492,8 +522,10 @@ mod tests {
             node: 5,
             is_open: false,
             at_root: false,
+            is_dir: false,
             local_path: None,
             local_movable: false,
+            cut_source: None,
             path_text: None,
         }
     }
@@ -514,24 +546,24 @@ mod tests {
         let mut t = target();
         assert!(!availability(ContextAction::CopyPath, &t));
         assert!(!availability(ContextAction::Reveal, &t));
-        assert!(!availability(ContextAction::Move, &t));
+        assert!(!availability(ContextAction::Cut, &t));
         assert!(!availability(ContextAction::Delete, &t));
         // LAN の相手のもの: コピーはできるが、手元のディスクに無いので表示・移動・削除はできない。
         t.path_text = Some("Windows PC: C:/Users".into());
         assert!(availability(ContextAction::CopyPath, &t));
         assert!(!availability(ContextAction::Reveal, &t));
-        assert!(!availability(ContextAction::Move, &t));
+        assert!(!availability(ContextAction::Cut, &t));
         assert!(!availability(ContextAction::Delete, &t));
         let here = std::env::current_dir().unwrap();
         t.local_path = Some(here.clone());
         t.path_text = Some(here.display().to_string());
         assert!(availability(ContextAction::Reveal, &t));
         // ドライブの一番上（local_movable = false）では移動・削除はできない。
-        assert!(!availability(ContextAction::Move, &t));
+        assert!(!availability(ContextAction::Cut, &t));
         assert!(!availability(ContextAction::Delete, &t));
         // ドライブの中のファイル・フォルダなら移動・削除できる。
         t.local_movable = true;
-        assert!(availability(ContextAction::Move, &t));
+        assert!(availability(ContextAction::Cut, &t));
         assert!(availability(ContextAction::Delete, &t));
     }
 
@@ -546,6 +578,31 @@ mod tests {
     }
 
     #[test]
+    fn paste_requires_a_valid_different_destination() {
+        let root = std::env::temp_dir().join(format!("lisa-paste-test-{}", std::process::id()));
+        let from = root.join("source");
+        let child = from.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let dest = root.join("destination");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut t = target();
+        t.cut_source = Some(from.clone());
+        t.is_dir = true;
+        t.local_path = Some(dest.clone());
+        assert!(availability(ContextAction::Paste, &t));
+        t.local_path = Some(child.clone());
+        assert!(!availability(ContextAction::Paste, &t));
+        t.local_path = Some(root.clone());
+        assert!(!availability(ContextAction::Paste, &t));
+        t.is_dir = false;
+        t.local_path = Some(dest.join("file.txt"));
+        assert!(availability(ContextAction::Paste, &t));
+        t.cut_source = None;
+        assert!(!availability(ContextAction::Paste, &t));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn every_action_is_listed_once() {
         let listed: Vec<_> = ITEMS.iter().flatten().copied().collect();
         for action in [
@@ -554,7 +611,8 @@ mod tests {
             ContextAction::CopyPath,
             ContextAction::Reveal,
             ContextAction::Rename,
-            ContextAction::Move,
+            ContextAction::Cut,
+            ContextAction::Paste,
             ContextAction::Delete,
             ContextAction::Details,
         ] {
