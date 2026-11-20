@@ -49,6 +49,10 @@ impl Cartridge for Text {
         head_lines(&head).map(|lines| LoadedPreview::Text { lines })
     }
 
+    fn portrait_a4(&self) -> bool {
+        true
+    }
+
     fn draw(&self, ctx: &mut DrawContext<'_, '_, '_, '_>) {
         if let Some(Preview::Text(lines)) = ctx.loaded.clone() {
             let inner = ctx.inner;

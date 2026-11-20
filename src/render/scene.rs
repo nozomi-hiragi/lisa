@@ -11,16 +11,18 @@ use crate::model::tree::{FileTree, NodeId};
 use crate::preview::PreviewRegistry;
 use crate::render::cache::FolderImages;
 use crate::render::ear::{self, EarSizes};
-use crate::render::shapes::{Painter, over};
-use crate::render::status;
+use crate::render::shapes::{Painter, UiThemeAssets, over};
+use crate::render::status::{self, FolderBodyState};
 use crate::render::tag;
 
-pub const BACKGROUND: Color = Color::srgb(0.08, 0.08, 0.1);
+pub const BACKGROUND: Color = Color::srgb_u8(5, 12, 20);
 
 /// フォルダの枠・中身・耳・プレビューを描くレイヤー（本物の描画とサムネ撮影の両方で映す）。
 pub const CONTENT_LAYER: usize = 0;
-/// 本物の場面にだけ重ねる印（重複の枠、カタログの札・暗い膜、読み込み中の光）。サムネには映さない。
+/// 本物の場面にだけ重ねる印（重複の枠、カタログの札・暗い膜、読み込み中のスピナー）。サムネには映さない。
 pub const OVERLAY_LAYER: usize = 1;
+/// 今開いているフォルダと先祖の外装。サムネには一覧の中身だけを撮る。
+pub const SHELL_LAYER: usize = 2;
 
 /// 場面の根。これを消すと場面の中身もまとめて消える。
 ///
@@ -30,7 +32,112 @@ pub const OVERLAY_LAYER: usize = 1;
 #[derive(Component)]
 pub struct SceneRoot {
     pub folder: NodeId,
+    pub focus: Option<NodeId>,
 }
+
+/// 開いたフォルダと先祖の画像・タイトルだけをまとめる。
+#[derive(Component)]
+pub(crate) struct FolderShell {
+    pub folder: NodeId,
+    pub alpha: f32,
+}
+
+fn drawn_ancestors(ancestors: &[NodeId]) -> impl Iterator<Item = NodeId> + '_ {
+    ancestors[ancestors.len().saturating_sub(2)..]
+        .iter()
+        .copied()
+        .filter(|&folder| folder != FileTree::ROOT)
+}
+
+fn draw_shell(painter: &mut Painter, source: &SceneSource, folder: NodeId, z: f32) {
+    let parent = painter.parent;
+    let layer = std::mem::replace(&mut painter.layer, RenderLayers::layer(SHELL_LAYER));
+    painter.parent = painter
+        .commands
+        .spawn((
+            FolderShell { folder, alpha: 1.0 },
+            ChildOf(parent),
+            Transform::default(),
+            Visibility::default(),
+        ))
+        .id();
+    let slot = slot_of(source.tree, source.layouts, folder);
+    let size = size_of(source.tree, source.layouts, source.ears, folder, true);
+    ear::draw_folder(
+        painter,
+        slot,
+        size,
+        Some(&source.tree.nodes[folder].name),
+        folder_color(source.tree, folder),
+        None,
+        z,
+    );
+    painter.parent = parent;
+    painter.layer = layer;
+}
+
+/// 裏撮影だけが映すレイヤー。
+pub const CAPTURE_LAYER: usize = 4;
+
+/// 本体の状態が変わったときだけ、一覧の該当タイルを作り直す。
+#[derive(Component)]
+pub(crate) struct FolderDisplay {
+    pub folder: NodeId,
+    pub appearance: Entity,
+    pub body: FolderBodyState,
+    pub load_state: crate::model::tree::LoadState,
+    pub no_cull: bool,
+    pub scale: f32,
+}
+
+pub(crate) fn folder_body(
+    tree: &FileTree,
+    images: &FolderImages,
+    id: NodeId,
+    pending: bool,
+) -> FolderBodyState {
+    let node = &tree.nodes[id];
+    FolderBodyState::new(
+        node.state,
+        images.ready(tree, id),
+        node.loaded && node.children.is_empty(),
+        pending,
+    )
+}
+
+pub(crate) fn draw_folder(
+    painter: &mut Painter,
+    source: &SceneSource,
+    child: NodeId,
+    body: &FolderBodyState,
+    live: bool,
+) {
+    let tree = source.tree;
+    let node = &tree.nodes[child];
+    let slot = slot_of(tree, source.layouts, child);
+    let size = size_of(tree, source.layouts, source.ears, child, live);
+    status::draw_folder(
+        painter,
+        node.state,
+        body,
+        slot,
+        size,
+        &node.name,
+        folder_color(tree, child),
+        node.depth as f32,
+        live,
+    );
+}
+
+#[derive(Component)]
+pub(crate) struct FolderTile {
+    pub scene: Entity,
+    pub folder: NodeId,
+}
+
+/// サムネイル画像、または画像が来るまでの三点・スピナーをまとめた部品。
+#[derive(Component)]
+pub(crate) struct FolderPreview;
 
 pub struct SceneSource<'a> {
     pub tree: &'a FileTree,
@@ -39,6 +146,7 @@ pub struct SceneSource<'a> {
     pub previews: &'a PreviewRegistry,
     pub font: &'a Handle<Font>,
     pub ears: &'a EarSizes,
+    pub theme: &'a UiThemeAssets,
     /// 重複の一覧で選んだ組の印（本物の場面だけ）。
     pub highlight: Option<&'a crate::dups::DupHighlight>,
     /// カタログの札と役割の印（本物の場面だけ）。
@@ -66,7 +174,7 @@ pub fn spawn(
     let tree = source.tree;
     let root = commands
         .spawn((
-            SceneRoot { folder },
+            SceneRoot { folder, focus },
             Transform::default(),
             Visibility::default(),
             layer.clone(),
@@ -80,27 +188,16 @@ pub fn spawn(
         layer,
         scale,
         font: source.font.clone(),
+        theme: source.theme,
         no_cull: true,
     };
 
-    // 外側のフォルダの枠。ズームの前後で、枠の外に見える色が変わらないようにする。
-    for &ancestor in ancestors {
-        if ancestor == FileTree::ROOT {
-            continue;
-        }
-        let color = folder_color(tree, ancestor);
-        let z = tree.nodes[ancestor].depth as f32 - 0.5;
-        let (slot, size) = (slot_of(source, ancestor), size_of(source, ancestor, true));
-        in_group(&mut painter, slot, size, |painter| {
-            painter.rect(slot.body, color, z);
-        });
-        ear::draw_ear(
+    for ancestor in drawn_ancestors(ancestors) {
+        draw_shell(
             &mut painter,
-            slot,
-            size,
-            &tree.nodes[ancestor].name,
-            color,
-            z,
+            source,
+            ancestor,
+            tree.nodes[ancestor].depth as f32 - 0.5,
         );
     }
 
@@ -114,6 +211,7 @@ pub fn spawn(
             true,
             Some(folder),
             Some(folder),
+            None,
         );
     }
 
@@ -121,20 +219,31 @@ pub fn spawn(
     // 縮んで譲る。画像に焼くときは耳を入れず、本体を画像いっぱいに描く。
     let node = &tree.nodes[folder];
     let z = node.depth as f32;
-    let background = folder_color(tree, folder);
-    let frame = source.layouts[folder].frame;
-    if folder == FileTree::ROOT || !live {
-        if folder != FileTree::ROOT {
-            painter.rect(frame, background, z);
-        }
-        draw_children(&mut painter, source, folder, live, None, focus);
+    let color = folder_color(tree, folder);
+    if folder == FileTree::ROOT {
+        draw_children(&mut painter, source, folder, live, None, focus, Some(root));
     } else {
-        let (slot, size) = (slot_of(source, folder), size_of(source, folder, true));
-        in_group(&mut painter, slot, size, |painter| {
-            painter.rect(frame, background, z);
-            draw_children(painter, source, folder, true, None, focus);
-        });
-        ear::draw_ear(&mut painter, slot, size, &node.name, background, z + 0.5);
+        let (slot, size) = (
+            slot_of(source.tree, source.layouts, folder),
+            size_of(source.tree, source.layouts, source.ears, folder, live),
+        );
+        if live {
+            draw_shell(&mut painter, source, folder, z);
+            in_group(&mut painter, slot, size, |painter| {
+                draw_children(painter, source, folder, true, None, focus, Some(root));
+            });
+        } else {
+            ear::draw_folder(
+                &mut painter,
+                slot,
+                ear::Size::Fixed(0.0),
+                None,
+                color,
+                None,
+                z,
+            );
+            draw_children(&mut painter, source, folder, false, None, focus, None);
+        }
         if let Some(marks) = source.catalog {
             let prev_layer = painter.layer.clone();
             painter.layer = RenderLayers::layer(OVERLAY_LAYER);
@@ -145,7 +254,39 @@ pub fn spawn(
     root
 }
 
+/// 本体の中身だけを描く。画面の本シーンとは別に管理する。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_contents(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<ColorMaterial>,
+    source: &SceneSource,
+    folder: NodeId,
+    root: Entity,
+    layer: RenderLayers,
+    scale: f32,
+    live_body: bool,
+) {
+    let mut painter = Painter {
+        commands,
+        meshes,
+        materials,
+        parent: root,
+        layer,
+        scale,
+        font: source.font.clone(),
+        theme: source.theme,
+        no_cull: true,
+    };
+    let slot = slot_of(source.tree, source.layouts, folder);
+    let size = size_of(source.tree, source.layouts, source.ears, folder, live_body);
+    in_group(&mut painter, slot, size, |painter| {
+        draw_children(painter, source, folder, false, None, None, None);
+    });
+}
+
 /// フォルダ `folder` の中身のタイルを描く。`skip` は描かない子、`focus` の周りの 8 つはカリングしない。
+#[allow(clippy::too_many_arguments)]
 fn draw_children(
     painter: &mut Painter,
     source: &SceneSource,
@@ -153,16 +294,17 @@ fn draw_children(
     live: bool,
     skip: Option<NodeId>,
     focus: Option<NodeId>,
+    tile_scene: Option<Entity>,
 ) {
     let tree = source.tree;
     let node = &tree.nodes[folder];
-    let background = folder_color(tree, folder);
+    let background = over(BACKGROUND, folder_color(tree, folder), 0.08);
     let grid = source.layouts[folder].grid;
     let columns = grid.columns.max(1) as i64;
     let at = |i: usize| ((i as i64) % columns, (i as i64) / columns);
     let focus = focus.and_then(|f| node.children.iter().position(|c| *c == f).map(at));
     for (i, &child) in node.children.iter().enumerate() {
-        if Some(child) == skip {
+        if Some(child) == skip || !source.layouts.contains(child) {
             continue;
         }
         let (column, row) = at(i);
@@ -171,25 +313,45 @@ fn draw_children(
         let l = &source.layouts[child];
         let child_node = &tree.nodes[child];
         let z = child_node.depth as f32;
-        let (slot, size) = (slot_of(source, child), size_of(source, child, live));
+        let (slot, size) = (
+            slot_of(source.tree, source.layouts, child),
+            size_of(source.tree, source.layouts, source.ears, child, live),
+        );
         if child_node.is_dir {
-            let color = folder_color(tree, child);
-            let image = source.images.ready(tree, child);
-            in_group(painter, slot, size, |painter| {
-                status::draw_folder(
-                    painter,
-                    child_node.state,
-                    l.frame,
-                    image,
-                    color,
-                    background,
-                    z,
-                    live,
-                );
-            });
-            ear::draw_ear(painter, slot, size, &child_node.name, color, z);
+            let parent = painter.parent;
+            let body = folder_body(tree, source.images, child, false);
+            if live {
+                let tile = painter
+                    .commands
+                    .spawn((ChildOf(parent), Transform::default(), Visibility::default()))
+                    .id();
+                let appearance = painter
+                    .commands
+                    .spawn((ChildOf(tile), Transform::default(), Visibility::default()))
+                    .id();
+                painter.commands.entity(tile).insert(FolderDisplay {
+                    folder: child,
+                    appearance,
+                    body: body.clone(),
+                    load_state: child_node.state,
+                    no_cull: painter.no_cull,
+                    scale: painter.scale,
+                });
+                if let Some(scene) = tile_scene {
+                    painter.commands.entity(tile).insert(FolderTile {
+                        scene,
+                        folder: child,
+                    });
+                }
+                painter.parent = appearance;
+                draw_folder(painter, source, child, &body, true);
+                painter.parent = tile;
+            } else {
+                draw_folder(painter, source, child, &body, false);
+            }
             mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
+            painter.parent = parent;
         } else {
             let loaded = crate::ui::tooltip::local_path(tree, child)
                 .and_then(|path| source.previews.images.get(&path));
@@ -207,7 +369,7 @@ fn draw_children(
                 );
             });
             // 名前はプレビューの下に、同じフォルダの中のフォルダの耳の名前と同じ大きさで書く。
-            let color = over(background, Color::WHITE, 0.9);
+            let color = Color::WHITE.with_alpha(0.92);
             ear::draw_name(painter, slot, size, &child_node.name, color, z);
             mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
@@ -303,37 +465,46 @@ fn in_group(
 }
 
 /// タイル `id` の枠の中での置き方。
-fn slot_of(source: &SceneSource, id: NodeId) -> ear::Slot {
-    let l = &source.layouts[id];
+pub(super) fn slot_of(tree: &FileTree, layouts: &Layouts, id: NodeId) -> ear::Slot {
+    let l = &layouts[id];
     ear::Slot {
         cell: l.cell,
         body: l.frame,
-        name_below: !source.tree.nodes[id].is_dir,
+        name_below: !tree.nodes[id].is_dir,
     }
 }
 
 /// タイル `id` の耳（ファイルは名前）の大きさの決め方。`live` ならズームに合わせて変え、そうで
 /// なければ親を開いたときの大きさに決める（画像に焼くとき）。
-fn size_of<'a>(source: &SceneSource<'a>, id: NodeId, live: bool) -> ear::Size<'a> {
-    let node = &source.tree.nodes[id];
-    let parent = node.parent.map(|p| &source.layouts[p]);
-    let in_list = parent.map_or(0.0, |p| p.grid.ear);
-    if !live {
-        return ear::Size::Fixed(in_list);
-    }
+pub(super) fn size_of<'a>(
+    tree: &FileTree,
+    layouts: &Layouts,
+    ears: &'a EarSizes,
+    id: NodeId,
+    live: bool,
+) -> ear::Size<'a> {
+    let node = &tree.nodes[id];
+    let parent = node.parent.map(|p| &layouts[p]);
+    let in_list = parent.map_or(0.0, |_| {
+        layouts[id].cell.height() * crate::layout::MAX_EAR_IN_CELL
+    });
     let size_width = if node.is_dir {
-        source.layouts[id].frame.width()
+        layouts[id].frame.width()
     } else {
         parent.map_or(0.0, |p| p.grid.body_width)
     };
-    ear::Size::Live(
-        source.ears,
-        ear::EarOf {
-            size_width,
-            parent_width: parent.map_or(size_width, |p| p.frame.width()),
-            in_list,
-        },
-    )
+    let of = ear::EarOf {
+        size_width,
+        selected_fit: node.is_dir.then(|| layouts[id].fit.size()),
+        selected_height: (layouts[id].cell.max.y - layouts[id].frame.max.y).max(0.0),
+        parent_width: parent.map_or(size_width, |p| p.frame.width()),
+        in_list,
+    };
+    if live {
+        ear::Size::Live(ears, of)
+    } else {
+        ear::Size::Frozen(ears, of)
+    }
 }
 
 /// フォルダの枠の色。親の枠の上に、端末の色を薄く重ねる（不透明な色として求める）。
@@ -345,8 +516,8 @@ pub fn folder_color(tree: &FileTree, id: NodeId) -> Color {
             let hue = [210.0, 140.0, 30.0, 290.0][node.device % 4];
             over(
                 folder_color(tree, parent),
-                Color::hsl(hue, 0.35, 0.55),
-                0.10,
+                Color::hsl(hue, 0.83, 0.72),
+                0.85,
             )
         }
     }
@@ -355,3 +526,50 @@ pub fn folder_color(tree: &FileTree, id: NodeId) -> Color {
 /// 名前に使うフォント。
 #[derive(Resource)]
 pub struct LabelFont(pub Handle<Font>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fitted_folder_uses_the_exact_same_body_at_every_window_size() {
+        let tree = FileTree::deep(6);
+        let settings = crate::settings::Settings::default();
+        let folder = tree
+            .nodes
+            .iter()
+            .position(|node| node.name == "底")
+            .unwrap();
+        for (width, height) in [
+            (500.0, 400.0),
+            (960.0, 600.0),
+            (1280.0, 800.0),
+            (1920.0, 1080.0),
+        ] {
+            for panel in [0.0, 240.0] {
+                let viewport = Vec2::new(width - panel, height - 32.0);
+                let (spec, ears) = crate::view::ear_spec_for_view(&settings, viewport);
+                for anchor in [folder, tree.nodes[folder].parent.unwrap()] {
+                    let layouts =
+                        crate::layout::layout(&tree, anchor, crate::layout::anchor_body(), spec);
+                    let slot = slot_of(&tree, &layouts, folder);
+                    let scale = crate::layout::fit_scale(layouts[folder].fit.size(), viewport);
+                    for scale in [scale, scale * 0.65] {
+                        let live = size_of(&tree, &layouts, &ears, folder, true);
+                        let capture = size_of(&tree, &layouts, &ears, folder, false);
+                        assert_eq!(slot.yielded(live.height(scale)), (1.0, slot.body));
+                        assert_eq!(slot.yielded(capture.height(scale)), (1.0, slot.body));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_parent_and_grandparent_can_spawn_shells() {
+        let ancestors = [FileTree::ROOT, 10, 20, 30];
+        assert_eq!(drawn_ancestors(&ancestors).collect::<Vec<_>>(), [20, 30]);
+        assert_eq!(drawn_ancestors(&ancestors[..2]).collect::<Vec<_>>(), [10]);
+        assert_eq!(drawn_ancestors(&ancestors[..1]).count(), 0);
+    }
+}

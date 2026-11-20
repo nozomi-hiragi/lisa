@@ -80,6 +80,10 @@ pub trait Cartridge: Send + Sync + 'static {
     fn load(&self, _path: &Path) -> Option<LoadedPreview> {
         None
     }
+    /// 紙の形を縦 A4 にする。
+    fn portrait_a4(&self) -> bool {
+        false
+    }
     /// 紙の内側を描く。
     fn draw(&self, ctx: &mut DrawContext<'_, '_, '_, '_>);
 }
@@ -96,6 +100,10 @@ impl Cartridge for BuiltinFallback {
 
     fn extensions(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    fn portrait_a4(&self) -> bool {
+        true
     }
 
     fn draw(&self, _ctx: &mut DrawContext<'_, '_, '_, '_>) {}
@@ -179,7 +187,41 @@ pub fn extension(name: &str) -> &str {
     name.rsplit_once('.').map_or("", |(_, ext)| ext)
 }
 
-/// 紙の形の背景（右上が折れている）と、選んだカートリッジの絵を描く。`background` は下の色。
+fn paper_frame(frame: Rect, portrait_a4: bool) -> Rect {
+    if !portrait_a4 {
+        return frame;
+    }
+    let size = Vec2::new(
+        (frame.height() * std::f32::consts::FRAC_1_SQRT_2).min(frame.width()),
+        frame.height(),
+    );
+    Rect::from_center_size(frame.center(), size)
+}
+
+fn preview_geometry(
+    frame: Rect,
+    portrait_a4: bool,
+    loaded: Option<&Preview>,
+) -> (Option<Rect>, Rect) {
+    if matches!(loaded, Some(Preview::Image(_, size)) if size.x > 0 && size.y > 0) {
+        return (None, frame);
+    }
+    let paper = paper_frame(frame, portrait_a4);
+    let pad = if portrait_a4 {
+        paper.size().min_element()
+    } else {
+        paper.height()
+    } * 0.14;
+    (
+        Some(paper),
+        Rect {
+            min: paper.min + pad,
+            max: paper.max - pad,
+        },
+    )
+}
+
+/// カートリッジの絵を描く。画像がまだ無い場合やテキストには、折れ耳の紙を敷く。
 pub fn draw(
     registry: &PreviewRegistry,
     painter: &mut Painter,
@@ -189,35 +231,39 @@ pub fn draw(
     z: f32,
     loaded: Option<Preview>,
 ) {
+    let cartridge = registry.pick(name);
+    let portrait_a4 = cartridge.portrait_a4();
+    let (paper_rect, inner) = preview_geometry(frame, portrait_a4, loaded.as_ref());
     let paper = Color::srgb(0.85, 0.87, 0.95);
     let page = over(background, paper, 0.10);
-    let fold = over(background, paper, 0.22);
-    let c = frame.height() * 0.15;
-    painter.rect(
-        Rect::new(frame.min.x, frame.min.y, frame.max.x - c, frame.max.y),
-        page,
-        z,
-    );
-    painter.rect(
-        Rect::new(frame.max.x - c, frame.min.y, frame.max.x, frame.max.y - c),
-        page,
-        z,
-    );
-    painter.triangle(
-        [
-            Vec2::new(frame.max.x - c, frame.max.y),
-            Vec2::new(frame.max.x - c, frame.max.y - c),
-            Vec2::new(frame.max.x, frame.max.y - c),
-        ],
-        fold,
-        z,
-    );
+    if let Some(frame) = paper_rect {
+        let fold = over(background, paper, 0.22);
+        let c = if portrait_a4 {
+            frame.size().min_element() * 0.22
+        } else {
+            frame.height() * 0.15
+        };
+        painter.rect(
+            Rect::new(frame.min.x, frame.min.y, frame.max.x - c, frame.max.y),
+            page,
+            z,
+        );
+        painter.rect(
+            Rect::new(frame.max.x - c, frame.min.y, frame.max.x, frame.max.y - c),
+            page,
+            z,
+        );
+        painter.triangle(
+            [
+                Vec2::new(frame.max.x - c, frame.max.y),
+                Vec2::new(frame.max.x - c, frame.max.y - c),
+                Vec2::new(frame.max.x, frame.max.y - c),
+            ],
+            fold,
+            z,
+        );
+    }
 
-    let pad = frame.height() * 0.14;
-    let inner = Rect {
-        min: frame.min + pad,
-        max: frame.max - pad,
-    };
     let mut ctx = DrawContext {
         painter,
         name,
@@ -227,7 +273,7 @@ pub fn draw(
         z: z + 0.05,
         loaded,
     };
-    registry.pick(name).draw(&mut ctx);
+    cartridge.draw(&mut ctx);
 }
 
 /// プレビューのカートリッジを登録するプラグイン。
@@ -470,6 +516,77 @@ mod tests {
         }
 
         fn draw(&self, _ctx: &mut DrawContext<'_, '_, '_, '_>) {}
+    }
+
+    #[test]
+    fn a_loaded_image_uses_the_full_frame_without_paper() {
+        let frame = Rect::new(10.0, 20.0, 170.0, 140.0);
+        let image = Preview::Image(Handle::default(), UVec2::new(1024, 768));
+        for portrait in [false, true] {
+            assert_eq!(
+                preview_geometry(frame, portrait, Some(&image)),
+                (None, frame)
+            );
+        }
+    }
+
+    #[test]
+    fn missing_text_and_invalid_image_previews_keep_the_padded_paper() {
+        let frame = Rect::new(10.0, 20.0, 170.0, 140.0);
+        let text = Preview::Text(vec!["sample".to_string()].into());
+        let invalid = Preview::Image(Handle::default(), UVec2::new(100, 0));
+        for loaded in [None, Some(&text), Some(&invalid)] {
+            for portrait in [false, true] {
+                let (paper, inner) = preview_geometry(frame, portrait, loaded);
+                let paper = paper.unwrap();
+                let pad = if portrait {
+                    paper.width()
+                } else {
+                    frame.height()
+                } * 0.14;
+                assert_eq!(paper.center(), frame.center());
+                assert_eq!(inner.min, paper.min + pad);
+                assert_eq!(inner.max, paper.max - pad);
+                if portrait {
+                    assert!(
+                        (paper.width() / paper.height() - std::f32::consts::FRAC_1_SQRT_2).abs()
+                            < 1e-6
+                    );
+                } else {
+                    assert_eq!(paper, frame);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_document_cartridges_use_portrait_a4_paper() {
+        let mut registry = PreviewRegistry::default();
+        cartridges::register(&mut registry);
+        let frame = Rect::new(-30.0, 10.0, 130.0, 130.0);
+        for name in [
+            "unknown.custom",
+            "notes.txt",
+            "notes.md",
+            "memo.docx",
+            "data.xlsx",
+            "brief.pdf",
+        ] {
+            let paper = paper_frame(frame, registry.pick(name).portrait_a4());
+            assert!(
+                (paper.width() / paper.height() - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6,
+                "{name}"
+            );
+            assert_eq!(paper.center(), frame.center(), "{name}");
+            assert_eq!(paper.height(), frame.height(), "{name}");
+        }
+        for name in ["photo.png", "photo.heic", "clip.mov", "clip.mp4"] {
+            assert_eq!(
+                paper_frame(frame, registry.pick(name).portrait_a4()),
+                frame,
+                "{name}"
+            );
+        }
     }
 
     #[test]

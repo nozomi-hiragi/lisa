@@ -92,9 +92,88 @@ impl Layouts {
         self.map.contains_key(&id)
     }
 
+    /// 探索予算の外でも、必要になったフォルダの直下だけを補う。
+    pub fn ensure_children(&mut self, tree: &FileTree, folder: NodeId, ears: EarSpec) -> bool {
+        let Some(node) = tree.nodes.get(folder) else {
+            return false;
+        };
+        let frame = self[folder].frame;
+        if !node.is_dir || !valid_frame(frame) || node.children.iter().all(|&id| self.contains(id))
+        {
+            return false;
+        }
+        let (grid, children) = place(tree, folder, frame, ears);
+        self.map.get_mut(&folder).expect("配置済みのフォルダ").grid = grid;
+        let mut inserted = false;
+        for (id, entry) in children {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.map.entry(id) {
+                slot.insert(entry);
+                inserted = true;
+            }
+        }
+        inserted
+    }
+
+    /// 配置済みの先祖から道のりを補い、最後のフォルダの直下まで使えるようにする。
+    pub fn ensure_path(&mut self, tree: &FileTree, id: NodeId, ears: EarSpec) {
+        if self.contains(id) {
+            self.ensure_children(tree, id, ears);
+            return;
+        }
+        if let Some(path) = tree.path_from_root(id)
+            && let Some(start) = path.iter().rposition(|&folder| self.contains(folder))
+        {
+            for &folder in &path[start..] {
+                self.ensure_children(tree, folder, ears);
+            }
+        }
+    }
+
     /// 並べてあるノード。
     pub fn ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.map.keys().copied()
+    }
+}
+
+pub(crate) fn valid_frame(rect: Rect) -> bool {
+    let size = rect.size();
+    rect.min.is_finite() && rect.max.is_finite() && size.is_finite() && size.min_element() > 0.0
+}
+
+/// 二つの基準矩形の間の相似変換。差を取ってから変換するまで f64 のまま扱う。
+#[derive(Clone, Copy)]
+pub(crate) struct Rebase {
+    old_center: bevy::math::DVec2,
+    new_center: bevy::math::DVec2,
+    factor: f64,
+}
+
+impl Rebase {
+    pub(crate) fn new(old: Rect, new: Rect) -> Option<Self> {
+        if !valid_frame(old) || !valid_frame(new) {
+            return None;
+        }
+        let center = |rect: Rect| (rect.min.as_dvec2() + rect.max.as_dvec2()) * 0.5;
+        let height = |rect: Rect| f64::from(rect.max.y) - f64::from(rect.min.y);
+        Some(Self {
+            old_center: center(old),
+            new_center: center(new),
+            factor: height(new) / height(old),
+        })
+    }
+
+    pub(crate) fn position(self, pos: Vec2) -> Vec2 {
+        ((pos.as_dvec2() - self.old_center) * self.factor + self.new_center).as_vec2()
+    }
+
+    pub(crate) fn scale(self, scale: f32) -> f32 {
+        (f64::from(scale) * self.factor) as f32
+    }
+    pub(crate) fn vector(self, vector: Vec2) -> Vec2 {
+        (vector.as_dvec2() * self.factor).as_vec2()
+    }
+    pub(crate) fn log_scale(self, ln: f32) -> f32 {
+        (f64::from(ln) + self.factor.ln()) as f32
     }
 }
 
@@ -125,20 +204,15 @@ pub const PREVIEW_ASPECT: f32 = 4.0 / 3.0;
 pub const FIT_MARGIN: f32 = 1.03;
 
 /// 一覧の中の耳（ファイルは名前）の高さの上限（タイルの高さに対する割合）。
-const MAX_EAR_IN_CELL: f32 = 0.4;
+pub(crate) const MAX_EAR_IN_CELL: f32 = 0.4;
 /// タイルどうしの隙間（タイルの幅に対する割合）。
 const GAP: f32 = 0.08;
 /// タイルの幅の上限（並べる場所の幅に対する割合）。中身が少なくても、入れ子に見えるように。
 const MAX_CELL: f32 = 0.5;
 
-/// 開いたフォルダを画面に収めたときの、本体の大きさ（論理ピクセル）。
-/// `view` はメニューバーの下の領域の大きさ、`ear_px` は開いたフォルダの耳の高さ。
-/// 本体の上に耳の分を取り、全体を余白つきで収める。
-pub fn fitted_size(view: Vec2, ear_px: f32) -> Vec2 {
-    let width = (view.x / FIT_MARGIN)
-        .min((view.y / FIT_MARGIN - ear_px) * BODY_ASPECT)
-        .max(1.0);
-    Vec2::new(width, width / BODY_ASPECT)
+/// ワールドの枠を、与えられた描画領域に余白付きで収める倍率。
+pub(crate) fn fit_scale(size: Vec2, viewport: Vec2) -> f32 {
+    (size.x / viewport.x).max(size.y / viewport.y) * FIT_MARGIN
 }
 
 /// 耳の大きさの設定を、開いたフォルダの本体の高さ `fitted_height` に対する割合に直したもの。
@@ -151,10 +225,11 @@ pub struct EarSpec {
 }
 
 impl EarSpec {
-    pub fn new(settings: &crate::settings::Settings, fitted_height: f32) -> Self {
+    pub fn new(settings: &crate::settings::Settings) -> Self {
+        const REF_FITTED_HEIGHT: f32 = 720.0;
         Self {
-            preview: settings.ear_preview_px / fitted_height,
-            selected: settings.ear_selected_px / fitted_height,
+            preview: settings.ear_preview_px / REF_FITTED_HEIGHT,
+            selected: settings.ear_selected_px / REF_FITTED_HEIGHT,
         }
     }
 }
@@ -166,18 +241,35 @@ impl EarSpec {
 pub fn layout(tree: &FileTree, anchor: NodeId, body: Rect, ears: EarSpec) -> Layouts {
     // 祖先の本体を、子の位置から逆に求める（並べ方は大きさに比例するだけ）。
     let mut chain = vec![(anchor, body)];
-    while let Some(parent) = tree.nodes[chain[chain.len() - 1].0].parent {
-        let (child, child_body) = chain[chain.len() - 1];
-        let unit = Rect::new(0.0, 0.0, BODY_ASPECT, 1.0);
+    let unit = Rect::new(0.0, 0.0, BODY_ASPECT, 1.0);
+    let mut min = body.min.as_dvec2();
+    let mut height = f64::from(body.max.y) - f64::from(body.min.y);
+    while let Some(parent) = tree.nodes[chain.last().unwrap().0].parent {
+        let child = chain.last().unwrap().0;
         let (_, placed) = place(tree, parent, unit, ears);
-        let in_unit = placed
+        let Some(in_unit) = placed
             .iter()
             .find(|(id, _)| *id == child)
             .map(|(_, l)| l.frame)
-            .expect("子は親の中に並ぶ");
-        let size = child_body.width() / in_unit.width();
-        let min = child_body.min - in_unit.min * size;
-        chain.push((parent, Rect::from_corners(min, min + unit.max * size)));
+        else {
+            break;
+        };
+        height /= f64::from(in_unit.height());
+        min -= in_unit.min.as_dvec2() * height;
+        let max = min + unit.max.as_dvec2() * height;
+        if !height.is_finite()
+            || height > 1e30
+            || !min.is_finite()
+            || !max.is_finite()
+            || min.abs().max(max.abs()).max_element() > 1e30
+        {
+            break;
+        }
+        let parent_body = Rect::from_corners(min.as_vec2(), max.as_vec2());
+        if !valid_frame(parent_body) {
+            break;
+        }
+        chain.push((parent, parent_body));
     }
     chain.reverse();
 
@@ -220,7 +312,12 @@ pub fn layout(tree: &FileTree, anchor: NodeId, body: Rect, ears: EarSpec) -> Lay
         place_into(tree, id, ears, &precise, &mut map);
         queue.extend(tree.nodes[id].children.iter().copied());
     }
-    Layouts { anchor, map }
+    let mut layouts = Layouts { anchor, map };
+    layouts.ensure_children(tree, anchor, ears);
+    if let Some(parent) = tree.nodes[anchor].parent {
+        layouts.ensure_children(tree, parent, ears);
+    }
+    layouts
 }
 
 /// `id` の子を並べて `map` に入れる（`id` はもう並べてあること）。`precise` にある祖先は、
@@ -291,6 +388,35 @@ pub fn choose_grid(count: usize, area: Vec2, cell_ratio: f32) -> (usize, f32) {
 
 /// フォルダ `id` の本体を `frame` に置いたときの、中身の並べ方と、子の配置（子の `grid` は空）。
 fn place(
+    tree: &FileTree,
+    id: NodeId,
+    frame: Rect,
+    ears: EarSpec,
+) -> (GridLayout, Vec<(NodeId, NodeLayout)>) {
+    if !valid_frame(frame) {
+        return (GridLayout::default(), Vec::new());
+    }
+    let unit = Rect::new(0.0, 0.0, BODY_ASPECT, 1.0);
+    let (mut grid, mut children) = place_unit(tree, id, unit, ears);
+    let scale = f64::from(frame.height());
+    let origin = frame.min.as_dvec2();
+    let transform = |rect: Rect| {
+        Rect::from_corners(
+            (origin + rect.min.as_dvec2() * scale).as_vec2(),
+            (origin + rect.max.as_dvec2() * scale).as_vec2(),
+        )
+    };
+    grid.body_width *= scale as f32;
+    grid.ear *= scale as f32;
+    for (_, child) in &mut children {
+        child.cell = transform(child.cell);
+        child.frame = transform(child.frame);
+        child.fit = transform(child.fit);
+    }
+    (grid, children)
+}
+
+fn place_unit(
     tree: &FileTree,
     id: NodeId,
     frame: Rect,
@@ -425,6 +551,69 @@ mod tests {
         // Root まで並んでいて、大きさは有限。
         assert!(near.contains(FileTree::ROOT));
         assert!(near[FileTree::ROOT].frame.width().is_finite());
+    }
+
+    #[test]
+    fn missing_children_can_be_added_after_the_budget_is_exhausted() {
+        let tree = FileTree::wide(3, 5_001);
+        let mut laid = layout(&tree, FileTree::ROOT, anchor_body(), EARS);
+        let child = *tree.nodes[FileTree::ROOT].children.last().unwrap();
+        let old_frame = laid[child].frame;
+        assert!(
+            tree.nodes[child]
+                .children
+                .iter()
+                .any(|&id| !laid.contains(id))
+        );
+        assert!(laid.ensure_children(&tree, child, EARS));
+        assert_eq!(laid[child].frame, old_frame);
+        assert!(
+            tree.nodes[child]
+                .children
+                .iter()
+                .all(|&id| valid_frame(laid[id].frame))
+        );
+        assert!(!laid.ensure_children(&tree, child, EARS));
+    }
+
+    #[test]
+    fn very_remote_ancestors_are_truncated_without_nonfinite_rectangles() {
+        let tree = FileTree::deep(160);
+        let bottom = tree
+            .nodes
+            .iter()
+            .position(|node| node.name == "底")
+            .unwrap();
+        let laid = layout(&tree, bottom, anchor_body(), EARS);
+        assert!(!laid.contains(FileTree::ROOT));
+        assert!(laid.ids().all(|id| valid_frame(laid[id].frame)));
+        assert!(
+            tree.nodes[bottom]
+                .children
+                .iter()
+                .all(|&id| laid.contains(id))
+        );
+    }
+
+    #[test]
+    fn relayout_keeps_the_active_body_and_children_when_other_counts_change() {
+        let mut tree = FileTree::deep(4);
+        let active = tree
+            .nodes
+            .iter()
+            .position(|node| node.name == "底")
+            .unwrap();
+        let old = layout(&tree, FileTree::ROOT, anchor_body(), EARS);
+        let frame = old[active].frame;
+        let parent = tree.nodes[active].parent.unwrap();
+        tree.nodes[parent].children.retain(|&id| id == active);
+        let new = layout(&tree, active, frame, EARS);
+        assert_eq!(new[active].frame, frame);
+        for &child in &tree.nodes[active].children {
+            assert_eq!(new[child].cell, old[child].cell);
+            assert_eq!(new[child].frame, old[child].frame);
+            assert_eq!(new[child].fit, old[child].fit);
+        }
     }
 
     #[test]

@@ -30,6 +30,15 @@ pub(crate) struct Animating {
     pub(crate) ease: Ease,
 }
 
+impl Animating {
+    pub(super) fn rebase(&mut self, rebase: Rebase) {
+        self.from_pos = rebase.position(self.from_pos);
+        self.to_pos = rebase.position(self.to_pos);
+        self.from_scale = rebase.scale(self.from_scale);
+        self.to_scale = rebase.scale(self.to_scale);
+    }
+}
+
 /// 右に開いている一覧の幅（論理ピクセル、`f32` のビット列）。その分だけ、木を映す領域が狭くなる。
 static SIDE_PX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -79,8 +88,7 @@ pub(crate) fn view_width(window: &Window) -> f32 {
 pub(crate) fn fit(rect: Rect, window: &Window) -> (Vec2, f32) {
     let view_height = window.height() - BAR_PX;
     // 周りに少し余白を残す（外側のフォルダの色が見え、耳も端に貼りつかない）。
-    let scale = (rect.width() / view_width(window)).max(rect.height() / view_height)
-        * crate::layout::FIT_MARGIN;
+    let scale = crate::layout::fit_scale(rect.size(), Vec2::new(view_width(window), view_height));
     // 画面の中心より、バーの高さの半分だけ下に枠の中心が来るようにする。
     (rect.center() + Vec2::new(0.0, BAR_PX / 2.0 * scale), scale)
 }
@@ -91,11 +99,17 @@ pub(crate) fn refit_on_resize(
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
     layouts: Res<Layouts>,
+    settings: Res<Settings>,
+    mut ears: ResMut<EarSizes>,
     nav: Res<Nav>,
     animating: Option<Res<Animating>>,
     gesture: Res<crate::input::gesture::Gesture>,
 ) {
-    if resized.read().last().is_none() || animating.is_some() || gesture.active() {
+    if resized.read().last().is_none() {
+        return;
+    }
+    *ears = ear_spec(&settings, &window).1;
+    if animating.is_some() || gesture.active() {
         return;
     }
     let (pos, scale) = fit(nav.top().frame(&layouts), &window);
@@ -109,13 +123,14 @@ pub(crate) fn refit_on_resize(
     }
 }
 
-pub(crate) fn animate_camera(
+pub(super) fn animate_camera(
     animating: Option<Res<Animating>>,
     camera: Single<(&mut Transform, &mut Projection), With<MainCamera>>,
     mut current: ResMut<CurrentScene>,
     mut maker: SceneMaker,
     nav: Res<Nav>,
     window: Single<&Window, With<PrimaryWindow>>,
+    prepared: Query<&super::center::Contents>,
 ) {
     let Some(anim) = animating else {
         return;
@@ -148,8 +163,9 @@ pub(crate) fn animate_camera(
     }
     maker.commands.remove_resource::<Animating>();
     if anim.then_show {
-        // 画像の上に本物の場面を重ねてフェードインし、終わったら古い場面を消す。
+        // 中身が準備できていればそのまま本シーンへ切り替える。未読込時は従来のフェードを使う。
         let path = scene_path(&nav, &maker.tree);
+        maker.ensure_folder(path.last().unwrap().node);
         let (_, scene_scale) = fit(path[path.len() - 1].frame(&maker.layouts), &window);
         let scene_scale = if scene_scale > 0.0 && scene_scale.is_finite() {
             scene_scale
@@ -158,6 +174,15 @@ pub(crate) fn animate_camera(
         };
         let old = current.0;
         current.0 = maker.spawn(path, scene_scale);
+        let target = path[path.len() - 1].node;
+        if maker.images.ready(&maker.tree, target).is_none()
+            || prepared
+                .iter()
+                .any(|item| item.scene == old && item.folder == target)
+        {
+            maker.commands.entity(old).despawn();
+            return;
+        }
         maker.commands.entity(current.0).insert((
             Fade {
                 started: Instant::now(),
