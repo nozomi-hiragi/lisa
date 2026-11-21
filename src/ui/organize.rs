@@ -6,7 +6,6 @@
 //! - 履歴のパネルはメニューバーの「整理」で開け閉めし、重複・カタログのパネルと同じく右からすべり出す
 //!   （同時には開かない）。
 
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::ui::ScrollPosition;
 use bevy::window::RequestRedraw;
@@ -20,6 +19,8 @@ use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::JumpTo;
 use crate::ui::menu::BAR_PX;
+
+use super::{SidePanelLayout, SidePanelList};
 
 /// 履歴パネルの幅（論理ピクセル。重複・カタログと同じ）。
 pub const PANEL_PX: f32 = 380.0;
@@ -48,8 +49,6 @@ const ACCENT: Color = palette::WARNING;
 
 /// すべり出しにかける時間（秒）。
 const SLIDE_SECONDS: f32 = 0.22;
-/// 1 回のホイールで動かす量（行単位のとき）。
-const LINE_PX: f32 = 24.0;
 
 pub struct OrganizePanelPlugin;
 
@@ -58,10 +57,9 @@ impl Plugin for OrganizePanelPlugin {
         app.add_systems(PostStartup, spawn_ui).add_systems(
             Update,
             (
-                only_one_panel,
-                show_panel,
+                only_one_panel.before(SidePanelLayout),
+                show_panel.in_set(SidePanelLayout),
                 fill_panel,
-                scroll_panel,
                 update_banners,
             )
                 .chain(),
@@ -202,6 +200,7 @@ fn spawn_ui(mut commands: Commands) {
                     ..default()
                 },
                 ScrollPosition::default(),
+                SidePanelList::default(),
             ));
         });
 }
@@ -232,8 +231,10 @@ fn show_panel(
     mut shown: Local<f32>,
     mut last: Local<Option<std::time::Instant>>,
     mut panel: Single<&mut Node, With<Panel>>,
+    mut list: Single<&mut SidePanelList, With<List>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
+    list.closing = !organize.panel_open;
     let target = if organize.panel_open { 1.0 } else { 0.0 };
     let now = std::time::Instant::now();
     let dt = last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
@@ -1144,29 +1145,6 @@ fn spawn_plan_card(
                 commands.insert_resource(JumpTo(chain.clone()));
             });
         }
-    }
-}
-
-/// 履歴パネルの上でホイールを回したらスクロールする。
-fn scroll_panel(
-    state: Res<OrganizeState>,
-    mut wheel: MessageReader<MouseWheel>,
-    window: Single<&Window>,
-    mut list: Single<&mut ScrollPosition, With<List>>,
-) {
-    let over = state.panel_open
-        && window
-            .cursor_position()
-            .is_some_and(|p| p.x > crate::view::view_width(&window) && p.y > BAR_PX);
-    for event in wheel.read() {
-        if !over {
-            continue;
-        }
-        let dy = match event.unit {
-            MouseScrollUnit::Line => event.y * LINE_PX,
-            MouseScrollUnit::Pixel => event.y,
-        };
-        list.y = (list.y - dy).max(0.0);
     }
 }
 

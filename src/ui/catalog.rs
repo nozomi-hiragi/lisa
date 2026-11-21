@@ -10,7 +10,6 @@
 
 use std::collections::BTreeMap;
 
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::ui::ScrollPosition;
 use bevy::window::RequestRedraw;
@@ -23,6 +22,8 @@ use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::JumpTo;
 use crate::ui::menu::BAR_PX;
+
+use super::{SidePanelLayout, SidePanelList};
 use crate::view::Nav;
 
 /// パネルの幅（論理ピクセル）。
@@ -37,8 +38,6 @@ const DIM_COLOR: Color = palette::MUTED;
 const ERROR_COLOR: Color = palette::ERROR;
 /// すべり出しにかける時間（秒）。
 const SLIDE_SECONDS: f32 = 0.22;
-/// 1 回のホイールで動かす量（行単位のとき）。
-const LINE_PX: f32 = 24.0;
 
 pub struct CatalogPanelPlugin;
 
@@ -46,7 +45,12 @@ impl Plugin for CatalogPanelPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PostStartup, spawn_panel).add_systems(
             Update,
-            (only_one_panel, show_panel, fill_panel, scroll_panel).chain(),
+            (
+                only_one_panel.before(SidePanelLayout),
+                show_panel.in_set(SidePanelLayout),
+                fill_panel,
+            )
+                .chain(),
         );
     }
 }
@@ -86,6 +90,7 @@ fn spawn_panel(mut commands: Commands) {
                     ..default()
                 },
                 ScrollPosition::default(),
+                SidePanelList::default(),
             ));
         });
 }
@@ -105,8 +110,10 @@ fn show_panel(
     mut shown: Local<f32>,
     mut last: Local<Option<std::time::Instant>>,
     mut panel: Single<&mut Node, With<Panel>>,
+    mut list: Single<&mut SidePanelList, With<List>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
+    list.closing = !view.open;
     let target = if view.open { 1.0 } else { 0.0 };
     let now = std::time::Instant::now();
     let dt = last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
@@ -488,37 +495,6 @@ fn chip_row(
             .observe(move |_: On<PointerClick>| on_click(i));
         }
     });
-}
-
-/// パネルの上でホイールを回したら、一覧を動かす。
-fn scroll_panel(
-    view: Res<CatalogView>,
-    mut wheel: MessageReader<MouseWheel>,
-    window: Single<&Window>,
-    list: Single<(&mut ScrollPosition, &ComputedNode), With<List>>,
-) {
-    let (mut scroll, node) = list.into_inner();
-    // 一番下より先へは進めない（進めた分が溜まると、戻すときに動かなくなる）。中身をまだ並べていない
-    // フレーム（作り直した直後）は、下の端が分からないので上だけ止める。
-    let bottom = ((node.content_size.y - node.size.y + node.padding.max_inset.y).max(0.0)
-        * node.inverse_scale_factor)
-        .max(0.0);
-    let laid_out = node.content_size.y > 0.0;
-    let over = view.open
-        && window
-            .cursor_position()
-            .is_some_and(|p| p.x > crate::view::view_width(&window) && p.y > BAR_PX);
-    for event in wheel.read() {
-        if !over {
-            continue;
-        }
-        let dy = match event.unit {
-            MouseScrollUnit::Line => event.y * LINE_PX,
-            MouseScrollUnit::Pixel => event.y,
-        };
-        let y = (scroll.y - dy).max(0.0);
-        scroll.y = if laid_out { y.min(bottom) } else { y };
-    }
 }
 
 /// 読みやすい大きさ（1024 区切り）。
