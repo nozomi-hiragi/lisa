@@ -12,8 +12,40 @@ pub struct TitleSuffix(pub Option<String>);
 
 /// 今いる場所を、ウィンドウのタイトルとメニューバーに出す。
 pub(crate) fn show_breadcrumb(commands: &mut Commands, tree: &FileTree, node: NodeId) {
-    commands.insert_resource(Breadcrumb(tree.path(node)));
-    commands.insert_resource(MenuBreadcrumb(tree.path(node)));
+    let parts = crate::model::display_path::tree_parts(tree, node);
+    let text = lisa_core::display_path::text(&parts);
+    let steps = crate::model::display_path::steps(tree, node).unwrap_or_default();
+    commands.insert_resource(Breadcrumb(text.clone()));
+    commands.insert_resource(MenuBreadcrumb { text, parts, steps });
+}
+
+/// 木が作り直されると、登録前の項目を見分ける印（`Step::Attached`）も変わる。
+/// 今の場所のパンくずと正の場所を、今の木から取り直す。
+pub(crate) fn refresh_breadcrumb_steps(
+    tree: Res<FileTree>,
+    nav: Res<Nav>,
+    breadcrumb: Option<ResMut<MenuBreadcrumb>>,
+    mut location: ResMut<Location>,
+) {
+    if !tree.is_changed() {
+        return;
+    }
+    let node = nav.top().node;
+    let Some(steps) = crate::model::display_path::steps(&tree, node) else {
+        return;
+    };
+    if let Some(mut breadcrumb) = breadcrumb
+        && breadcrumb.steps != steps
+        && breadcrumb.parts.len() == steps.len()
+    {
+        breadcrumb.steps = steps;
+    }
+    if matches!(*location, Location::Attached(_)) {
+        let fresh = Location::from_tree(&tree, node);
+        if *location != fresh {
+            *location = fresh;
+        }
+    }
 }
 
 /// ウィンドウのタイトル。今いる場所に、あればデバッグ情報を添える。変わったときだけ書き換える。

@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod cloud;
 pub mod db;
+pub mod display_path;
 pub mod dups;
 #[cfg(target_os = "macos")]
 pub mod fsevents;

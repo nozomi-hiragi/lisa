@@ -603,12 +603,13 @@ fn collect_debug_state(
             .iter()
             .map(|l| tree.nodes[l.node].name.clone())
             .collect(),
+        nav_display_names: crate::model::display_path::tree_parts(tree, top.node),
         nav_entries: nav.stack.iter().map(|l| tree.nodes[l.node].entry).collect(),
         nav_top_path: tree.nodes[top.node].path.clone(),
         nav_top_attached: is_attached(tree, top.node),
         nav_top_in_layout: dbg.layouts.contains(top.node),
         breadcrumb: dbg.breadcrumb.0.clone(),
-        menu_breadcrumb: dbg.menu_breadcrumb.as_ref().map(|m| m.0.clone()),
+        menu_breadcrumb: dbg.menu_breadcrumb.as_ref().map(|m| m.text.clone()),
         anchor_node: dbg.layouts.anchor,
         anchor_name: tree.nodes[dbg.layouts.anchor].name.clone(),
         anchor_attached: is_attached(tree, dbg.layouts.anchor),

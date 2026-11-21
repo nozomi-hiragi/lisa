@@ -42,7 +42,7 @@ pub(crate) use camera::{
 };
 pub(crate) use fade::{Fade, fade_scenes};
 pub use title::TitleSuffix;
-pub(crate) use title::{Breadcrumb, show_breadcrumb, update_title};
+pub(crate) use title::{Breadcrumb, refresh_breadcrumb_steps, show_breadcrumb, update_title};
 
 pub struct TreeViewPlugin;
 
@@ -76,7 +76,7 @@ impl Plugin for TreeViewPlugin {
             .init_resource::<CenterApproach>()
             .insert_resource(cache::ImageCache::new())
             .insert_resource(ClearColor(BACKGROUND))
-            .insert_resource(Breadcrumb("Root".into()))
+            .insert_resource(Breadcrumb(lisa_core::display_path::DEVICES.into()))
             .init_resource::<Busy>()
             .init_resource::<WindowOccludedState>()
             .init_resource::<crate::render::status::SpinnerClock>()
@@ -112,6 +112,7 @@ impl Plugin for TreeViewPlugin {
                     crate::preview::update_previews,
                     crate::render::status::animate_spinners,
                     keep_redrawing,
+                    refresh_breadcrumb_steps,
                     update_title,
                 )
                     .chain()
@@ -157,12 +158,14 @@ fn track_window_occlusion(
 /// 開いている場所の「正」。木のノード番号（`NodeId`）は読み直し（`reset_children`）で別物に
 /// なるため、読み直しをまたいで変わらない道のりで持つ。
 #[derive(Resource, Clone, Debug, PartialEq, Eq)]
-pub enum Location {
+pub(crate) enum Location {
+    /// LAN の識別子または今の木で確認した祖先列。
+    Attached(Vec<crate::model::display_path::Step>),
     /// 手元の DB にあるドライブ以下: ドライブ先頭からの `entry.id` 列。
     Local(Vec<i64>),
     /// 改名後、再走査で新しい entry.id が揃うまで追うディスク上の実パス。
     Renamed(std::path::PathBuf),
-    /// それ以外（Root、端末、ダミーの木、DB 無しドライブ、LAN の相手）: Root からの名前列。
+    /// 仮想ルートとダミーの木: Root からの名前列。
     Named(Vec<String>),
 }
 
@@ -177,6 +180,11 @@ impl Location {
         let Some(path) = tree.path_from_root(node) else {
             return Self::root();
         };
+        if tree.nodes[node].remote.is_some() || (path.len() == 2 && tree.nodes[node].device == 0) {
+            return Self::Attached(
+                crate::model::display_path::steps(tree, node).unwrap_or_default(),
+            );
+        }
         if let Some(first_entry) = path.iter().position(|&id| tree.nodes[id].entry.is_some())
             && path[first_entry..]
                 .iter()
@@ -189,6 +197,11 @@ impl Location {
             if !chain.is_empty() {
                 return Self::Local(chain);
             }
+        }
+        if path.get(2).is_some_and(|&id| tree.nodes[id].path.is_some()) {
+            return Self::Attached(
+                crate::model::display_path::steps(tree, node).unwrap_or_default(),
+            );
         }
         Self::Named(
             path.into_iter()
@@ -588,10 +601,12 @@ fn sync_view(
     scenes: Query<(Entity, &RenderLayers), With<SceneRoot>>,
     mut core: SyncCore,
     mut draw: SyncDrawAssets,
+    breadcrumb_jump: Option<Res<crate::ui::menu::BreadcrumbJump>>,
 ) {
-    let Some(mut mode) = sync.mode else {
+    if sync.mode.is_none() && breadcrumb_jump.is_none() {
         return;
-    };
+    }
+    let mut mode = sync.mode.unwrap_or(SyncMode::Reset);
     let interacting = animating.is_some() || !fades.is_empty() || gesture.active();
     let broken =
         !core.tree.is_attached(core.nav.top().node) || !core.tree.is_attached(core.layouts.anchor);
@@ -599,12 +614,29 @@ fn sync_view(
     if interacting && !(mode == SyncMode::Reset && broken) {
         return;
     }
+    let breadcrumb_path = breadcrumb_jump.and_then(|jump| {
+        commands.remove_resource::<crate::ui::menu::BreadcrumbJump>();
+        let path = crate::model::display_path::resolve_breadcrumb(&core.tree, &jump.0);
+        if path.is_some() {
+            commands.remove_resource::<crate::ui::menu::BreadcrumbError>();
+        } else {
+            commands.insert_resource(crate::ui::menu::BreadcrumbError(Instant::now()));
+        }
+        path
+    });
+    if breadcrumb_path.is_some() {
+        mode = SyncMode::Reset;
+    } else if sync.mode.is_none() {
+        return;
+    }
+
     sync.mode = None;
     let refit = std::mem::take(&mut sync.refit);
     if mode == SyncMode::RelayoutKeepView && broken {
         mode = SyncMode::Reset;
     }
 
+    let breadcrumb_jumped = breadcrumb_path.is_some();
     let main_layer = RenderLayers::layer(CONTENT_LAYER);
     let despawn_all_main = |commands: &mut Commands, warn_expected: Option<&[Entity]>| {
         let mut stray = 0usize;
@@ -633,15 +665,17 @@ fn sync_view(
             }
             let _ = gesture.clear_and_take_parent_scene();
 
-            let resolved = crate::scan::resolve_location(
-                &mut core.tree,
-                core.store.as_deref(),
-                core.scanner.as_deref_mut(),
-                &mut core.location,
-            );
+            let resolved = breadcrumb_path.unwrap_or_else(|| {
+                crate::scan::resolve_location(
+                    &mut core.tree,
+                    core.store.as_deref(),
+                    core.scanner.as_deref_mut(),
+                    &mut core.location,
+                )
+            });
             core.nav.stack = resolved.into_iter().map(|node| Level { node }).collect();
             let top_node = core.nav.top().node;
-            if !matches!(*core.location, Location::Renamed(_)) {
+            if !matches!(*core.location, Location::Renamed(_)) || breadcrumb_jumped {
                 *core.location = Location::from_tree(&core.tree, top_node);
             }
 

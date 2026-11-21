@@ -1,6 +1,12 @@
 //! 画面上端のメニューバーと、設定のポップアップ（Bevy UI、カメラのズームとは関係なく画面に固定）。
 
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
+use bevy::text::{LineBreak, TextLayout, Underline};
+
+use crate::model::display_path::Step;
+use lisa_core::display_path::DEVICES;
 
 use crate::render::palette;
 use crate::render::scene::LabelFont;
@@ -25,10 +31,17 @@ impl Plugin for MenuPlugin {
                     close_with_escape,
                     show_popup,
                     show_breadcrumb,
+                    show_breadcrumb_error,
+                    highlight_breadcrumb,
+                    scroll_breadcrumb,
                     show_pause,
                     show_organize_badge,
                 )
                     .in_set(MenuSystems),
+            )
+            .add_systems(
+                PostUpdate,
+                follow_breadcrumb_end.after(bevy::ui::UiSystems::Layout),
             );
     }
 }
@@ -44,8 +57,18 @@ pub struct Popup {
 }
 
 /// メニューバーに出す、今いる場所。
+#[derive(Resource, PartialEq, Eq, Clone)]
+pub struct MenuBreadcrumb {
+    pub(crate) text: String,
+    pub(crate) parts: Vec<String>,
+    pub(crate) steps: Vec<Step>,
+}
+
 #[derive(Resource)]
-pub struct MenuBreadcrumb(pub String);
+pub(crate) struct BreadcrumbJump(pub Vec<Step>);
+
+#[derive(Resource)]
+pub(crate) struct BreadcrumbError(pub std::time::Instant);
 
 /// ポップアップの中身を足す場所（設定の項目はここに並べる）。
 #[derive(Component)]
@@ -55,7 +78,22 @@ pub struct PopupBody;
 struct Backdrop;
 
 #[derive(Component)]
-struct BreadcrumbText;
+struct BreadcrumbStrip;
+
+#[derive(Component, Default)]
+struct BreadcrumbScroll {
+    follow_end: bool,
+    max: f32,
+}
+
+#[derive(Component)]
+struct BreadcrumbTarget(Vec<Step>);
+
+#[derive(Component)]
+struct AncestorBreadcrumb;
+
+#[derive(Component)]
+struct BreadcrumbErrorText;
 
 /// 一時停止のボタンの文字（止めているあいだは「再開」）。
 #[derive(Component)]
@@ -86,30 +124,62 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
             GlobalZIndex(10),
         ))
         .with_children(|bar| {
-            bar.spawn((
-                BreadcrumbText,
-                Text::new("Root"),
-                text_font.clone(),
-                TextColor(TEXT_COLOR),
-            ));
-            let button = || {
-                (
+            bar.spawn(Node {
+                min_width: Val::Px(0.0),
+                flex_basis: Val::Px(0.0),
+                flex_grow: 1.0,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                margin: UiRect::right(Val::Px(8.0)),
+                ..default()
+            })
+            .with_children(|left| {
+                left.spawn((
+                    menu_button(),
+                    BreadcrumbTarget(Vec::new()),
+                    children![(Text::new(DEVICES), text_font.clone(), TextColor(TEXT_COLOR))],
+                ))
+                .observe(request_breadcrumb);
+                left.spawn((
+                    BreadcrumbStrip,
+                    BreadcrumbScroll::default(),
                     Node {
-                        padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
-                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                        min_width: Val::Px(0.0),
+                        flex_basis: Val::Px(0.0),
+                        flex_grow: 1.0,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        overflow: Overflow::scroll_x(),
                         ..default()
                     },
-                    BackgroundColor(BUTTON_COLOR),
-                )
-            };
+                    ScrollPosition::default(),
+                    Hovered::default(),
+                ));
+                left.spawn((
+                    BreadcrumbErrorText,
+                    Node {
+                        position_type: PositionType::Absolute,
+                        top: Val::Px(BAR_PX),
+                        display: Display::None,
+                        padding: UiRect::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BackgroundColor(BAR_COLOR),
+                    Text::new("この場所へ移動できませんでした"),
+                    text_font.clone(),
+                    TextColor(TEXT_COLOR),
+                    Pickable::IGNORE,
+                ));
+            });
             bar.spawn(Node {
                 column_gap: Val::Px(8.0),
+                flex_shrink: 0.0,
                 ..default()
             })
             .with_children(|buttons| {
                 buttons
                     .spawn((
-                        button(),
+                        menu_button(),
                         children![(
                             PauseText,
                             Text::new("一時停止"),
@@ -127,7 +197,7 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                     );
                 buttons
                     .spawn((
-                        button(),
+                        menu_button(),
                         children![(Text::new("重複"), text_font.clone(), TextColor(TEXT_COLOR))],
                     ))
                     .observe(|_: On<PointerClick>, mut dups: ResMut<crate::dups::Dups>| {
@@ -135,7 +205,7 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                     });
                 buttons
                     .spawn((
-                        button(),
+                        menu_button(),
                         children![(
                             Text::new("カタログ"),
                             text_font.clone(),
@@ -149,7 +219,7 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                     );
                 buttons
                     .spawn((
-                        button(),
+                        menu_button(),
                         children![(
                             OrganizeText,
                             Text::new("整理"),
@@ -165,7 +235,7 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                     );
                 buttons
                     .spawn((
-                        button(),
+                        menu_button(),
                         children![(Text::new("設定"), text_font.clone(), TextColor(TEXT_COLOR))],
                     ))
                     .observe(|_: On<PointerClick>, mut popup: ResMut<Popup>| {
@@ -263,14 +333,157 @@ fn show_popup(popup: Res<Popup>, mut backdrop: Single<&mut Node, With<Backdrop>>
     };
 }
 
-fn show_breadcrumb(
-    breadcrumb: Option<Res<MenuBreadcrumb>>,
-    mut text: Single<&mut Text, With<BreadcrumbText>>,
+fn menu_button() -> (Node, BackgroundColor) {
+    (
+        Node {
+            padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BackgroundColor(BUTTON_COLOR),
+    )
+}
+
+fn request_breadcrumb(
+    mut event: On<PointerClick>,
+    targets: Query<&BreadcrumbTarget>,
+    mut commands: Commands,
 ) {
-    if let Some(breadcrumb) = breadcrumb
-        && breadcrumb.is_changed()
+    if event.button == PointerButton::Primary
+        && let Ok(target) = targets.get(event.entity)
     {
-        text.0 = breadcrumb.0.clone();
+        event.propagate(false);
+        commands.insert_resource(BreadcrumbJump(target.0.clone()));
+    }
+}
+
+fn breadcrumb_item(
+    strip: &mut ChildSpawnerCommands,
+    font: &TextFont,
+    label: &str,
+    target: Option<Vec<Step>>,
+    color: Color,
+) {
+    let mut item = strip.spawn((
+        Node {
+            flex_shrink: 0.0,
+            ..default()
+        },
+        Text::new(label),
+        font.clone(),
+        TextColor(color),
+        TextLayout::linebreak(LineBreak::NoWrap),
+    ));
+    if let Some(target) = target {
+        item.insert((
+            AncestorBreadcrumb,
+            BreadcrumbTarget(target),
+            Hovered::default(),
+        ))
+        .observe(request_breadcrumb);
+    } else {
+        item.insert(Pickable::IGNORE);
+    }
+}
+
+type ChangedAncestorHover = (With<AncestorBreadcrumb>, Changed<Hovered>);
+
+fn highlight_breadcrumb(
+    mut commands: Commands,
+    mut ancestors: Query<(Entity, &Hovered, &mut TextColor), ChangedAncestorHover>,
+) {
+    for (entity, hovered, mut color) in &mut ancestors {
+        if hovered.get() {
+            color.0 = TEXT_COLOR;
+            commands.entity(entity).insert(Underline);
+        } else {
+            color.0 = palette::MUTED;
+            commands.entity(entity).remove::<Underline>();
+        }
+    }
+}
+
+fn show_breadcrumb(
+    mut commands: Commands,
+    breadcrumb: Option<Res<MenuBreadcrumb>>,
+    font: Res<LabelFont>,
+    strip: Single<(Entity, &mut BreadcrumbScroll), With<BreadcrumbStrip>>,
+    mut last: Local<Option<MenuBreadcrumb>>,
+) {
+    let Some(breadcrumb) = breadcrumb.filter(|b| b.is_changed()) else {
+        return;
+    };
+    if last.as_ref() == Some(&breadcrumb) {
+        return;
+    }
+    *last = Some(breadcrumb.as_ref().clone());
+    let (strip, mut scroll) = strip.into_inner();
+    let font = TextFont::from_font_size(14.0).with_font(font.0.clone());
+    let mut entity = commands.entity(strip);
+    entity.despawn_children().with_children(|strip| {
+        for (index, part) in breadcrumb.parts.iter().enumerate() {
+            if index > 0 {
+                breadcrumb_item(strip, &font, "›", None, palette::MUTED);
+            }
+            let target =
+                (index + 1 < breadcrumb.parts.len()).then(|| breadcrumb.steps[..=index].to_vec());
+            let color = if target.is_some() {
+                palette::MUTED
+            } else {
+                TEXT_COLOR
+            };
+            breadcrumb_item(strip, &font, part, target, color);
+        }
+    });
+    scroll.follow_end = true;
+}
+
+fn follow_breadcrumb_end(
+    strip: Single<
+        (&ComputedNode, &mut ScrollPosition, &mut BreadcrumbScroll),
+        With<BreadcrumbStrip>,
+    >,
+) {
+    let (node, mut position, mut scroll) = strip.into_inner();
+    let max = (node.content_size.x - node.size.x).max(0.0) * node.inverse_scale_factor;
+    if scroll.follow_end || position.x > max {
+        scroll.follow_end = false;
+        position.x = max;
+    }
+    scroll.max = max;
+}
+
+fn scroll_breadcrumb(
+    mut wheel: MessageReader<MouseWheel>,
+    strip: Single<(&Hovered, &mut ScrollPosition, &BreadcrumbScroll), With<BreadcrumbStrip>>,
+) {
+    let (hovered, mut position, scroll) = strip.into_inner();
+    for event in wheel.read() {
+        if !hovered.get() {
+            continue;
+        }
+        let delta = if event.x != 0.0 { event.x } else { event.y };
+        let scale = if event.unit == MouseScrollUnit::Line {
+            32.0
+        } else {
+            1.0
+        };
+        position.x = (position.x - scale * delta).clamp(0.0, scroll.max);
+    }
+}
+
+fn show_breadcrumb_error(
+    error: Option<Res<BreadcrumbError>>,
+    mut text: Single<&mut Node, With<BreadcrumbErrorText>>,
+) {
+    let display = if error.is_some_and(|error| error.0.elapsed().as_secs() < 4) {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if text.display != display {
+        text.display = display;
     }
 }
 

@@ -817,7 +817,6 @@ fn describe_rows(
         }
     };
     let node = &tree.nodes[id];
-    let local = node.remote.is_none();
     let path = if full { local_item_path(tree, store, id) } else { local_path(tree, id) };
     let name = match path.as_deref().and_then(Path::file_name) {
         Some(name) if full && node.depth > 2 => name.to_string_lossy(),
@@ -874,26 +873,22 @@ fn describe_rows(
                 rows.push(row("ハッシュ", if full { hash } else { short_hash(&hash) }));
             }
         }
-        rows.push(row(
-            "場所",
-            name_or_path(&path.display().to_string(), MAX_PATH_CHARS),
-        ));
-    } else if let Some(r) = &node.remote_meta {
-        if node.depth > 2 {
-            if let Some(t) = r.mtime {
-                rows.push(row(if full { "更新日時" } else { "更新" }, date(t)));
-            }
-            if let Some(hash) = &r.hash {
-                rows.push(row("ハッシュ", if full { hash.clone() } else { short_hash(hash) }));
-            }
+    } else if let Some(r) = &node.remote_meta
+        && node.depth > 2
+    {
+        if let Some(t) = r.mtime {
+            rows.push(row(if full { "更新日時" } else { "更新" }, date(t)));
         }
-        if let Some(path) = remote_path_text(tree, id) {
-            rows.push(row("場所", name_or_path(&path, MAX_PATH_CHARS)));
+        if let Some(hash) = &r.hash {
+            rows.push(row(
+                "ハッシュ",
+                if full { hash.clone() } else { short_hash(hash) },
+            ));
         }
-    } else if !local && let Some(path) = remote_path_text(tree, id) {
-        rows.push(row("場所", name_or_path(&path, MAX_PATH_CHARS)));
-    } else if full && let Some(path) = path {
-        rows.push(row("場所", path.display().to_string()));
+    }
+    if node.depth >= 2 {
+        let place = crate::model::display_path::tree_text(tree, id);
+        rows.push(row("場所", name_or_path(&place, MAX_PATH_CHARS)));
     }
 
     let state = match node.state {
@@ -1317,11 +1312,20 @@ fn spawn_kv_line(
         Pickable::IGNORE,
         ChildOf(line),
     ));
+    let place = label == "場所";
     let mut val_cmd = commands.spawn((
-        Text::new(value),
+        Text::new(if place {
+            lisa_core::display_path::wrap_at_separators(&value)
+        } else {
+            value
+        }),
         text_font.clone(),
         TextColor(TEXT_COLOR),
-        TextLayout::linebreak(LineBreak::AnyCharacter),
+        TextLayout::linebreak(if place {
+            LineBreak::WordOrCharacter
+        } else {
+            LineBreak::AnyCharacter
+        }),
         Pickable::IGNORE,
         ChildOf(line),
     ));
@@ -1751,6 +1755,8 @@ mod tests {
         tree.add_remote_drives(
             remote,
             vec![crate::model::tree::RemoteDrive {
+                id: None,
+                mount: None,
                 label: "C:".into(),
                 entry_id: 1,
                 listed: true,
@@ -1857,7 +1863,7 @@ mod tests {
         );
         assert_eq!(
             row_value(&file_rows, "場所"),
-            Some(path_text(&file_path).as_str())
+            Some("ThisMac › TestDrive › note.txt")
         );
         assert_eq!(row_value(&file_rows, "状態"), None);
         #[cfg(target_os = "macos")]
@@ -1883,7 +1889,7 @@ mod tests {
         assert!(row_value(&folder_rows, "更新").is_some());
         assert_eq!(
             row_value(&folder_rows, "場所"),
-            Some(path_text(&sub_dir).as_str())
+            Some("ThisMac › TestDrive › docs")
         );
 
         // フォルダの合計の状態ごとの表示（計算中 / 合計あり / 読んだ分だけ）。
@@ -1927,10 +1933,7 @@ mod tests {
         );
         assert_eq!(row_value(&drive_rows, "作成"), None);
         assert_eq!(row_value(&drive_rows, "更新"), None);
-        assert_eq!(
-            row_value(&drive_rows, "場所"),
-            Some(path_text(&dir).as_str())
-        );
+        assert_eq!(row_value(&drive_rows, "場所"), Some("ThisMac › TestDrive"));
 
         // 端末（場所・作成・更新日時は出さない）
         let dev_rows = describe(&tree, None, device, None);
@@ -1972,6 +1975,8 @@ mod tests {
         tree.add_remote_drives(
             remote,
             vec![crate::model::tree::RemoteDrive {
+                id: None,
+                mount: None,
                 label: "/".into(),
                 entry_id: 1,
                 listed: true,
@@ -2022,7 +2027,10 @@ mod tests {
         );
         let rows = describe(&tree, None, memo, None);
         assert_eq!(row_value(&rows, "大きさ"), Some("42 バイト"));
-        assert_eq!(row_value(&rows, "場所"), Some("MacBook: /Users/memo.txt"));
+        assert_eq!(
+            row_value(&rows, "場所"),
+            Some("MacBook (LAN) › / › Users › memo.txt")
+        );
     }
 
     #[test]
@@ -2032,6 +2040,8 @@ mod tests {
         tree.add_remote_drives(
             remote,
             vec![crate::model::tree::RemoteDrive {
+                id: None,
+                mount: None,
                 label: "C:".into(),
                 entry_id: 1,
                 listed: true,
@@ -2104,14 +2114,17 @@ mod tests {
         assert_eq!(row_value(&report, "ハッシュ"), Some("0123456789abcdef…"));
         assert_eq!(
             row_value(&report, "場所"),
-            Some("Windows PC: C:/report.pdf")
+            Some("Windows PC (LAN) › C: › report.pdf")
         );
         assert_eq!(row_value(&report, "状態"), None);
         assert_eq!(row_value(&report, "エラー"), None);
 
         let cloud = describe(&tree, None, find("cloud.mov"), None);
         assert_eq!(row_value(&cloud, "種類"), Some("ファイル（クラウドのみ）"));
-        assert_eq!(row_value(&cloud, "場所"), Some("Windows PC: C:/cloud.mov"));
+        assert_eq!(
+            row_value(&cloud, "場所"),
+            Some("Windows PC (LAN) › C: › cloud.mov")
+        );
 
         let broken = describe(&tree, None, find("broken.dat"), None);
         assert_eq!(row_value(&broken, "状態"), Some("読めなかった"));
@@ -2123,7 +2136,7 @@ mod tests {
         assert_eq!(row_value(&rdev, "場所"), None);
         let rdrive = describe(&tree, None, drive, None);
         assert_eq!(row_value(&rdrive, "種類"), Some("ドライブ"));
-        assert_eq!(row_value(&rdrive, "場所"), Some("Windows PC: C:"));
+        assert_eq!(row_value(&rdrive, "場所"), Some("Windows PC (LAN) › C:"));
     }
 
     #[test]

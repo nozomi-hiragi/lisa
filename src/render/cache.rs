@@ -808,6 +808,8 @@ mod tests {
         tree.add_remote_drives(
             peer,
             vec![crate::model::tree::RemoteDrive {
+                id: None,
+                mount: None,
                 label: "C:".into(),
                 entry_id: 1,
                 listed: true,
