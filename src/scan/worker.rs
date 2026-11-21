@@ -19,14 +19,17 @@ use std::time::{Duration, Instant};
 use bevy::log::warn;
 use bevy::winit::EventLoopProxy;
 use bevy::winit::WinitUserEvent;
-use lisa_core::db::Db;
+use lisa_core::db::{Db, ErrorCode, ListingSave};
 use lisa_core::hash::{self, Pace};
 use lisa_core::listing;
 
 use super::{Message, Progress, Root, SHOWN_NEXT, readable, report};
 
-/// DB に書いたものを確定する間隔。
-const COMMIT_EVERY: Duration = Duration::from_millis(300);
+/// 初回走査で、ロックの外で先読みするフォルダ数と項目数の目安。
+const INITIAL_FOLDERS: usize = 64;
+const INITIAL_ENTRIES: usize = 512;
+const INITIAL_READ_BUDGET: Duration = Duration::from_millis(12);
+const INITIAL_WRITE_BUDGET: Duration = Duration::from_millis(20);
 /// ファイルを同時にハッシュする数。
 const HASH_THREADS: usize = 4;
 /// 休む・止めるかを見直す間隔。
@@ -219,6 +222,49 @@ pub(super) struct Worker {
     pub skip_dirs: Vec<PathBuf>,
 }
 
+enum StoreOutcome {
+    Published {
+        alive: bool,
+        changed: bool,
+        first: bool,
+    },
+    Busy,
+}
+
+fn finish_initial_store(
+    outcome: StoreOutcome,
+    stack: &mut Vec<(usize, PathBuf)>,
+    index: usize,
+    path: PathBuf,
+    failed: bool,
+) -> (bool, u64, u64) {
+    match outcome {
+        StoreOutcome::Busy => {
+            stack.push((index, path));
+            (true, 0, 0)
+        }
+        StoreOutcome::Published { alive, .. } => (alive, 1, u64::from(failed)),
+    }
+}
+
+fn push_initial_children(
+    stack: &mut Vec<(usize, PathBuf)>,
+    index: usize,
+    path: &Path,
+    result: &Result<listing::Listing, String>,
+) {
+    if let Ok(listing) = result {
+        stack.extend(
+            listing
+                .entries
+                .iter()
+                .rev()
+                .filter(|entry| readable(entry))
+                .map(|entry| (index, path.join(&entry.name))),
+        );
+    }
+}
+
 impl Worker {
     pub fn run(mut self) {
         let background = Background::new(self.control.clone());
@@ -228,35 +274,17 @@ impl Worker {
         if stack.is_empty() {
             report(&self.progress, |p| p.finished = Some(Instant::now()));
         }
-        // 1. 深さ優先で読む。
-        let mut last_commit = Instant::now();
-        while let Some((index, path)) = stack.pop() {
-            if self.is_skipped(&path) {
-                continue;
-            }
+        // 1. 親から順に読む。
+        let mut batch_limit = INITIAL_FOLDERS;
+        while !stack.is_empty() {
             if !self.wait_turn(&background) {
                 return;
             }
             lisa_core::pace::set_thread_background(true);
+            let (alive, done, failed) = self.initial_batch(&mut stack, &mut batch_limit);
             report(&self.progress, |p| {
-                p.current = Some(path.clone());
-                p.queued = stack.len();
-            });
-            let result = self.read_dir_filtered(&path);
-            if let Ok(listing) = &result {
-                for entry in listing.entries.iter().rev().filter(|e| readable(e)) {
-                    stack.push((index, path.join(&entry.name)));
-                }
-            }
-            let due = stack.is_empty() || last_commit.elapsed() >= COMMIT_EVERY;
-            if due {
-                last_commit = Instant::now();
-            }
-            let failed = result.is_err();
-            let (alive, _) = self.store(index, path, result, due, false);
-            report(&self.progress, |p| {
-                p.done += 1;
-                p.failed += failed as u64;
+                p.done += done;
+                p.failed += failed;
                 p.queued = stack.len();
                 p.next = stack
                     .iter()
@@ -449,6 +477,120 @@ impl Worker {
         true
     }
 
+    /// 親が確定したフォルダを、同じドライブから少しだけ先読みする。
+    fn initial_batch(
+        &mut self,
+        stack: &mut Vec<(usize, PathBuf)>,
+        batch_limit: &mut usize,
+    ) -> (bool, u64, u64) {
+        let Some((index, path)) = stack.pop() else {
+            return (true, 0, 0);
+        };
+        if self.is_skipped(&path) {
+            return (true, 0, 0);
+        }
+        report(&self.progress, |p| {
+            p.current = Some(path.clone());
+            p.queued = stack.len();
+        });
+        let root = &self.roots[index];
+        let version = self
+            .db
+            .as_ref()
+            .zip(root.drive_id.as_ref())
+            .and_then(|(db, _)| db.listing_version().ok());
+        let Some(version) = version else {
+            return self.store_initial_folder(stack, index, path);
+        };
+        let started = Instant::now();
+        let result = Self::read_dir_filtered(&self.skip_dirs, &path);
+        let mut entries = result.as_ref().map_or(0, |listing| listing.entries.len());
+        let mut batch = vec![(path, result)];
+        while batch.len() < *batch_limit
+            && entries < INITIAL_ENTRIES
+            && started.elapsed() < INITIAL_READ_BUDGET
+            && stack.last().is_some_and(|(next, _)| *next == index)
+            && let Some((_, path)) = stack.pop()
+        {
+            if !self.is_skipped(&path) {
+                let result = Self::read_dir_filtered(&self.skip_dirs, &path);
+                entries += result.as_ref().map_or(0, |listing| listing.entries.len());
+                batch.push((path, result));
+            }
+        }
+        let saved = match self.db.as_mut().zip(root.drive_id.as_ref()) {
+            Some((db, drive_id)) => db.save_initial_listings(
+                drive_id,
+                &root.mount,
+                version,
+                batch.iter().map(|(path, result)| (path.as_path(), result)),
+                INITIAL_WRITE_BUDGET,
+            ),
+            None => Ok(Vec::new()),
+        };
+        let saved = match saved {
+            Ok(saved) => saved,
+            Err(error) => {
+                warn!("初回の一覧をまとめて確定できませんでした: {error}");
+                if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) {
+                    stack.extend(batch.into_iter().rev().map(|(path, _)| (index, path)));
+                    return (true, 0, 0);
+                }
+                Vec::new()
+            }
+        };
+        if saved.is_empty() {
+            *batch_limit = (batch.len() / 2).max(1);
+            // 世代が変わった一覧は捨て、先頭を従来の再試行経路で読み直す。
+            let mut queued = batch.into_iter().map(|(path, _)| path);
+            let path = queued.next().expect("バッチの先頭");
+            stack.extend(queued.rev().map(|path| (index, path)));
+            return self.store_initial_folder(stack, index, path);
+        }
+        *batch_limit = (*batch_limit + 1).min(INITIAL_FOLDERS);
+        let done = saved.len() as u64;
+        let mut failed = 0;
+        stack.extend(
+            batch
+                .drain(saved.len()..)
+                .rev()
+                .map(|(path, _)| (index, path)),
+        );
+        for (path, result) in batch.iter().rev() {
+            push_initial_children(stack, index, path, result);
+        }
+        for ((path, result), saved) in batch.into_iter().zip(saved) {
+            failed += u64::from(result.is_err());
+            if (matches!(saved, ListingSave::Changed)
+                && !self.send(Message::Changed { path: path.clone() }))
+                || !self.send(Message::Listed {
+                    path,
+                    result,
+                    stored: !matches!(saved, ListingSave::Missing),
+                })
+            {
+                return (false, done, failed);
+            }
+        }
+        let alive = self.send(Message::Committed);
+        self.wake();
+        (alive, done, failed)
+    }
+
+    fn store_initial_folder(
+        &mut self,
+        stack: &mut Vec<(usize, PathBuf)>,
+        index: usize,
+        path: PathBuf,
+    ) -> (bool, u64, u64) {
+        let mut failed = false;
+        let outcome = self.store(index, &path, false, |result| {
+            failed = result.is_err();
+            push_initial_children(stack, index, &path, result);
+        });
+        finish_initial_store(outcome, stack, index, path, failed)
+    }
+
     /// 読み始めるものを、深さ優先で後ろから先に積む。DB に残っているドライブは、まだ読み終えて
     /// いないフォルダから（DB の木の並びの順に）。
     fn initial_stack(&self) -> Vec<(usize, PathBuf)> {
@@ -552,16 +694,21 @@ impl Worker {
         if self.roots[index].drive_id.is_none() || self.db.is_none() || !path.is_dir() {
             return true;
         }
-        let result = self.read_dir_filtered(path);
-        let (alive, changed) = self.store(index, path.to_path_buf(), result, true, false);
+        let StoreOutcome::Published {
+            alive,
+            changed,
+            first,
+        } = self.store_reread(index, path, false)
+        else {
+            return true;
+        };
         if !alive {
             return false;
         }
-        if changed {
-            self.dirty = true;
-            if !self.fill_unlisted(index, path) {
-                return false;
-            }
+        self.dirty |= changed;
+        // 子の保存が Busy で延期された場合、ヒントからの初回保存でも新しい配下をたどる。
+        if (changed || first) && !self.fill_unlisted(index, path) {
+            return false;
         }
         true
     }
@@ -582,9 +729,10 @@ impl Worker {
         if !path.is_dir() {
             return true;
         }
-        let result = self.read_dir_filtered(&path);
-        let (alive, _) = self.store(index, path, result, true, true);
-        alive
+        !matches!(
+            self.store_reread(index, &path, true),
+            StoreOutcome::Published { alive: false, .. }
+        )
     }
 
     /// `path` の下の、まだ読んでいないフォルダ（読み直しで新しくできたもの）を深さ優先で読む。
@@ -618,11 +766,11 @@ impl Worker {
                     continue;
                 }
                 if !child.listed {
-                    let result = self.read_dir_filtered(&child_path);
-                    if !self.store(index, child_path.clone(), result, true, false).0 {
-                        return false;
+                    match self.store_reread(index, &child_path, false) {
+                        StoreOutcome::Published { alive: false, .. } => return false,
+                        StoreOutcome::Published { .. } => stack.push(child_path),
+                        StoreOutcome::Busy => {}
                     }
-                    stack.push(child_path);
                 }
             }
         }
@@ -680,48 +828,98 @@ impl Worker {
         !closed.load(Ordering::Relaxed)
     }
 
-    /// 読んだ結果を DB に書き（`commit` なら確定もし）、UI に知らせる。（UI がまだいるか、読み直しで
-    /// DB と違っていたか）を返す。
+    fn store_reread(&mut self, index: usize, path: &Path, force_changed: bool) -> StoreOutcome {
+        let outcome = self.store(index, path, force_changed, |_| {});
+        if matches!(outcome, StoreOutcome::Busy) {
+            self.hints.insert(path.to_path_buf());
+        }
+        outcome
+    }
+
+    /// フォルダを読み、結果を通知する。Busy の場合は呼び出し元が再度キューに積む。
     fn store(
         &mut self,
         index: usize,
-        path: PathBuf,
-        result: Result<listing::Listing, String>,
-        commit: bool,
+        path: &Path,
         force_changed: bool,
-    ) -> (bool, bool) {
+        on_read: impl FnOnce(&Result<listing::Listing, String>),
+    ) -> StoreOutcome {
         let root = &self.roots[index];
         let mut stored = false;
-        let mut committed = false;
         let mut changed = force_changed;
-        if let (Some(db), Some(drive_id)) = (self.db.as_mut(), &root.drive_id) {
-            match db
-                .begin()
-                .and_then(|()| db.save_listing(drive_id, &root.mount, &path, &result))
-            {
-                Ok(c) => {
-                    stored = true;
-                    changed |= c;
+        let mut first = false;
+        let mut retries = 0;
+        let result = loop {
+            let version = match (&self.db, &root.drive_id) {
+                (Some(db), Some(_)) => db.listing_version().map(Some),
+                _ => Ok(None),
+            };
+            let mut result = Self::read_dir_filtered(&self.skip_dirs, path);
+            match (self.db.as_mut(), &root.drive_id, version) {
+                (Some(db), Some(drive_id), Ok(Some(version))) => {
+                    let mut saved =
+                        db.save_listing_at(drive_id, &root.mount, path, &result, Some(version));
+                    if matches!(saved, Ok(ListingSave::Retry)) {
+                        if retries < 2 {
+                            retries += 1;
+                            continue;
+                        }
+                        // 3 回続けて競合したときだけ、他の確定で待ち続けないよう書き込み権を取って読み直す。
+                        match db.save_fresh_listing(drive_id, &root.mount, path, || {
+                            Self::read_dir_filtered(&self.skip_dirs, path)
+                        }) {
+                            Ok((fresh_saved, fresh_result)) => {
+                                saved = Ok(fresh_saved);
+                                result = fresh_result;
+                            }
+                            Err(error) => saved = Err(error),
+                        }
+                    }
+                    match saved {
+                        Ok(saved) => {
+                            stored = !matches!(saved, ListingSave::Missing);
+                            changed |= matches!(saved, ListingSave::Changed);
+                            first = matches!(saved, ListingSave::First);
+                        }
+                        Err(error) => {
+                            warn!("DB に書けませんでした（{}）: {error}", path.display());
+                            if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) {
+                                return StoreOutcome::Busy;
+                            }
+                        }
+                    }
                 }
-                Err(error) => warn!("DB に書けませんでした（{}）: {error}", path.display()),
-            }
-            if commit {
-                match db.commit() {
-                    Ok(()) => committed = true,
-                    Err(error) => warn!("DB に確定できませんでした: {error}"),
+                (_, _, Err(error)) => {
+                    warn!(
+                        "DB の更新状態を読めませんでした（{}）: {error}",
+                        path.display()
+                    );
+                    if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) {
+                        return StoreOutcome::Busy;
+                    }
                 }
+                _ => {}
             }
-        }
+            break result;
+        };
+        on_read(&result);
         // 変わっていたら、先に知らせる（UI は木の子を出し直し、古いにする）。
-        let alive = (!changed || self.send(Message::Changed { path: path.clone() }))
+        let alive = (!changed
+            || self.send(Message::Changed {
+                path: path.to_path_buf(),
+            }))
             && self.send(Message::Listed {
-                path,
+                path: path.to_path_buf(),
                 result,
                 stored,
             })
-            && (!committed || self.send(Message::Committed));
+            && (!stored || self.send(Message::Committed));
         self.wake();
-        (alive, changed)
+        StoreOutcome::Published {
+            alive,
+            changed,
+            first,
+        }
     }
 
     /// 知らせのパスを、読むドライブの下のパスにする。Mac の FSEvents は起動ディスクの Data のボリュームの
@@ -751,24 +949,26 @@ impl Worker {
 
     /// 隔離フォルダ（`.lisa-trash` と、データのフォルダの `trash/`）か。
     fn is_skipped(&self, path: &Path) -> bool {
+        Self::path_is_skipped(&self.skip_dirs, path)
+    }
+
+    fn path_is_skipped(skip_dirs: &[PathBuf], path: &Path) -> bool {
         if path
             .components()
             .any(|c| lisa_core::name::is_quarantine_dir(c.as_os_str()))
         {
             return true;
         }
-        self.skip_dirs
-            .iter()
-            .any(|s| path == s || path.starts_with(s))
+        skip_dirs.iter().any(|s| path == s || path.starts_with(s))
     }
 
     /// フォルダを 1 段読み、飛ばす対象（隔離フォルダ）を除いて返す。
-    fn read_dir_filtered(&self, path: &Path) -> Result<listing::Listing, String> {
+    fn read_dir_filtered(skip_dirs: &[PathBuf], path: &Path) -> Result<listing::Listing, String> {
         let mut listing = listing::read_dir(path).map_err(|e| e.to_string())?;
-        if !self.skip_dirs.is_empty() {
+        if !skip_dirs.is_empty() {
             listing
                 .entries
-                .retain(|e| !self.is_skipped(&path.join(&e.name)));
+                .retain(|e| !Self::path_is_skipped(skip_dirs, &path.join(&e.name)));
         }
         Ok(listing)
     }
@@ -780,5 +980,21 @@ impl Worker {
     /// 止まっている間でも、すぐに木に足して描けるように起こす。
     fn wake(&self) {
         let _ = self.proxy.send_event(WinitUserEvent::WakeUp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_initial_folder_remains_pending_without_counting_as_finished() {
+        let folder = PathBuf::from("root");
+        let mut stack = vec![];
+        assert_eq!(
+            finish_initial_store(StoreOutcome::Busy, &mut stack, 3, folder.clone(), false),
+            (true, 0, 0)
+        );
+        assert_eq!(stack.pop(), Some((3, folder)));
     }
 }
