@@ -28,6 +28,11 @@ pub enum LoadState {
 }
 
 pub struct Node {
+    /// 再利用されるノード番号とは独立した、木に追加された時点の識別子。
+    pub(crate) incarnation: u64,
+    /// 表示のために相手から受け取ったドライブのマウント先。
+    pub(crate) remote_mount: Option<PathBuf>,
+    pub(crate) drive_id: Option<String>,
     pub name: String,
     /// バイト数。フォルダは子の合計。
     pub size: u64,
@@ -79,6 +84,8 @@ pub struct RemoteRef {
 /// 相手の端末のドライブ 1 つ分の情報（木に足すとき用）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteDrive {
+    pub id: Option<String>,
+    pub mount: Option<PathBuf>,
     pub label: String,
     pub entry_id: i64,
     pub listed: bool,
@@ -241,12 +248,13 @@ impl FileTree {
         let root = tree.push("Root", 0, None, 0, true);
         let device = tree.push(name, 0, Some(root), 0, true);
         for drive in drives.iter().filter(|d| !d.hidden) {
-            let label = if drive.label.is_empty() {
-                drive.mount_path.display().to_string()
-            } else {
-                drive.label.clone()
-            };
+            let label = lisa_core::display_path::drive_label(
+                &drive.label,
+                Some(&drive.mount_path),
+                drive.id.as_deref().unwrap_or(""),
+            );
             let id = tree.push(&label, 0, Some(device), 0, true);
+            tree.nodes[id].drive_id = drive.id.clone();
             tree.nodes[id].path = Some(drive.mount_path.clone());
             tree.nodes[id].listed = false;
             tree.nodes[id].loaded = false;
@@ -307,6 +315,8 @@ impl FileTree {
             node.path = None;
             node.remote = None;
             node.remote_meta = None;
+            node.remote_mount = None;
+            node.drive_id = None;
             node.listed = false;
             node.loaded = false;
             node.size = 0;
@@ -538,6 +548,8 @@ impl FileTree {
         for drive in drives {
             let child = self.push(&drive.label, 0, Some(id), device, true);
             let node = &mut self.nodes[child];
+            node.drive_id = drive.id;
+            node.remote_mount = drive.mount;
             node.listed = drive.listed;
             node.loaded = false;
             node.remote = Some(RemoteRef {
@@ -700,6 +712,9 @@ impl FileTree {
         let state = dummy_state(name);
         let depth = parent.map_or(0, |p| self.nodes[p].depth + 1);
         let node = Node {
+            incarnation: next_incarnation(),
+            remote_mount: None,
+            drive_id: None,
             name: name.to_string(),
             size,
             depth,
@@ -785,6 +800,12 @@ impl FileTree {
 /// 子の状態からフォルダの状態を決める。読み込み中か未読み込みの子があれば、全部が未読み込みなら
 /// 未読み込み、そうでなければ読み込み中。次に古い子があれば古い。子の失敗はフォルダの失敗に
 /// しない（フォルダの失敗は、そのフォルダの一覧が読めなかったときだけ）。
+fn next_incarnation() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 fn combine(states: &[LoadState]) -> LoadState {
     let mut counted = states.iter().filter(|s| **s != LoadState::Failed);
     let has = |want: LoadState| states.contains(&want);
@@ -1019,6 +1040,8 @@ mod tests {
         tree.add_remote_drives(
             remote_dev,
             vec![RemoteDrive {
+                id: None,
+                mount: None,
                 label: "C:".into(),
                 entry_id: 10,
                 listed: true,

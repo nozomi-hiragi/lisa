@@ -1300,15 +1300,12 @@ fn fetch_drives(peer: &SavedPeer) -> Result<Vec<RemoteDrive>, (bool, String)> {
             .map_err(|e| (false, e.to_string()))?;
     let mut out = Vec::new();
     for drive in drives {
-        let label = if !drive.label.is_empty() {
-            drive.label.clone()
-        } else if let Some(mount) = &drive.mount {
-            mount.display().to_string()
-        } else {
-            drive.id.clone()
-        };
+        let label =
+            lisa_core::display_path::drive_label(&drive.label, drive.mount.as_deref(), &drive.id);
         if let Some(root_id) = drive.root_id {
             out.push(RemoteDrive {
+                id: Some(drive.id.clone()),
+                mount: drive.mount.clone(),
                 label,
                 entry_id: root_id,
                 listed: true,
@@ -1331,6 +1328,8 @@ fn fetch_drives(peer: &SavedPeer) -> Result<Vec<RemoteDrive>, (bool, String)> {
             )
             .map_err(|e| (false, e.to_string()))?;
             out.push(RemoteDrive {
+                id: Some(drive.id.clone()),
+                mount: drive.mount.clone(),
                 label,
                 entry_id: item.id,
                 listed: item.listed,
@@ -1970,6 +1969,8 @@ mod tests {
         tree.add_remote_drives(
             dev_node,
             vec![RemoteDrive {
+                id: None,
+                mount: None,
                 label: "C:".into(),
                 entry_id: 10,
                 listed: true,
@@ -1994,6 +1995,8 @@ mod tests {
         tree.add_remote_drives(
             dev_node,
             vec![RemoteDrive {
+                id: None,
+                mount: None,
                 label: "D:".into(),
                 entry_id: 20,
                 listed: true,

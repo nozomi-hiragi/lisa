@@ -266,6 +266,8 @@ fn show_panel(
 fn update_banners(
     mut commands: Commands,
     state: Res<OrganizeState>,
+    store: Option<Res<crate::scan::Store>>,
+    names: Res<crate::model::display_path::DisplayNames>,
     font: Res<LabelFont>,
     mut move_banner: Single<
         (Entity, &mut Node),
@@ -293,7 +295,7 @@ fn update_banners(
     >,
     mut rendered_key: Local<Option<BannerKey>>,
 ) {
-    let key = BannerKey::from_state(&state);
+    let key = BannerKey::from_state(&state, names.generation);
     if rendered_key.as_ref() == Some(&key) {
         return;
     }
@@ -348,6 +350,9 @@ fn update_banners(
     commands.entity(approval_banner.0).despawn_children();
     if let Some(active) = state.pending.first() {
         approval_banner.1.display = Display::Flex;
+        let paths = store
+            .as_deref()
+            .and_then(|store| store.display_paths(&names));
         build_approval_popup(
             &mut commands,
             approval_banner.0,
@@ -357,6 +362,7 @@ fn update_banners(
             state.busy,
             &text_font,
             &small_font,
+            paths.as_ref(),
         );
     } else {
         approval_banner.1.display = Display::None;
@@ -389,10 +395,11 @@ struct BannerKey {
     busy: bool,
     notice: Option<String>,
     panel_open: bool,
+    names: u64,
 }
 
 impl BannerKey {
-    fn from_state(state: &OrganizeState) -> Self {
+    fn from_state(state: &OrganizeState, names: u64) -> Self {
         let pending_id = state.pending.first().map(|p| p.plan.id);
         Self {
             cut_source: state.cut_source.clone(),
@@ -402,6 +409,7 @@ impl BannerKey {
             busy: state.busy,
             notice: state.current_notice().map(str::to_string),
             panel_open: state.panel_open,
+            names,
         }
     }
 }
@@ -416,6 +424,7 @@ fn build_approval_popup(
     busy: bool,
     text_font: &TextFont,
     small_font: &TextFont,
+    paths: Option<&lisa_core::display_path::DisplayPaths>,
 ) {
     let plan = &active.plan;
     let plan_id = plan.id;
@@ -500,13 +509,35 @@ fn build_approval_popup(
                     for op in risky_ops.iter().take(MAX_SHOWN_RISKY) {
                         let reason = op.risky.as_deref().unwrap_or("");
                         let line = format!(
-                            "・[{}] {} — {}",
+                            "・[{}] 実パス {} — {}",
                             op_label(op.op),
-                            shorten_path(&op.src.display().to_string(), 64),
+                            op.src.display(),
                             reason
                         );
+                        let place = crate::model::display_path::mounted_text(
+                            paths,
+                            op.drive_id.as_deref(),
+                            &op.src,
+                        );
+                        let place = if let Some(dst) = &op.dst {
+                            format!(
+                                "{place} → {}",
+                                crate::model::display_path::mounted_text(
+                                    paths,
+                                    op.drive_id.as_deref(),
+                                    dst
+                                )
+                            )
+                        } else {
+                            place
+                        };
                         box_node.spawn((
-                            Text::new(line),
+                            Text::new(lisa_core::display_path::wrap_at_separators(&format!(
+                                "{place}\n{line}"
+                            ))),
+                            bevy::text::TextLayout::linebreak(
+                                bevy::text::LineBreak::WordOrCharacter,
+                            ),
                             small_font.clone(),
                             TextColor(RISKY_COLOR),
                         ));
@@ -660,12 +691,16 @@ fn build_approval_popup(
 fn fill_panel(
     mut commands: Commands,
     state: Res<OrganizeState>,
+    store: Option<Res<crate::scan::Store>>,
+    names: Res<crate::model::display_path::DisplayNames>,
     font: Res<LabelFont>,
-    list: Single<Entity, With<List>>,
-    status: Single<Entity, With<PanelStatus>>,
+    (list, status): (
+        Single<Entity, With<List>>,
+        Single<Entity, With<PanelStatus>>,
+    ),
     mut rendered_key: Local<Option<PanelKey>>,
 ) {
-    let key = PanelKey::from_state(&state);
+    let key = PanelKey::from_state(&state, names.generation);
     if rendered_key.as_ref() == Some(&key) {
         return;
     }
@@ -771,6 +806,9 @@ fn fill_panel(
             });
         }
     });
+    let paths = store
+        .as_deref()
+        .and_then(|store| store.display_paths(&names));
 
     let unpurged_trash = state
         .history
@@ -850,7 +888,9 @@ fn fill_panel(
                 .selected_details
                 .as_ref()
                 .filter(|d| d.plan_id == plan.id);
-            spawn_plan_card(list, plan, selected, details, &state, &big, &small);
+            spawn_plan_card(
+                list, plan, selected, details, &state, &big, &small, paths.as_ref(),
+            );
         }
     });
 }
@@ -866,10 +906,11 @@ struct PanelKey {
     details_id: Option<i64>,
     details_ops: Option<Vec<(usize, OpState)>>,
     history_confirmation: Option<HistoryConfirmation>,
+    names: u64,
 }
 
 impl PanelKey {
-    fn from_state(state: &OrganizeState) -> Self {
+    fn from_state(state: &OrganizeState, names: u64) -> Self {
         Self {
             panel_open: state.panel_open,
             busy: state.busy,
@@ -893,10 +934,12 @@ impl PanelKey {
                 d.ops.iter().map(|o| (o.seq as usize, o.state)).collect()
             }),
             history_confirmation: state.history_confirmation,
+            names,
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_plan_card(
     list: &mut ChildSpawnerCommands,
     plan: &Plan,
@@ -905,6 +948,7 @@ fn spawn_plan_card(
     state: &OrganizeState,
     big: &TextFont,
     small: &TextFont,
+    paths: Option<&lisa_core::display_path::DisplayPaths>,
 ) {
     let plan_id = plan.id;
     let busy = state.busy;
@@ -1095,14 +1139,14 @@ fn spawn_plan_card(
             op.seq,
             op_label(op.op),
             op_state_label(op.state),
-            shorten_path(&op.src.display().to_string(), 48),
+            crate::model::display_path::mounted_text(paths, op.drive_id.as_deref(), &op.src),
         );
         if op.op == OpKind::Move
             && let Some(dst) = &op.dst
         {
             line.push_str(&format!(
                 " -> {}",
-                shorten_path(&dst.display().to_string(), 40)
+                crate::model::display_path::mounted_text(paths, op.drive_id.as_deref(), dst)
             ));
         }
         let color = match op.state {
@@ -1124,7 +1168,12 @@ fn spawn_plan_card(
             BackgroundColor(ROW_COLOR),
         ));
         row_cmd.with_children(|row| {
-            row.spawn((Text::new(line), small.clone(), TextColor(color)));
+            row.spawn((
+                Text::new(lisa_core::display_path::wrap_at_separators(&line)),
+                bevy::text::TextLayout::linebreak(bevy::text::LineBreak::WordOrCharacter),
+                small.clone(),
+                TextColor(color),
+            ));
             if let Some(risky) = &op.risky {
                 row.spawn((
                     Text::new(format!("危ない: {risky}")),
@@ -1206,17 +1255,6 @@ fn human(bytes: u64) -> String {
     }
 }
 
-fn shorten_path(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_string();
-    }
-    let keep = max_chars.saturating_sub(1);
-    let tail: String = s.chars().skip(count - keep).collect();
-    format!("…{tail}")
-}
-
-/// UTC の Unix ミリ秒を「YYYY-MM-DD HH:MM」に整形する（ローカル時刻オフセット付き）。
 fn format_epoch_ms(ms: i64) -> String {
     let secs = ms.div_euclid(1000) + local_offset_secs();
     let days = secs.div_euclid(86_400);
@@ -1291,11 +1329,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shorten_path_keeps_tail() {
-        assert_eq!(shorten_path("/a/b", 10), "/a/b");
+    fn missing_plan_drive_keeps_the_full_display_path() {
+        let path = std::path::Path::new("/example/deep/folder/file.txt");
         assert_eq!(
-            shorten_path("/Users/alice/Documents/file.txt", 12),
-            "…ts/file.txt"
+            crate::model::display_path::mounted_text(None, Some("missing"), path),
+            "端末不明 › example › deep › folder › file.txt",
         );
     }
 

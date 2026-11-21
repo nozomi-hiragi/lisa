@@ -77,6 +77,11 @@ impl Plugin for ScanPlugin {
             let os = std::env::consts::OS;
             match store.this_device(&name, &name, os) {
                 Ok(device) => {
+                    if let Ok(Some((name, _))) = lisa_core::query::this_device(store)
+                        && !name.trim().is_empty()
+                    {
+                        tree.nodes[FileTree::ROOT + 1].name = name;
+                    }
                     for (volume, &node) in visible.iter().zip(&drive_nodes) {
                         let Some(id) = &volume.id else { continue };
                         if let Err(error) = store.upsert_drive(&device, volume) {
@@ -118,10 +123,12 @@ impl Plugin for ScanPlugin {
             })
             .insert_resource(Setup(Mutex::new(Some((db, roots)))))
             .init_resource::<TreeChanged>()
+            .init_resource::<crate::model::display_path::DisplayNames>()
             .add_systems(Startup, start_workers)
             .add_systems(
                 Update,
                 (
+                    crate::model::display_path::refresh_display_names,
                     apply_settings,
                     request_visible,
                     receive.after(crate::organize::receive_events),
@@ -211,6 +218,27 @@ impl Store {
         let db = self.reader.as_ref()?.lock().ok()?;
         let located = lisa_core::query::path_of(&db, entry).ok()??;
         located.path.is_absolute().then_some(located.path)
+    }
+
+    pub(crate) fn display_paths(
+        &self,
+        names: &crate::model::display_path::DisplayNames,
+    ) -> Option<lisa_core::display_path::DisplayPaths> {
+        let db = self.reader.as_ref()?.lock().ok()?;
+        lisa_core::display_path::DisplayPaths::read(&db, &names.visible).ok()
+    }
+
+    pub(crate) fn with_display_entries<R>(
+        &self,
+        visible: &lisa_core::display_path::VisibleNames,
+        use_entries: impl FnOnce(&dyn Fn(i64) -> Option<String>) -> R,
+    ) -> Option<R> {
+        let db = self.reader.as_ref()?.lock().ok()?;
+        let names = lisa_core::display_path::DisplayPaths::read(&db, visible).ok()?;
+        Some(use_entries(&|entry| {
+            let parts = names.entry(&db, entry).ok()??;
+            Some(lisa_core::display_path::text(&parts))
+        }))
     }
 
     fn entry_chain_at(&self, path: &Path) -> Option<Vec<i64>> {
@@ -980,6 +1008,9 @@ pub(crate) fn resolve_location(
                 .unwrap_or_else(|| vec![FileTree::ROOT])
         }
         crate::view::Location::Renamed(_) => unreachable!("上で実パスを解決済み"),
+        crate::view::Location::Attached(steps) => {
+            crate::model::display_path::resolve_steps(tree, steps)
+        }
         crate::view::Location::Named(names) => {
             let mut node = FileTree::ROOT;
             let mut reader = store.and_then(|s| s.reader.as_ref()?.lock().ok());

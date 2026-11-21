@@ -121,10 +121,12 @@ fn show_panel(
 fn fill_panel(
     mut commands: Commands,
     dups: Res<Dups>,
+    store: Option<Res<crate::scan::Store>>,
+    names: Res<crate::model::display_path::DisplayNames>,
     font: Res<LabelFont>,
     list: Single<Entity, With<List>>,
 ) {
-    if !dups.is_changed() || !dups.open {
+    if !(dups.is_changed() || names.is_changed()) || !dups.open {
         return;
     }
     let list = *list;
@@ -203,9 +205,16 @@ fn fill_panel(
             if !selected {
                 continue;
             }
-            for copy in &group.copies {
+            let paths = crate::model::display_path::entry_texts(
+                &names,
+                store.as_deref(),
+                group
+                    .copies
+                    .iter()
+                    .map(|copy| (copy.chain.last().copied(), &copy.path)),
+            );
+            for (copy, mut text) in group.copies.iter().zip(paths) {
                 let chain = copy.chain.clone();
-                let mut text = copy.path.display().to_string();
                 if !copy.hard_links.is_empty() {
                     text.push_str(&format!(
                         "（ハードリンク {} か所も同じ実体）",
@@ -221,7 +230,12 @@ fn fill_panel(
                         ..default()
                     },
                     BackgroundColor(ROW_COLOR),
-                    children![(Text::new(text), small.clone(), TextColor(TEXT_COLOR))],
+                    children![(
+                        Text::new(lisa_core::display_path::wrap_at_separators(&text)),
+                        small.clone(),
+                        TextColor(TEXT_COLOR),
+                        bevy::text::TextLayout::linebreak(bevy::text::LineBreak::WordOrCharacter)
+                    )],
                 ))
                 .observe(move |_: On<PointerClick>, mut commands: Commands| {
                     commands.insert_resource(JumpTo(chain.clone()));

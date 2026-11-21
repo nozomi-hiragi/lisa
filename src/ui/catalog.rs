@@ -159,6 +159,13 @@ fn role_text(role: Role) -> &'static str {
     }
 }
 
+/// 行ごとの表示パス。行と表示名の世代が同じなら作り直さない。
+struct PathCache {
+    names: u64,
+    keys: Vec<(Option<i64>, std::path::PathBuf)>,
+    paths: Vec<String>,
+}
+
 /// 中身を作り直す（結果が来たとき、選んだものが変わったとき、開いているフォルダが変わったとき）。
 #[allow(clippy::too_many_arguments)]
 fn fill_panel(
@@ -170,10 +177,15 @@ fn fill_panel(
     font: Res<LabelFont>,
     list: Single<Entity, With<List>>,
     mut last_open: Local<Option<usize>>,
+    store: Option<Res<crate::scan::Store>>,
+    names: Res<crate::model::display_path::DisplayNames>,
+    mut cached: Local<Option<PathCache>>,
 ) {
     let open_folder = nav.top().node;
     let folder_changed = *last_open != Some(open_folder);
-    if !view.open || !(view.is_changed() || remote.is_changed() || folder_changed) {
+    if !view.open
+        || !(view.is_changed() || remote.is_changed() || names.is_changed() || folder_changed)
+    {
         return;
     }
     *last_open = Some(open_folder);
@@ -226,6 +238,34 @@ fn fill_panel(
     apps.sort();
     apps.dedup();
 
+    // フォルダを移動するだけでは行は変わらないので、同じ行なら前の表記を使い回す（DB を引かない）。
+    let keys: Vec<_> = snapshot
+        .hits
+        .iter()
+        .map(|hit| (hit.chain.last().copied(), hit.path.clone()))
+        .chain(
+            snapshot
+                .unclassified
+                .iter()
+                .map(|hit| (hit.chain.last().copied(), hit.path.clone())),
+        )
+        .collect();
+    let paths = match cached.as_ref() {
+        Some(cache) if cache.names == names.generation && cache.keys == keys => cache.paths.clone(),
+        _ => {
+            let paths = crate::model::display_path::entry_texts(
+                &names,
+                store.as_deref(),
+                keys.iter().map(|(entry, path)| (*entry, path)),
+            );
+            *cached = Some(PathCache {
+                names: names.generation,
+                keys,
+                paths: paths.clone(),
+            });
+            paths
+        }
+    };
     commands.entity(list).with_children(|list| {
         list.spawn((Text::new(header), big.clone(), TextColor(TEXT_COLOR)));
         list.spawn((
@@ -317,7 +357,14 @@ fn fill_panel(
                             TextColor(if selected { hit.color } else { TEXT_COLOR }),
                         ),
                         (
-                            Text::new(format!("{}  {}", human(hit.size), hit.path.display())),
+                            Text::new(format!(
+                                "{}  {}",
+                                human(hit.size),
+                                lisa_core::display_path::wrap_at_separators(&paths[index])
+                            )),
+                            bevy::text::TextLayout::linebreak(
+                                bevy::text::LineBreak::WordOrCharacter
+                            ),
                             small.clone(),
                             TextColor(DIM_COLOR),
                         )
@@ -345,7 +392,11 @@ fn fill_panel(
                 small.clone(),
                 TextColor(DIM_COLOR),
             ));
-            for big_folder in &snapshot.unclassified {
+            for (big_folder, path) in snapshot
+                .unclassified
+                .iter()
+                .zip(&paths[snapshot.hits.len()..])
+            {
                 let chain = big_folder.chain.clone();
                 list.spawn((
                     Node {
@@ -359,8 +410,9 @@ fn fill_panel(
                         Text::new(format!(
                             "{}  {}",
                             human(big_folder.size),
-                            big_folder.path.display()
+                            lisa_core::display_path::wrap_at_separators(path)
                         )),
+                        bevy::text::TextLayout::linebreak(bevy::text::LineBreak::WordOrCharacter),
                         small.clone(),
                         TextColor(TEXT_COLOR)
                     )],

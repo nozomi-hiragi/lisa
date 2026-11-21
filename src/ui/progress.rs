@@ -2,7 +2,6 @@
 //! 読んだ数と速さを出す。読み終えたらハッシュの進み具合（今のフォルダ、数、大きさ、速さ）を出し、
 //! それも終えたら少しして消す。
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
@@ -18,7 +17,7 @@ const DIM_COLOR: Color = palette::MUTED;
 const UPDATE_EVERY: Duration = Duration::from_millis(200);
 /// 読み終えてから消すまで。
 const HIDE_AFTER: Duration = Duration::from_secs(4);
-/// パスをこの文字数より長ければ、前を「…」で切る。
+/// 場所をこの文字数より長ければ、中央を「…」で省く。
 const MAX_CHARS: usize = 70;
 
 pub struct ProgressPlugin;
@@ -74,6 +73,7 @@ fn spawn_panel(mut commands: Commands, font: Res<LabelFont>, progress: Option<Re
 
 fn show_progress(
     progress: Option<Res<ScanProgress>>,
+    tree: Res<crate::model::tree::FileTree>,
     control: Option<Res<crate::scan::ScanControl>>,
     mut last: Local<Option<Instant>>,
     mut panel: Query<&mut Visibility, With<Panel>>,
@@ -136,7 +136,10 @@ fn show_progress(
             let speed = hash.bytes as f64 / seconds;
             let mut body = String::new();
             if let Some(folder) = &hash.folder {
-                body = format!("▶ {}", shorten(folder));
+                body = format!(
+                    "▶ {}",
+                    crate::model::display_path::mounted_tree_text(&tree, folder, MAX_CHARS)
+                );
             }
             (
                 format!(
@@ -151,9 +154,17 @@ fn show_progress(
         _ => {
             let mut body = Vec::new();
             if let Some(current) = &p.current {
-                body.push(format!("▶ {}", shorten(current)));
+                body.push(format!(
+                    "▶ {}",
+                    crate::model::display_path::mounted_tree_text(&tree, current, MAX_CHARS)
+                ));
             }
-            body.extend(p.next.iter().map(|path| format!("   {}", shorten(path))));
+            body.extend(p.next.iter().map(|path| {
+                format!(
+                    "   {}",
+                    crate::model::display_path::mounted_tree_text(&tree, path, MAX_CHARS)
+                )
+            }));
             (
                 format!(
                     "読み込み中  {} フォルダ{failed}・あと {}・1 秒に {rate:.0}",
@@ -200,15 +211,4 @@ pub(crate) fn bytes(n: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
-}
-
-/// 長いパスは前を切って、後ろ（今いる場所に近いほう）を残す。
-fn shorten(path: &Path) -> String {
-    let text = path.display().to_string();
-    let count = text.chars().count();
-    if count <= MAX_CHARS {
-        return text;
-    }
-    let tail: String = text.chars().skip(count - (MAX_CHARS - 1)).collect();
-    format!("…{tail}")
 }

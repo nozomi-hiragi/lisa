@@ -32,7 +32,10 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BIN = REPO_ROOT / "target" / "debug" / "lisa"
-SOURCE_DATA_DIR = Path.home() / "Library" / "Application Support" / "Lisa"
+SOURCE_DATA_DIR = Path(
+    os.environ.get("LISA_VERIFY_SOURCE_DATA_DIR")
+    or Path.home() / "Library" / "Application Support" / "Lisa"
+)
 BAR_PX = 32.0
 
 
@@ -769,7 +772,14 @@ def check_invariants(
             f"nav.top() ({st['nav_nodes'][-1]}:{st['nav_names'][-1]}) が layouts に無い"
         )
 
-    expected_bc = " / ".join(st["nav_names"])
+    names = st["nav_names"][1:]
+    shown_names = st["nav_display_names"]
+    if len(shown_names) != len(names) or any(
+        shown != name and (index >= 2 or not shown.startswith(name + " ("))
+        for index, (shown, name) in enumerate(zip(shown_names, names))
+    ):
+        errors.append(f"端末起点の表示列が不正: {shown_names!r} (木: {names!r})")
+    expected_bc = " › ".join(shown_names) or "端末一覧"
     if st["breadcrumb"] != expected_bc:
         errors.append(
             f"パンくず不一致: breadcrumb={st['breadcrumb']!r} != nav={expected_bc!r}"

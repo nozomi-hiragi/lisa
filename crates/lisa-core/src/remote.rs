@@ -172,6 +172,8 @@ pub struct DebugTileRect {
 pub struct DebugState {
     pub nav_nodes: Vec<usize>,
     pub nav_names: Vec<String>,
+    #[serde(default)]
+    pub nav_display_names: Vec<String>,
     pub nav_entries: Vec<Option<i64>>,
     pub nav_top_path: Option<PathBuf>,
     pub nav_top_attached: bool,
