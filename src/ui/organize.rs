@@ -6,7 +6,6 @@
 //! - 履歴のパネルはメニューバーの「整理」で開け閉めし、重複・カタログのパネルと同じく右からすべり出す
 //!   （同時には開かない）。
 
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::ui::ScrollPosition;
 use bevy::window::RequestRedraw;
@@ -15,11 +14,13 @@ use lisa_core::organize::{OpKind, OpState, Plan, PlanState};
 use crate::catalog::CatalogView;
 use crate::dups::Dups;
 use crate::lan::PairBanner;
-use crate::organize::{ConfirmPurge, OrganizeState, PendingPlan, PlanDetails};
+use crate::organize::{HistoryConfirmation, OrganizeState, PendingPlan, PlanDetails};
 use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::JumpTo;
 use crate::ui::menu::BAR_PX;
+
+use super::{SidePanelLayout, SidePanelList};
 
 /// 履歴パネルの幅（論理ピクセル。重複・カタログと同じ）。
 pub const PANEL_PX: f32 = 380.0;
@@ -48,8 +49,6 @@ const ACCENT: Color = palette::WARNING;
 
 /// すべり出しにかける時間（秒）。
 const SLIDE_SECONDS: f32 = 0.22;
-/// 1 回のホイールで動かす量（行単位のとき）。
-const LINE_PX: f32 = 24.0;
 
 pub struct OrganizePanelPlugin;
 
@@ -58,10 +57,9 @@ impl Plugin for OrganizePanelPlugin {
         app.add_systems(PostStartup, spawn_ui).add_systems(
             Update,
             (
-                only_one_panel,
-                show_panel,
+                only_one_panel.before(SidePanelLayout),
+                show_panel.in_set(SidePanelLayout),
                 fill_panel,
-                scroll_panel,
                 update_banners,
             )
                 .chain(),
@@ -74,6 +72,9 @@ struct Panel;
 
 #[derive(Component)]
 struct List;
+
+#[derive(Component)]
+struct PanelStatus;
 
 #[derive(Component)]
 struct ApprovalBanner;
@@ -169,6 +170,7 @@ fn spawn_ui(mut commands: Commands) {
                 right: Val::Px(-PANEL_PX),
                 bottom: Val::Px(0.0),
                 width: Val::Px(PANEL_PX),
+                flex_direction: FlexDirection::Column,
                 display: Display::None,
                 ..default()
             },
@@ -177,17 +179,28 @@ fn spawn_ui(mut commands: Commands) {
         ))
         .with_children(|panel| {
             panel.spawn((
+                PanelStatus,
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(6.0),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+            ));
+            panel.spawn((
                 List,
                 Node {
                     flex_direction: FlexDirection::Column,
                     width: Val::Percent(100.0),
-                    height: Val::Percent(100.0),
+                    flex_grow: 1.0,
+                    min_height: Val::Px(0.0),
                     padding: UiRect::all(Val::Px(8.0)),
                     row_gap: Val::Px(6.0),
                     overflow: Overflow::scroll_y(),
                     ..default()
                 },
                 ScrollPosition::default(),
+                SidePanelList::default(),
             ));
         });
 }
@@ -218,8 +231,10 @@ fn show_panel(
     mut shown: Local<f32>,
     mut last: Local<Option<std::time::Instant>>,
     mut panel: Single<&mut Node, With<Panel>>,
+    mut list: Single<&mut SidePanelList, With<List>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
+    list.closing = !organize.panel_open;
     let target = if organize.panel_open { 1.0 } else { 0.0 };
     let now = std::time::Instant::now();
     let dt = last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
@@ -647,6 +662,7 @@ fn fill_panel(
     state: Res<OrganizeState>,
     font: Res<LabelFont>,
     list: Single<Entity, With<List>>,
+    status: Single<Entity, With<PanelStatus>>,
     mut rendered_key: Local<Option<PanelKey>>,
 ) {
     let key = PanelKey::from_state(&state);
@@ -656,11 +672,105 @@ fn fill_panel(
     *rendered_key = Some(key);
     let list = *list;
     commands.entity(list).despawn_children();
+    commands.entity(*status).despawn_children();
     if !state.panel_open {
         return;
     }
     let big = TextFont::from_font_size(13.0).with_font(font.0.clone());
     let small = TextFont::from_font_size(11.0).with_font(font.0.clone());
+
+    // 確認と失敗のお知らせは、どの行までスクロールしていても見える。
+    commands.entity(*status).with_children(|status| {
+        if let Some(msg) = state.current_notice() {
+            status.spawn((
+                Node {
+                    padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    flex_shrink: 0.0,
+                    margin: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(SELECTED_COLOR),
+                children![(Text::new(msg.to_string()), small.clone(), TextColor(ACCENT))],
+            ));
+        }
+
+        if let Some(confirming) = state.history_confirmation {
+            let message = match confirming {
+                HistoryConfirmation::PurgePlan(id) => format!(
+                    "計画 #{id} の隔離ファイルを OS のゴミ箱へ送りますか？（取り消せなくなります）"
+                ),
+                HistoryConfirmation::Dismiss(id) => format!(
+                    "計画 #{id} を履歴から削除しますか？ ファイルは変更されません。"
+                ),
+                HistoryConfirmation::PurgeAll => {
+                    "すべての隔離ファイルを OS のゴミ箱へ送りますか？（取り消せなくなります）".to_string()
+                }
+            };
+            status.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                padding: UiRect::all(Val::Px(7.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                margin: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                flex_shrink: 0.0,
+                ..default()
+            })
+            .insert((
+                BackgroundColor(palette::ERROR_CONTENT.with_alpha(0.85)),
+                BorderColor::all(RISKY_COLOR),
+            ))
+            .with_children(|box_node| {
+                box_node.spawn((Text::new(message), small.clone(), TextColor(RISKY_COLOR)));
+                box_node
+                    .spawn(Node {
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|buttons| {
+                        buttons
+                            .spawn((
+                                Node {
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(REJECT_COLOR),
+                                children![(Text::new(if matches!(confirming, HistoryConfirmation::Dismiss(_)) { "削除" } else { "送る" }), small.clone(), TextColor(REJECT_TEXT_COLOR))],
+                            ))
+                            .observe(
+                                move |mut click: On<PointerClick>,
+                                      mut state: ResMut<OrganizeState>| {
+                                    click.propagate(false);
+                                    state.confirm_history_action(confirming);
+                                },
+                            );
+                        buttons
+                            .spawn((
+                                Node {
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(BUTTON_COLOR),
+                                children![(
+                                    Text::new("やめる"),
+                                    small.clone(),
+                                    TextColor(TEXT_COLOR)
+                                )],
+                            ))
+                            .observe(
+                                move |mut click: On<PointerClick>,
+                                      mut state: ResMut<OrganizeState>| {
+                                    click.propagate(false);
+                                    state.cancel_history_confirmation(confirming);
+                                },
+                            );
+                });
+            });
+        }
+    });
 
     let unpurged_trash = state
         .history
@@ -706,7 +816,7 @@ fn fill_panel(
                     |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
                         click.propagate(false);
                         if !state.busy {
-                            state.confirming_purge = Some(ConfirmPurge::All);
+                            state.history_confirmation = Some(HistoryConfirmation::PurgeAll);
                         }
                     },
                 );
@@ -718,99 +828,6 @@ fn fill_panel(
             small.clone(),
             TextColor(DIM_COLOR),
         ));
-
-        if let Some(msg) = state.current_notice() {
-            list.spawn((
-                Node {
-                    padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    flex_shrink: 0.0,
-                    ..default()
-                },
-                BackgroundColor(SELECTED_COLOR),
-                children![(Text::new(msg.to_string()), small.clone(), TextColor(ACCENT))],
-            ));
-        }
-
-        if let Some(confirming) = state.confirming_purge {
-            let message = match confirming {
-                ConfirmPurge::Plan(id) => format!(
-                    "計画 #{id} の隔離ファイルを OS のゴミ箱へ送りますか？（取り消せなくなります）"
-                ),
-                ConfirmPurge::All => {
-                    "すべての隔離ファイルを OS のゴミ箱へ送りますか？（取り消せなくなります）".to_string()
-                }
-            };
-            list.spawn(Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(6.0),
-                padding: UiRect::all(Val::Px(7.0)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
-                border: UiRect::all(Val::Px(1.0)),
-                flex_shrink: 0.0,
-                ..default()
-            })
-            .insert((
-                BackgroundColor(palette::ERROR_CONTENT.with_alpha(0.85)),
-                BorderColor::all(RISKY_COLOR),
-            ))
-            .with_children(|box_node| {
-                box_node.spawn((Text::new(message), small.clone(), TextColor(RISKY_COLOR)));
-                box_node
-                    .spawn(Node {
-                        column_gap: Val::Px(8.0),
-                        ..default()
-                    })
-                    .with_children(|buttons| {
-                        buttons
-                            .spawn((
-                                Node {
-                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
-                                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(REJECT_COLOR),
-                                children![(Text::new("送る"), small.clone(), TextColor(REJECT_TEXT_COLOR))],
-                            ))
-                            .observe(
-                                move |mut click: On<PointerClick>,
-                                      mut state: ResMut<OrganizeState>| {
-                                    click.propagate(false);
-                                    if state.confirming_purge == Some(confirming) && !state.busy {
-                                        state.confirming_purge = None;
-                                        match confirming {
-                                            ConfirmPurge::Plan(id) => state.purge_plan(id),
-                                            ConfirmPurge::All => state.purge_all(),
-                                        }
-                                    }
-                                },
-                            );
-                        buttons
-                            .spawn((
-                                Node {
-                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
-                                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(BUTTON_COLOR),
-                                children![(
-                                    Text::new("やめる"),
-                                    small.clone(),
-                                    TextColor(TEXT_COLOR)
-                                )],
-                            ))
-                            .observe(
-                                move |mut click: On<PointerClick>,
-                                      mut state: ResMut<OrganizeState>| {
-                                    click.propagate(false);
-                                    if state.confirming_purge == Some(confirming) {
-                                        state.confirming_purge = None;
-                                    }
-                                },
-                            );
-                });
-            });
-        }
 
         if state.history.is_empty() {
             list.spawn((
@@ -833,7 +850,7 @@ fn fill_panel(
                 .selected_details
                 .as_ref()
                 .filter(|d| d.plan_id == plan.id);
-            spawn_plan_card(list, plan, selected, details, state.busy, &big, &small);
+            spawn_plan_card(list, plan, selected, details, &state, &big, &small);
         }
     });
 }
@@ -844,10 +861,11 @@ struct PanelKey {
     busy: bool,
     selected_plan: Option<i64>,
     notice: Option<String>,
-    history: Vec<(i64, PlanState, Option<i64>)>,
+    history: Vec<(i64, PlanState, Option<i64>, bool)>,
+    dismissing: Option<i64>,
     details_id: Option<i64>,
     details_ops: Option<Vec<(usize, OpState)>>,
-    confirming_purge: Option<ConfirmPurge>,
+    history_confirmation: Option<HistoryConfirmation>,
 }
 
 impl PanelKey {
@@ -860,13 +878,21 @@ impl PanelKey {
             history: state
                 .history
                 .iter()
-                .map(|p| (p.id, p.state, p.purged_at))
+                .map(|p| {
+                    (
+                        p.id,
+                        p.state,
+                        p.purged_at,
+                        state.dismissible.contains(&p.id),
+                    )
+                })
                 .collect(),
+            dismissing: state.dismissing,
             details_id: state.selected_details.as_ref().map(|d| d.plan_id),
             details_ops: state.selected_details.as_ref().map(|d| {
                 d.ops.iter().map(|o| (o.seq as usize, o.state)).collect()
             }),
-            confirming_purge: state.confirming_purge,
+            history_confirmation: state.history_confirmation,
         }
     }
 }
@@ -876,11 +902,14 @@ fn spawn_plan_card(
     plan: &Plan,
     selected: bool,
     details: Option<&PlanDetails>,
-    busy: bool,
+    state: &OrganizeState,
     big: &TextFont,
     small: &TextFont,
 ) {
     let plan_id = plan.id;
+    let busy = state.busy;
+    let can_dismiss = state.dismissible.contains(&plan_id);
+    let dismiss_disabled = busy || state.dismissing.is_some();
     let can_undo = matches!(plan.state, PlanState::Done | PlanState::Partial)
         && plan.purged_at.is_none();
     let undo_busy = busy;
@@ -943,7 +972,7 @@ fn spawn_plan_card(
         }
         card.spawn((Text::new(meta), small.clone(), TextColor(DIM_COLOR)));
 
-        if can_undo || can_purge {
+        if can_undo || can_purge || can_dismiss {
             card.spawn(Node {
                 column_gap: Val::Px(6.0),
                 margin: UiRect::top(Val::Px(3.0)),
@@ -974,6 +1003,42 @@ fn spawn_plan_card(
                             },
                         );
                 }
+                if can_dismiss {
+                    actions
+                        .spawn((
+                            Node {
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(if dismiss_disabled {
+                                ROW_COLOR
+                            } else {
+                                BUTTON_COLOR
+                            }),
+                            children![(
+                                Text::new("履歴から削除"),
+                                small.clone(),
+                                TextColor(if dismiss_disabled {
+                                    DIM_COLOR
+                                } else {
+                                    TEXT_COLOR
+                                })
+                            )],
+                        ))
+                        .observe(
+                            move |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
+                                click.propagate(false);
+                                if !state.busy
+                                    && state.dismissing.is_none()
+                                    && state.dismissible.contains(&plan_id)
+                                {
+                                    state.history_confirmation =
+                                        Some(HistoryConfirmation::Dismiss(plan_id));
+                                }
+                            },
+                        );
+                }
                 if can_purge {
                     actions
                         .spawn((
@@ -993,7 +1058,8 @@ fn spawn_plan_card(
                             move |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
                                 click.propagate(false);
                                 if !busy && !state.busy {
-                                    state.confirming_purge = Some(ConfirmPurge::Plan(plan_id));
+                                    state.history_confirmation =
+                                        Some(HistoryConfirmation::PurgePlan(plan_id));
                                 }
                             },
                         );
@@ -1079,29 +1145,6 @@ fn spawn_plan_card(
                 commands.insert_resource(JumpTo(chain.clone()));
             });
         }
-    }
-}
-
-/// 履歴パネルの上でホイールを回したらスクロールする。
-fn scroll_panel(
-    state: Res<OrganizeState>,
-    mut wheel: MessageReader<MouseWheel>,
-    window: Single<&Window>,
-    mut list: Single<&mut ScrollPosition, With<List>>,
-) {
-    let over = state.panel_open
-        && window
-            .cursor_position()
-            .is_some_and(|p| p.x > crate::view::view_width(&window) && p.y > BAR_PX);
-    for event in wheel.read() {
-        if !over {
-            continue;
-        }
-        let dy = match event.unit {
-            MouseScrollUnit::Line => event.y * LINE_PX,
-            MouseScrollUnit::Pixel => event.y,
-        };
-        list.y = (list.y - dy).max(0.0);
     }
 }
 

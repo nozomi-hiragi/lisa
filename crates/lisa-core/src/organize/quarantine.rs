@@ -300,6 +300,119 @@ pub(crate) fn plan_quarantine_dirs(
     Ok(dirs.into_iter().collect())
 }
 
+/// 処分と同じ候補を確認し、アクセスできない隔離先も履歴に残す。
+pub(crate) fn history_quarantine_clear<'a>(
+    db: &Db,
+    data_dir: &Path,
+    plan_id: i64,
+    ops: impl Iterator<Item = &'a plan::PlanOp>,
+) -> bool {
+    fn absent(path: &Path) -> bool {
+        matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    let id = plan_id.to_string();
+    if !history_plan_dir_clear(&data_dir.join("trash").join(&id), plan_id) {
+        return false;
+    }
+    let Ok(drives) = query::drives(db) else {
+        return false;
+    };
+    if drives.iter().filter_map(|d| d.mount.as_ref()).any(|mount| {
+        !history_plan_dir_clear(&mount.join(name::QUARANTINE_DIR_NAME).join(&id), plan_id)
+    }) {
+        return false;
+    }
+    for op in ops.filter(|op| matches!(op.op, OpKind::Move | OpKind::Trash)) {
+        // 別ボリュームへの移動でも元ファイルを隔離することがある。
+        if let Some(drive_id) = &op.drive_id
+            && !drives.iter().any(|drive| {
+                &drive.id == drive_id && drive.mount.as_ref().is_some_and(|mount| mount.is_dir())
+            })
+        {
+            return false;
+        }
+        if op.op == OpKind::Trash {
+            match &op.dst {
+                Some(dst)
+                    if dst.is_absolute()
+                        && absent(dst)
+                        && find_plan_dir_ancestor(dst, &id)
+                            .is_some_and(|dir| history_plan_dir_clear(&dir, plan_id)) => {}
+                None if matches!(op.state, plan::OpState::Skipped | plan::OpState::Failed) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// 取り消しは隔離した項目だけを戻す。空の親フォルダとマニフェストは残る。
+fn history_plan_dir_clear(dir: &Path, plan_id: i64) -> bool {
+    match fs::symlink_metadata(dir) {
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return false,
+    }
+
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let mut parent_dirs = BTreeSet::new();
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(meta) if meta.is_file() => {
+            let Some(manifest) = fs::read(&manifest_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+                .filter(|manifest| manifest.plan_id == plan_id)
+            else {
+                return false;
+            };
+            for entry in manifest.entries {
+                let relative = Path::new(&entry.rel_path);
+                if relative.as_os_str().is_empty()
+                    || relative
+                        .components()
+                        .any(|part| !matches!(part, Component::Normal(_)))
+                {
+                    return false;
+                }
+                let payload = dir.join(relative);
+                if !matches!(fs::symlink_metadata(&payload), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return false;
+                }
+                for parent in payload
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|parent| *parent != dir)
+                {
+                    parent_dirs.insert(parent.to_path_buf());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return false,
+    }
+
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(parent) = pending.pop() {
+        let Ok(entries) = fs::read_dir(parent) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_file() && path == manifest_path => {}
+                Ok(kind) if kind.is_dir() && parent_dirs.contains(&path) => pending.push(path),
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 fn find_plan_dir_ancestor(path: &Path, plan_id_str: &str) -> Option<PathBuf> {
     let mut cur = path.parent();
     while let Some(p) = cur {

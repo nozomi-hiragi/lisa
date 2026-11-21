@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{self, Db};
@@ -478,6 +478,86 @@ pub fn list_plans(db: &Db, state: Option<PlanState>, limit: usize) -> db::Result
     }
 }
 
+/// UI の履歴だけを読む。除外した計画も通常の計画参照には残る。
+pub fn list_history(db: &Db, limit: usize) -> db::Result<Vec<Plan>> {
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT {PLAN_COLUMNS} FROM plan
+         WHERE NOT EXISTS (SELECT 1 FROM dismissed_plan WHERE plan_id = plan.id)
+         ORDER BY id DESC LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map([limit.max(1) as i64], row_to_plan)?;
+    rows.collect()
+}
+
+/// 履歴から消せるか。Undo の実行対象と、処分または確認が必要な隔離先を確かめる。
+pub fn can_dismiss_history(db: &Db, data_dir: &Path, plan: &Plan) -> bool {
+    match plan.state {
+        PlanState::Rejected | PlanState::Cancelled | PlanState::Expired => true,
+        PlanState::Pending | PlanState::Approved | PlanState::Running => false,
+        PlanState::Done | PlanState::Partial | PlanState::Undone => {
+            can_dismiss_finished(db, data_dir, plan).unwrap_or(false)
+        }
+    }
+}
+
+fn can_dismiss_finished(db: &Db, data_dir: &Path, plan: &Plan) -> db::Result<bool> {
+    // 通常の読み出しでは未知の値を既定値に置き換えるため、ここでは生の値も確かめる。
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT {PLAN_OP_COLUMNS} FROM plan_op WHERE plan_id = ?1 ORDER BY seq"
+    ))?;
+    let ops = stmt
+        .query_map([plan.id], |r| {
+            let kind = OpKind::from_name(&r.get::<_, String>(2)?);
+            let state = OpState::from_name(&r.get::<_, String>(11)?);
+            Ok((kind.zip(state), row_to_plan_op(r)?))
+        })?
+        .collect::<db::Result<Vec<_>>>()?;
+    if ops.is_empty()
+        || ops.len() != plan.summary.total
+        || ops.iter().any(|(decoded, op)| {
+            decoded.is_none()
+                || matches!(op.state, OpState::Pending | OpState::Running)
+                || (op.state == OpState::Done
+                    && (plan.state == PlanState::Undone
+                        || op.op != OpKind::Trash
+                        || plan.purged_at.is_none()))
+        })
+    {
+        return Ok(false);
+    }
+    Ok(super::quarantine::history_quarantine_clear(
+        db,
+        data_dir,
+        plan.id,
+        ops.iter().map(|(_, op)| op),
+    ))
+}
+
+/// 書き込みロックを取ってから判定し、同じ計画への再試行は成功として扱う。
+pub fn dismiss_history(db: &Db, data_dir: &Path, id: i64) -> Result<(), String> {
+    let save = || -> Result<(), String> {
+        let tx = Transaction::new_unchecked(db.conn(), TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let dismissed: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM dismissed_plan WHERE plan_id = ?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !dismissed {
+            let plan = load_plan_required(db, id)?;
+            if !can_dismiss_history(db, data_dir, &plan) {
+                return Err("現在の状態では履歴から削除できません".into());
+            }
+            tx.execute("INSERT INTO dismissed_plan (plan_id) VALUES (?1)", [id])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    };
+    save().map_err(|e| format!("計画 #{id} を履歴から削除できませんでした: {e}"))
+}
+
 /// 24 時間以上 `pending` のままの計画を `expired` にする。変えた件数を返す。
 pub fn expire_stale_plans(db: &mut Db) -> db::Result<usize> {
     expire_stale_plans_at(db, db::now_ms())
@@ -650,4 +730,179 @@ pub(crate) fn set_op_result_exact_dst(
 
 pub(crate) fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use std::fs;
+    use std::time::Duration;
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("lisa-history-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn open(&self) -> Db {
+            Db::open(&self.0.join("lisa.db")).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn insert_plan(db: &Db, state: &str, op: &str, op_state: &str) -> i64 {
+        let summary = serde_json::to_string(&PlanSummary {
+            total: 1,
+            trash: usize::from(op == "trash"),
+            ..PlanSummary::default()
+        })
+        .unwrap();
+        let id = db.conn().query_row(
+            "INSERT INTO plan (state, by, summary, created_at) VALUES (?1, 'test', ?2, 0) RETURNING id",
+            params![state, summary],
+            |row| row.get(0),
+        ).unwrap();
+        db.conn().execute(
+            "INSERT INTO plan_op (plan_id, seq, op, src, state) VALUES (?1, 0, ?2, '/fixture/item', ?3)",
+            params![id, op, op_state],
+        ).unwrap();
+        id
+    }
+
+    #[test]
+    fn history_eligibility_by_state_and_undo() {
+        let dir = Fixture::new();
+        let db = dir.open();
+        for (state, kind, op_state, purged, expected) in [
+            ("rejected", "move", "pending", false, true),
+            ("cancelled", "move", "pending", false, true),
+            ("expired", "move", "pending", false, true),
+            ("pending", "move", "pending", false, false),
+            ("approved", "move", "pending", false, false),
+            ("running", "move", "running", false, false),
+            ("unknown", "move", "pending", false, false),
+            ("done", "move", "done", false, false),
+            ("done", "move", "done", true, false),
+            ("done", "trash", "done", false, false),
+            ("done", "trash", "done", true, false), // 隔離先の記録なし
+            ("partial", "trash", "skipped", false, true),
+            ("partial", "move", "failed", false, true),
+            ("partial", "move", "unknown", false, false),
+            ("partial", "unknown", "failed", false, false),
+            ("undone", "mkdir", "undone", false, true),
+        ] {
+            let id = insert_plan(&db, state, kind, op_state);
+            if purged {
+                db.conn()
+                    .execute("UPDATE plan SET purged_at = 1 WHERE id = ?1", [id])
+                    .unwrap();
+            }
+            let plan = load_plan_required(&db, id).unwrap();
+            assert_eq!(
+                can_dismiss_history(&db, &dir.0, &plan),
+                expected,
+                "{state}/{kind}/{op_state}/{purged}"
+            );
+        }
+    }
+
+    #[test]
+    fn undone_quarantine_and_unknown_locations_stay_visible() {
+        let dir = Fixture::new();
+        let db = dir.open();
+        let id = insert_plan(&db, "undone", "trash", "skipped");
+        let quarantine = dir.0.join("trash").join(id.to_string());
+        fs::create_dir_all(&quarantine).unwrap();
+        let item = quarantine.join("item");
+        fs::write(&item, b"fixture").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE plan_op SET dst = ?1 WHERE plan_id = ?2",
+                params![item.to_str().unwrap(), id],
+            )
+            .unwrap();
+        let plan = load_plan_required(&db, id).unwrap();
+        assert!(!can_dismiss_history(&db, &dir.0, &plan));
+        assert!(dismiss_history(&db, &dir.0, id).is_err());
+        assert_eq!(fs::read(item).unwrap(), b"fixture");
+        fs::remove_dir_all(quarantine).unwrap();
+        assert!(can_dismiss_history(&db, &dir.0, &plan));
+        db.conn()
+            .execute(
+                "UPDATE plan_op SET drive_id = 'missing' WHERE plan_id = ?1",
+                [id],
+            )
+            .unwrap();
+        assert!(!can_dismiss_history(&db, &dir.0, &plan));
+    }
+
+    #[test]
+    fn history_dismissal_is_idempotent_persistent_and_filters_before_limit() {
+        let dir = Fixture::new();
+        let db = dir.open();
+        // 旧 DB に相当する状態から開き直す。
+        db.conn().execute("DROP TABLE dismissed_plan", []).unwrap();
+        let ids: Vec<_> = (0..51)
+            .map(|_| insert_plan(&db, "rejected", "move", "pending"))
+            .collect();
+        drop(db);
+        let db = dir.open();
+        let visible = |db: &Db| {
+            list_history(db, 50)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        };
+        let mut expected: Vec<_> = ids.iter().copied().rev().collect();
+        assert_eq!(visible(&db), expected[..50]);
+        let id = expected.remove(0);
+        dismiss_history(&db, &dir.0, id).unwrap();
+        dismiss_history(&db, &dir.0, id).unwrap();
+        assert_eq!(visible(&db), expected);
+        drop(db);
+        let db = dir.open();
+        assert_eq!(visible(&db), expected);
+        assert_eq!(get_plan(&db, id).unwrap().unwrap().1.len(), 1);
+        assert_eq!(list_plans(&db, None, 1).unwrap()[0].id, id);
+        assert!(insert_plan(&db, "rejected", "move", "pending") > id);
+    }
+
+    #[test]
+    fn history_dismissal_rechecks_state_and_preserves_row_when_database_is_locked() {
+        let dir = Fixture::new();
+        let db = dir.open();
+        db.conn().busy_timeout(Duration::ZERO).unwrap();
+        let writer = dir.open();
+        let id = insert_plan(&db, "rejected", "move", "pending");
+        let shown = load_plan_required(&db, id).unwrap();
+        assert!(can_dismiss_history(&db, &dir.0, &shown));
+        writer
+            .conn()
+            .execute("UPDATE plan SET state = 'approved' WHERE id = ?1", [id])
+            .unwrap();
+        assert!(
+            dismiss_history(&db, &dir.0, id)
+                .unwrap_err()
+                .contains("現在の状態では")
+        );
+        writer
+            .conn()
+            .execute("UPDATE plan SET state = 'rejected' WHERE id = ?1", [id])
+            .unwrap();
+        let tx = Transaction::new_unchecked(writer.conn(), TransactionBehavior::Immediate).unwrap();
+        let failure = dismiss_history(&db, &dir.0, id).unwrap_err();
+        assert!(failure.contains("database is locked"), "{failure}");
+        assert_eq!(list_history(&db, 50).unwrap()[0].id, id);
+        tx.rollback().unwrap();
+        dismiss_history(&db, &dir.0, id).unwrap();
+    }
 }

@@ -89,6 +89,7 @@ fn main() {
         ui::organize::OrganizePanelPlugin,
         remote::RemotePlugin,
     ));
+    app.add_plugins(ui::SidePanelScrollPlugin);
     app.add_plugins(render::diag::RenderDiagPlugin);
     #[cfg(debug_assertions)]
     app.add_plugins(debug::DebugTitlePlugin);

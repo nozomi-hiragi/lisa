@@ -20,8 +20,9 @@ pub use apply::{
 };
 pub use plan::{
     CheckStatus, CreateResult, OpCheck, OpInput, OpKind, OpState, Plan, PlanOp, PlanState,
-    PlanSummary, approve_plan, cancel_plan, create_plan, expire_stale_plans, expire_stale_plans_at,
-    get_plan, list_plans, plan_ops, reject_plan,
+    PlanSummary, approve_plan, can_dismiss_history, cancel_plan, create_plan, dismiss_history,
+    expire_stale_plans, expire_stale_plans_at, get_plan, list_history, list_plans, plan_ops,
+    reject_plan,
 };
 pub use quarantine::{
     MANIFEST_FILE, Manifest, ManifestEntry, PurgeReport, choose_quarantine_base, purge_expired,
@@ -513,6 +514,61 @@ mod tests {
         assert!(dup1.exists() && !q_path.exists());
         assert_eq!(fs::read(&a).unwrap(), b"hello move");
         assert_eq!(fs::read(&dup1).unwrap(), b"duplicate body");
+    }
+
+    #[test]
+    fn history_can_dismiss_after_undo_with_only_quarantine_metadata() {
+        let mut h = Harness::new("history-trash-undo");
+        let nested = h.drive.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let source = nested.join("empty");
+        fs::create_dir(&source).unwrap();
+        h.scan(true);
+
+        let id = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "test",
+            None,
+            &[OpInput::Trash {
+                path: source.clone(),
+                keep: None,
+            }],
+            false,
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+        let (_, ops) = get_plan(&h.db, id).unwrap().unwrap();
+        let payload = ops[0].dst.as_ref().unwrap();
+        let plan_dir = h.data_dir.join("trash").join(id.to_string());
+        let manifest = plan_dir.join(MANIFEST_FILE);
+        assert!(payload.is_dir() && manifest.is_file());
+
+        assert_eq!(
+            undo_plan(&mut h.db, &h.ctx, id).unwrap().state,
+            PlanState::Undone
+        );
+        let (plan, _) = get_plan(&h.db, id).unwrap().unwrap();
+        assert!(source.is_dir() && payload.parent().unwrap().is_dir());
+        assert!(can_dismiss_history(&h.db, &h.data_dir, &plan));
+
+        // 空でも、隔離したフォルダそのものや、用途不明のフォルダは対象外。
+        fs::create_dir(payload).unwrap();
+        assert!(!can_dismiss_history(&h.db, &h.data_dir, &plan));
+        fs::remove_dir(payload).unwrap();
+        let unknown = plan_dir.join("unknown");
+        fs::create_dir(&unknown).unwrap();
+        assert!(!can_dismiss_history(&h.db, &h.data_dir, &plan));
+        fs::remove_dir(unknown).unwrap();
+
+        let contents = fs::read(&manifest).unwrap();
+        dismiss_history(&h.db, &h.data_dir, id).unwrap();
+        assert!(list_history(&h.db, 50).unwrap().is_empty());
+        assert_eq!(fs::read(manifest).unwrap(), contents);
+        assert!(source.is_dir() && payload.parent().unwrap().is_dir());
     }
 
     #[test]

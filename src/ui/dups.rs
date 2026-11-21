@@ -3,7 +3,6 @@
 //! 組は空く大きさの順に並べ、それぞれに数・合計・空く量を出す。組を押すと選んで（木の上で光る）、
 //! その下にコピーの場所を出す。場所を押すと、木の上のそこへ飛ぶ。表示だけで、何も動かさない。
 
-use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::ui::ScrollPosition;
 use bevy::window::RequestRedraw;
@@ -15,6 +14,8 @@ use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::scan::JumpTo;
 use crate::ui::menu::BAR_PX;
+
+use super::{SidePanelLayout, SidePanelList};
 
 /// 一覧の幅（論理ピクセル）。
 pub const PANEL_PX: f32 = 380.0;
@@ -28,15 +29,13 @@ const DIM_COLOR: Color = palette::MUTED;
 const ACCENT: Color = palette::WARNING;
 /// すべり出しにかける時間（秒）。
 const SLIDE_SECONDS: f32 = 0.22;
-/// 1 回のホイールで動かす量（行単位のとき）。
-const LINE_PX: f32 = 24.0;
 
 pub struct DupsPanelPlugin;
 
 impl Plugin for DupsPanelPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PostStartup, spawn_panel)
-            .add_systems(Update, (show_panel, fill_panel, scroll_panel));
+            .add_systems(Update, (show_panel.in_set(SidePanelLayout), fill_panel));
     }
 }
 
@@ -75,6 +74,7 @@ fn spawn_panel(mut commands: Commands) {
                     ..default()
                 },
                 ScrollPosition::default(),
+                SidePanelList::default(),
             ));
         });
 }
@@ -85,8 +85,10 @@ fn show_panel(
     mut shown: Local<f32>,
     mut last: Local<Option<std::time::Instant>>,
     mut panel: Single<&mut Node, With<Panel>>,
+    mut list: Single<&mut SidePanelList, With<List>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
+    list.closing = !dups.open;
     let target = if dups.open { 1.0 } else { 0.0 };
     let now = std::time::Instant::now();
     let dt = last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
@@ -227,29 +229,6 @@ fn fill_panel(
             }
         }
     });
-}
-
-/// 一覧の上でホイールを回したら、一覧を動かす。
-fn scroll_panel(
-    dups: Res<Dups>,
-    mut wheel: MessageReader<MouseWheel>,
-    window: Single<&Window>,
-    mut list: Single<&mut ScrollPosition, With<List>>,
-) {
-    let over = dups.open
-        && window
-            .cursor_position()
-            .is_some_and(|p| p.x > crate::view::view_width(&window) && p.y > BAR_PX);
-    for event in wheel.read() {
-        if !over {
-            continue;
-        }
-        let dy = match event.unit {
-            MouseScrollUnit::Line => event.y * LINE_PX,
-            MouseScrollUnit::Pixel => event.y,
-        };
-        list.y = (list.y - dy).max(0.0);
-    }
 }
 
 /// 読みやすい大きさ（1024 区切り）。

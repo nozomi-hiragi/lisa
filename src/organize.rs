@@ -8,6 +8,7 @@
 //!   読む係へ `Request::Hint` で渡す。
 //! - 「場所を見る」で選んだ計画の対象は `PlanHighlightChains` に載せ、`src/dups.rs` の仕組みで木の上を光らせる。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -72,11 +73,12 @@ pub struct PlanDetails {
     pub chains: Vec<Option<Vec<i64>>>,
 }
 
-/// OS のゴミ箱へ送る前の確認内容。
+/// 履歴パネルで確認する操作。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ConfirmPurge {
-    Plan(i64),
-    All,
+pub enum HistoryConfirmation {
+    PurgePlan(i64),
+    PurgeAll,
+    Dismiss(i64),
 }
 
 /// UI と裏のスレッドの橋渡しをする状態。
@@ -88,6 +90,8 @@ pub struct OrganizeState {
     pub pending: Vec<PendingPlan>,
     /// 計画の履歴（新しい順）。
     pub history: Vec<Plan>,
+    pub dismissible: HashSet<i64>,
+    pub dismissing: Option<i64>,
     /// 履歴パネルで展開している計画の ID。
     pub selected_plan: Option<i64>,
     /// 展開している計画の操作一覧。
@@ -96,8 +100,8 @@ pub struct OrganizeState {
     pub highlighted_plan: Option<i64>,
     /// 右クリックの「切り取り」で選んだ移動元。貼り付けるまで保持する。
     pub cut_source: Option<PathBuf>,
-    /// OS のゴミ箱へ送る前の確認。
-    pub confirming_purge: Option<ConfirmPurge>,
+    /// 履歴パネルの確認。
+    pub history_confirmation: Option<HistoryConfirmation>,
     /// 裏のスレッドで実行・取り消し・掃除が動いているか。
     pub busy: bool,
     rename_pending: bool,
@@ -144,6 +148,50 @@ impl OrganizeState {
     pub fn purge_all(&mut self) {
         self.busy = true;
         self.send(Action::PurgeAll);
+    }
+
+    pub fn cancel_history_confirmation(&mut self, confirmation: HistoryConfirmation) {
+        if self.history_confirmation == Some(confirmation) {
+            self.history_confirmation = None;
+        }
+    }
+
+    pub fn confirm_history_action(&mut self, confirmation: HistoryConfirmation) {
+        if self.history_confirmation != Some(confirmation) || self.busy || self.dismissing.is_some()
+        {
+            return;
+        }
+        self.history_confirmation = None;
+        match confirmation {
+            HistoryConfirmation::PurgePlan(id) => self.purge_plan(id),
+            HistoryConfirmation::PurgeAll => self.purge_all(),
+            HistoryConfirmation::Dismiss(id) => {
+                let sent = self.sender.as_ref().is_some_and(|sender| {
+                    sender
+                        .lock()
+                        .is_ok_and(|sender| sender.send(Action::Dismiss { id }).is_ok())
+                });
+                if sent {
+                    self.dismissing = Some(id);
+                } else {
+                    self.set_notice(format!("計画 #{id} を履歴から削除できませんでした"));
+                }
+            }
+        }
+    }
+
+    fn finish_dismiss(&mut self, id: i64, result: Result<(), String>) {
+        self.dismissing = None;
+        match result {
+            Ok(()) => {
+                if self.selected_plan == Some(id) {
+                    self.select_plan(None);
+                }
+                self.history.retain(|plan| plan.id != id);
+                self.dismissible.remove(&id);
+            }
+            Err(error) => self.set_notice(error),
+        }
     }
 
     pub fn select_plan(&mut self, id: Option<i64>) {
@@ -204,6 +252,7 @@ enum Action {
     PurgePlan { id: i64 },
     PurgeAll,
     LoadDetails { id: i64 },
+    Dismiss { id: i64 },
     UserTrash { path: PathBuf },
     UserMove { from: PathBuf, dest_dir: PathBuf },
     UserRename { from: PathBuf, new_name: String },
@@ -213,6 +262,11 @@ enum Event {
     Snapshot {
         pending: Vec<PendingPlan>,
         history: Vec<Plan>,
+        dismissible: HashSet<i64>,
+    },
+    Dismissed {
+        id: i64,
+        result: Result<(), String>,
     },
     Details(PlanDetails),
     Renamed {
@@ -271,9 +325,14 @@ pub(crate) fn receive_events(
     for event in events {
         changed = true;
         match event {
-            Event::Snapshot { pending, history } => {
+            Event::Snapshot {
+                pending,
+                history,
+                dismissible,
+            } => {
                 state.pending = pending;
                 state.history = history;
+                state.dismissible = dismissible;
                 // 光らせていた計画がもう pending に無ければ光りを消す。
                 if let Some(hl_id) = state.highlighted_plan
                     && !state.pending.iter().any(|p| p.plan.id == hl_id)
@@ -281,6 +340,7 @@ pub(crate) fn receive_events(
                     state.highlighted_plan = None;
                 }
             }
+            Event::Dismissed { id, result } => state.finish_dismiss(id, result),
             Event::Details(details) => {
                 if state.selected_plan == Some(details.plan_id) {
                     state.selected_details = Some(details);
@@ -352,7 +412,7 @@ pub(crate) fn receive_events(
 }
 
 /// 変化検知用の軽い指紋（変化が無いときは UI へ送らない）。
-type Fingerprint = (Vec<(i64, PlanState, Option<i64>)>, Vec<i64>);
+type Fingerprint = (Vec<(i64, PlanState, Option<i64>, bool)>, Vec<i64>);
 
 fn run_worker(
     rx: Receiver<Action>,
@@ -399,6 +459,18 @@ fn run_worker(
 
     loop {
         match rx.recv_timeout(POLL_EVERY) {
+            Ok(Action::Dismiss { id }) => {
+                let result = dismiss_history(id);
+                if result.is_ok() && watched_detail == Some(id) {
+                    watched_detail = None;
+                }
+                if !send(Event::Dismissed { id, result }) {
+                    return;
+                }
+                if !poll_db(&mut last_fp, watched_detail, &send) {
+                    return;
+                }
+            }
             Ok(action) => {
                 let Some((mut db, ctx, settings)) = open_env() else {
                     if !send(Event::Notice("DB がまだありません".into())) {
@@ -412,6 +484,7 @@ fn run_worker(
                     continue;
                 };
                 match action {
+                    Action::Dismiss { .. } => unreachable!(),
                     Action::Approve { id, skip_risky } => {
                         match organize::approve_plan(&mut db, id, skip_risky)
                             .and_then(|_| organize::execute_plan(&mut db, &ctx, id))
@@ -811,7 +884,7 @@ fn poll_db(
         return true;
     };
     let _ = organize::expire_stale_plans(&mut db);
-    let Ok(history) = organize::list_plans(&db, None, HISTORY_LIMIT) else {
+    let Ok(history) = organize::list_history(&db, HISTORY_LIMIT) else {
         return true;
     };
     let Ok(mut pending_rows) = organize::list_plans(&db, Some(PlanState::Pending), HISTORY_LIMIT)
@@ -821,10 +894,17 @@ fn poll_db(
     // 複数あれば古い順に 1 つずつ出す。
     pending_rows.reverse();
 
+    let data_dir = db_path.parent().expect("DB の親フォルダ");
+    let dismissible: HashSet<_> = history
+        .iter()
+        .filter(|plan| organize::can_dismiss_history(&db, data_dir, plan))
+        .map(|plan| plan.id)
+        .collect();
+
     let fp: Fingerprint = (
         history
             .iter()
-            .map(|p| (p.id, p.state, p.purged_at))
+            .map(|p| (p.id, p.state, p.purged_at, dismissible.contains(&p.id)))
             .collect(),
         pending_rows.iter().map(|p| p.id).collect(),
     );
@@ -840,7 +920,11 @@ fn poll_db(
         pending.push(PendingPlan { plan, ops, chains });
     }
 
-    if !send(Event::Snapshot { pending, history }) {
+    if !send(Event::Snapshot {
+        pending,
+        history,
+        dismissible,
+    }) {
         return false;
     }
     if let Some(id) = watched_detail
@@ -875,6 +959,16 @@ fn resolve_op_chains(db: &Db, ops: &[PlanOp]) -> Vec<Vec<i64>> {
     chains
 }
 
+fn dismiss_history(id: i64) -> Result<(), String> {
+    let db_path = crate::scan::db_path()
+        .filter(|path| path.is_file())
+        .ok_or_else(|| format!("計画 #{id} を履歴から削除できませんでした: DB がありません"))?;
+    let db = Db::open(&db_path)
+        .map_err(|e| format!("計画 #{id} を履歴から削除できませんでした: {e}"))?;
+    let data_dir = db_path.parent().expect("DB の親フォルダ");
+    organize::dismiss_history(&db, data_dir, id)
+}
+
 fn open_env() -> Option<(Db, Context, Option<PathBuf>)> {
     let data_dir = crate::scan::data_dir()?;
     let db_path = data_dir.join("lisa.db");
@@ -905,5 +999,53 @@ mod rename_tests {
         state.busy = false; // 別件の Idle が先に届いても名前変更はまだ完了していない。
         assert!(state.user_rename(path, "another.txt".into()).is_err());
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn history_confirmation_cancel_and_repeated_click_send_at_most_one_action() {
+        let (tx, rx) = channel();
+        let confirmation = HistoryConfirmation::Dismiss(42);
+        let mut state = OrganizeState {
+            selected_plan: Some(42),
+            history_confirmation: Some(confirmation),
+            sender: Some(Mutex::new(tx)),
+            ..default()
+        };
+        state.cancel_history_confirmation(confirmation);
+        state.confirm_history_action(confirmation);
+        assert_eq!(state.selected_plan, Some(42));
+        assert!(rx.try_recv().is_err());
+
+        state.history_confirmation = Some(confirmation);
+        state.confirm_history_action(confirmation);
+        state.confirm_history_action(confirmation);
+        assert!(matches!(rx.try_recv(), Ok(Action::Dismiss { id: 42 })));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.dismissing, Some(42));
+
+        state.finish_dismiss(
+            42,
+            Err("計画 #42 を履歴から削除できませんでした: database is locked".into()),
+        );
+        assert_eq!(state.selected_plan, Some(42));
+        assert!(
+            state
+                .current_notice()
+                .unwrap()
+                .contains("database is locked")
+        );
+        assert_eq!(state.dismissing, None);
+
+        state.history_confirmation = Some(confirmation);
+        state.confirm_history_action(confirmation);
+        assert!(matches!(rx.try_recv(), Ok(Action::Dismiss { id: 42 })));
+        state.finish_dismiss(42, Ok(()));
+        assert_eq!(state.selected_plan, None);
+        assert_eq!(state.dismissing, None);
     }
 }

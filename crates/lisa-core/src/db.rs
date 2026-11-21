@@ -122,6 +122,9 @@ CREATE TABLE IF NOT EXISTS plan (
     purged_at   INTEGER            -- 隔離から OS のゴミ箱へ送った時刻
 );
 CREATE INDEX IF NOT EXISTS plan_state ON plan(state, id);
+CREATE TABLE IF NOT EXISTS dismissed_plan (
+    plan_id INTEGER PRIMARY KEY REFERENCES plan(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS plan_op (
     plan_id   INTEGER NOT NULL REFERENCES plan(id) ON DELETE CASCADE,
     seq       INTEGER NOT NULL,
