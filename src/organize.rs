@@ -727,9 +727,17 @@ fn handle_user_move(
                         if !report.touched_folders.is_empty() {
                             send(Event::Touched(report.touched_folders));
                         }
-                        send(Event::Notice(format!(
-                            "「{label}」を移動しました（計画 #{id}。取り消せます）"
-                        )));
+                        let notice = if report.done > 0 {
+                            format!("「{label}」を移動しました（計画 #{id}。取り消せます）")
+                        } else {
+                            let reason = organize::get_plan(db, id)
+                                .ok()
+                                .flatten()
+                                .and_then(|(_, ops)| ops.into_iter().find_map(|op| op.reason))
+                                .unwrap_or_else(|| "整理履歴を確認してください".into());
+                            format!("「{label}」を移動できませんでした（計画 #{id}）: {reason}")
+                        };
+                        send(Event::Notice(notice));
                     }
                     Err(err) => {
                         warn!("右クリックからの移動（計画 #{id}）に失敗しました: {err}");

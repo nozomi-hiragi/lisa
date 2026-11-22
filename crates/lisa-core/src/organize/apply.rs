@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -248,7 +249,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             .map_err(|e| e.to_string())?;
 
         match run_one_op(plan_id, op, drive_mount.as_deref(), &ctx.data_dir) {
-            Ok(OpExecOutcome::Done { exact_dst }) => {
+            Ok(OpExecOutcome::Done { exact_dst, warning }) => {
                 if op.op == OpKind::Mkdir {
                     plan::set_op_result_exact_dst(
                         db,
@@ -256,7 +257,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
                         op.seq,
                         OpState::Done,
                         exact_dst.as_deref(),
-                        None,
+                        warning.as_deref(),
                         Some(db::now_ms()),
                     )
                     .map_err(|e| e.to_string())?;
@@ -267,7 +268,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
                         op.seq,
                         OpState::Done,
                         exact_dst.as_deref(),
-                        None,
+                        warning.as_deref(),
                         Some(db::now_ms()),
                     )
                     .map_err(|e| e.to_string())?;
@@ -333,6 +334,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
 
 enum OpExecOutcome {
     Done {
+        warning: Option<String>,
         /// `trash` は隔離した場所、`mkdir` は新しく作った一番上のフォルダ（すでにあったら `None`）、
         /// `move` は `None`（元の `dst` を維持）。
         exact_dst: Option<PathBuf>,
@@ -349,13 +351,17 @@ fn run_one_op(
     match op.op {
         OpKind::Mkdir => {
             if op.src.is_dir() {
-                return Ok(OpExecOutcome::Done { exact_dst: None });
+                return Ok(OpExecOutcome::Done {
+                    exact_dst: None,
+                    warning: None,
+                });
             }
             // 新しく作られる一番浅いフォルダを覚えておく（取り消しで元からあった親まで消さないため）。
             let created_root = shallowest_missing_dir(&op.src);
             fs::create_dir_all(&op.src).map_err(|e| format!("フォルダを作れませんでした: {e}"))?;
             Ok(OpExecOutcome::Done {
                 exact_dst: created_root,
+                warning: None,
             })
         }
         OpKind::Move => {
@@ -375,24 +381,36 @@ fn run_one_op(
                 .ok_or_else(|| "行き先の親フォルダがありません".to_string())?;
             if op.src.parent() == Some(dst_parent) {
                 return match rename_without_replace(&op.src, dst) {
-                    Ok(()) => Ok(OpExecOutcome::Done { exact_dst: None }),
+                    Ok(()) => Ok(OpExecOutcome::Done {
+                        exact_dst: None,
+                        warning: None,
+                    }),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(
                         OpExecOutcome::Skipped("行き先にすでにファイルやフォルダがあります".into()),
                     ),
                     Err(e) => Err(format!("名前を変更できませんでした: {e}")),
                 };
             }
-            if quarantine::same_volume(&op.src, dst_parent) {
+            if use_rename(&op.src, dst_parent) {
                 match fs::rename(&op.src, dst) {
-                    Ok(()) => return Ok(OpExecOutcome::Done { exact_dst: None }),
+                    Ok(()) => {
+                        return Ok(OpExecOutcome::Done {
+                            exact_dst: None,
+                            warning: None,
+                        });
+                    }
                     Err(e) if is_cross_device_error(&e) => {
                         // 別ボリューム扱いだったのでコピーへ切り替える。
                     }
                     Err(e) => return Err(format!("移動できませんでした: {e}")),
                 }
             }
-            copy_verify_and_quarantine(plan_id, op.seq, &op.src, dst, drive_mount, data_dir)?;
-            Ok(OpExecOutcome::Done { exact_dst: None })
+            let (_, warning) =
+                copy_verify_and_quarantine(plan_id, op.seq, &op.src, dst, drive_mount, data_dir)?;
+            Ok(OpExecOutcome::Done {
+                exact_dst: None,
+                warning,
+            })
         }
         OpKind::Trash => {
             let quarantined = quarantine::move_to_quarantine(
@@ -402,9 +420,11 @@ fn run_one_op(
                 &op.src,
                 drive_mount,
                 data_dir,
+                |src, dst| fs::rename(src, dst),
             )?;
             Ok(OpExecOutcome::Done {
                 exact_dst: Some(quarantined),
+                warning: None,
             })
         }
     }
@@ -431,9 +451,27 @@ fn recover_running_ops(
                 }
             }
             OpKind::Move => {
-                let src_exists = fs::symlink_metadata(&op.src).is_ok();
                 let dst = op.dst.as_deref();
-                let dst_exists = dst.is_some_and(|d| fs::symlink_metadata(d).is_ok());
+                let presence = entry_exists(&op.src).and_then(|src_exists| {
+                    let dst_exists = dst.map(entry_exists).transpose()?.unwrap_or(false);
+                    Ok((src_exists, dst_exists))
+                });
+                let (src_exists, dst_exists) = match presence {
+                    Ok(presence) => presence,
+                    Err(e) => {
+                        plan::set_op_state(
+                            db,
+                            plan_id,
+                            op.seq,
+                            OpState::Failed,
+                            None,
+                            Some(&format!("中断後の照合に失敗: {e}")),
+                            Some(now),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        continue;
+                    }
+                };
                 match (src_exists, dst_exists) {
                     (false, true) => {
                         plan::set_op_state(
@@ -470,49 +508,33 @@ fn recover_running_ops(
                                 };
                             plan::set_op_state(db, plan_id, op.seq, state, None, reason, at)
                                 .map_err(|e| e.to_string())?;
-                        } else if entries_match_content(&op.src, dst) {
-                            let mount = drive_mount_of(drives, &op);
-                            match quarantine::move_to_quarantine(
-                                plan_id,
-                                op.seq,
-                                OpKind::Move,
-                                &op.src,
-                                mount.as_deref(),
-                                &ctx.data_dir,
-                            ) {
-                                Ok(_) => {
-                                    plan::set_op_state(
-                                        db,
-                                        plan_id,
-                                        op.seq,
-                                        OpState::Done,
-                                        None,
-                                        None,
-                                        Some(now),
-                                    )
-                                    .map_err(|e| e.to_string())?;
-                                }
-                                Err(e) => {
-                                    plan::set_op_state(
-                                        db,
-                                        plan_id,
-                                        op.seq,
-                                        OpState::Failed,
-                                        None,
-                                        Some(&format!("中断後の隔離に失敗: {e}")),
-                                        Some(now),
-                                    )
-                                    .map_err(|e| e.to_string())?;
-                                }
-                            }
                         } else {
+                            let result = entries_match_content(&op.src, dst)
+                                .map_err(|e| format!("中断後の照合に失敗: {e}"))
+                                .and_then(|()| {
+                                    let mount = drive_mount_of(drives, &op);
+                                    quarantine::move_to_quarantine(
+                                        plan_id,
+                                        op.seq,
+                                        OpKind::Move,
+                                        &op.src,
+                                        mount.as_deref(),
+                                        &ctx.data_dir,
+                                        rename_after_collision_check,
+                                    )
+                                    .map_err(|e| format!("中断後の隔離に失敗: {e}"))
+                                });
+                            let (state, reason) = match result {
+                                Ok(_) => (OpState::Done, None),
+                                Err(e) => (OpState::Failed, Some(e)),
+                            };
                             plan::set_op_state(
                                 db,
                                 plan_id,
                                 op.seq,
-                                OpState::Failed,
+                                state,
                                 None,
-                                Some("中断後に元と行き先の両方があり中身が一致しません"),
+                                reason.as_deref(),
                                 Some(now),
                             )
                             .map_err(|e| e.to_string())?;
@@ -621,14 +643,15 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
 
     for op in ops.into_iter().filter(|o| o.state == OpState::Done) {
         match undo_one_op(&plan, &op) {
-            Ok(()) => {
+            Ok(warning) => {
+                let reason = join_reasons(op.reason.as_deref(), warning);
                 plan::set_op_state(
                     db,
                     plan_id,
                     op.seq,
                     OpState::Undone,
                     None,
-                    None,
+                    reason.as_deref(),
                     Some(db::now_ms()),
                 )
                 .map_err(|e| e.to_string())?;
@@ -638,6 +661,7 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
                 undone_ops.push(marked);
             }
             Err(reason) => {
+                let reason = append_reason(reason, op.reason.as_deref());
                 plan::set_op_state(
                     db,
                     plan_id,
@@ -681,7 +705,7 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
     })
 }
 
-fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<(), String> {
+fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<Option<String>, String> {
     match op.op {
         OpKind::Trash => {
             if plan.purged_at.is_some() {
@@ -703,7 +727,7 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<(), String> {
                 return Err("戻す先の親フォルダがありません".into());
             }
             fs::rename(q_path, &op.src).map_err(|e| format!("隔離から戻せませんでした: {e}"))?;
-            Ok(())
+            Ok(None)
         }
         OpKind::Move => {
             let Some(dst) = op.dst.as_deref() else {
@@ -725,26 +749,26 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<(), String> {
             }
             if dst.parent() == Some(parent) {
                 return rename_without_replace(dst, &op.src)
+                    .map(|()| None)
                     .map_err(|e| format!("元の名前に戻せませんでした: {e}"));
             }
-            if quarantine::same_volume(dst, parent) {
+            if use_rename(dst, parent) {
                 match fs::rename(dst, &op.src) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return Ok(None),
                     Err(e) if is_cross_device_error(&e) => {}
                     Err(e) => return Err(format!("元の場所へ戻せませんでした: {e}")),
                 }
             }
-            // 別ボリュームの移動を戻す: コピー → blake3 で確かめる → 移動先を消す。
-            copy_verify_and_remove_src(plan.id, op.seq, dst, &op.src)?;
-            Ok(())
+            // 別ボリュームの移動を戻す: コピーの内容と日時を確かめてから移動先を消す。
+            copy_verify_and_remove_src(plan.id, op.seq, dst, &op.src)
         }
         OpKind::Mkdir => {
             // 元からあったフォルダ（dst が None）は消さない。
             let Some(created_root) = op.dst.as_deref() else {
-                return Ok(());
+                return Ok(None);
             };
             match fs::symlink_metadata(&op.src) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(format!("フォルダを確かめられません: {e}")),
                 Ok(m) if !m.is_dir() => return Err("フォルダではなくなっています".into()),
                 Ok(_) => {}
@@ -763,7 +787,7 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<(), String> {
                 }
                 cur = dir.parent();
             }
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -921,13 +945,16 @@ fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
             .chain([0])
             .collect::<Vec<_>>()
     };
-    // UNC と長いパスを扱える形にし、同じ実ディレクトリの下で変更する。
-    let parent = src
-        .parent()
-        .ok_or(io::ErrorKind::InvalidInput)?
-        .canonicalize()?;
-    let src = wide(&parent.join(src.file_name().ok_or(io::ErrorKind::InvalidInput)?));
-    let dst = wide(&parent.join(dst.file_name().ok_or(io::ErrorKind::InvalidInput)?));
+    // 親を正規化して UNC と長いパスを扱い、末尾のリンク自身を移す。
+    let absolute_entry = |path: &Path| -> io::Result<PathBuf> {
+        let parent = path
+            .parent()
+            .ok_or(io::ErrorKind::InvalidInput)?
+            .canonicalize()?;
+        Ok(parent.join(path.file_name().ok_or(io::ErrorKind::InvalidInput)?))
+    };
+    let src = wide(&absolute_entry(src)?);
+    let dst = wide(&absolute_entry(dst)?);
     // SAFETY: 両ポインターは呼び出し中有効な NUL 終端ワイド文字列を指す。
     if unsafe { MoveFileW(src.as_ptr(), dst.as_ptr()) } != 0 {
         Ok(())
@@ -939,6 +966,38 @@ fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn rename_without_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
+}
+
+fn rename_after_collision_check(src: &Path, dst: &Path) -> io::Result<()> {
+    match rename_without_replace(src, dst) {
+        // FAT など排他的 rename に対応しない媒体では、計画ロック中の従来の衝突確認を使う。
+        Err(e) if exclusive_rename_unsupported(&e) => match fs::symlink_metadata(dst) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(src, dst),
+            Err(e) => Err(e),
+            Ok(_) => Err(io::ErrorKind::AlreadyExists.into()),
+        },
+        result => result,
+    }
+}
+
+fn exclusive_rename_unsupported(error: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    if error.raw_os_error() == Some(libc::EINVAL) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ENOTSUP) {
+        return true;
+    }
+    error.kind() == io::ErrorKind::Unsupported
+}
+
+fn use_rename(src: &Path, dst_parent: &Path) -> bool {
+    #[cfg(test)]
+    if timestamp_test::FORCE_COPY.get() {
+        return false;
+    }
+    quarantine::same_volume(src, dst_parent)
 }
 
 fn is_cross_device_error(err: &io::Error) -> bool {
@@ -956,7 +1015,7 @@ fn is_cross_device_error(err: &io::Error) -> bool {
     false
 }
 
-/// 別ボリュームへの移動: コピー（一時名）→ blake3 で確かめる → 行き先へ rename → 元を隔離。
+/// 別ボリュームへの移動: 内容と日時を照合して正式名に置き、元を隔離する。
 pub(crate) fn copy_verify_and_quarantine(
     plan_id: i64,
     seq: i64,
@@ -964,147 +1023,311 @@ pub(crate) fn copy_verify_and_quarantine(
     dst: &Path,
     drive_mount: Option<&Path>,
     data_dir: &Path,
-) -> Result<PathBuf, String> {
-    let staging = staging_path(dst, plan_id, seq)?;
-    let _ = remove_any(&staging);
-
-    if let Err(e) = copy_and_verify_entry(src, &staging) {
-        let _ = remove_any(&staging);
-        return Err(e);
-    }
-    if fs::symlink_metadata(dst).is_ok() {
-        let _ = remove_any(&staging);
-        return Err("行き先にすでにファイルやフォルダがあります".into());
-    }
-    if let Err(e) = fs::rename(&staging, dst) {
-        let _ = remove_any(&staging);
-        return Err(format!("行き先へ置けませんでした: {e}"));
-    }
-
-    quarantine::move_to_quarantine(plan_id, seq, OpKind::Move, src, drive_mount, data_dir)
+) -> Result<(PathBuf, Option<String>), String> {
+    let warning = copy_verify_and_publish(plan_id, seq, src, dst)?;
+    quarantine::move_to_quarantine(
+        plan_id,
+        seq,
+        OpKind::Move,
+        src,
+        drive_mount,
+        data_dir,
+        rename_after_collision_check,
+    )
+    .map_err(|e| append_reason(e, warning.as_deref()))
+    .map(|path| (path, warning))
 }
 
-/// 別ボリュームからの取り消し: コピー → blake3 で確かめる → 元の場所へ rename → 移動先を消す。
+/// 別ボリュームからの取り消し: 検証したコピーを元の場所へ置き、移動先を消す。
 fn copy_verify_and_remove_src(
     plan_id: i64,
     seq: i64,
     src: &Path,
     dst: &Path,
-) -> Result<(), String> {
-    let staging = staging_path(dst, plan_id, seq)?;
-    let _ = remove_any(&staging);
-
-    if let Err(e) = copy_and_verify_entry(src, &staging) {
-        let _ = remove_any(&staging);
-        return Err(e);
-    }
-    if fs::symlink_metadata(dst).is_ok() {
-        let _ = remove_any(&staging);
-        return Err("戻す先にすでにファイルやフォルダがあります".into());
-    }
-    if let Err(e) = fs::rename(&staging, dst) {
-        let _ = remove_any(&staging);
-        return Err(format!("戻す先へ置けませんでした: {e}"));
-    }
-    remove_any(src).map_err(|e| format!("移動先の掃除に失敗しました: {e}"))?;
-    Ok(())
+) -> Result<Option<String>, String> {
+    let warning = copy_verify_and_publish(plan_id, seq, src, dst)?;
+    remove_any(src)
+        .map_err(|e| append_reason(path_error(src, "移動先の掃除", e), warning.as_deref()))?;
+    Ok(warning)
 }
 
-fn staging_path(dst: &Path, plan_id: i64, seq: i64) -> Result<PathBuf, String> {
+pub(super) fn copy_verify_and_publish(
+    plan_id: i64,
+    seq: i64,
+    src: &Path,
+    dst: &Path,
+) -> Result<Option<String>, String> {
     let parent = dst
         .parent()
         .ok_or_else(|| "行き先の親フォルダがありません".to_string())?;
-    Ok(parent.join(format!(
+    let staging = parent.join(format!(
         ".lisa-moving-{plan_id}-{seq}-{}",
         std::process::id()
-    )))
-}
-
-fn copy_and_verify_entry(src: &Path, dst: &Path) -> Result<(), String> {
-    let meta = fs::symlink_metadata(src).map_err(|e| format!("元を読めません: {e}"))?;
-    let kind = check::meta_kind(&meta);
-    match kind {
-        Kind::File => {
-            let expected = copy_file_hashing(src, dst, &meta)?;
-            let actual = hash::hash_file(dst)
-                .map_err(|e| format!("コピー先のハッシュを確かめられません: {e}"))?;
-            if actual != expected {
-                return Err("コピー先の blake3 が元と合いません".into());
-            }
-            Ok(())
+    ));
+    // 作成に成功したディレクトリ内だけを使い、既存の一時名には触らない。
+    fs::create_dir(&staging).map_err(|e| {
+        let reason = path_error(&staging, "一時フォルダの作成", &e);
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            return format!("{reason}。前回の残りを確認して削除してから再実行してください");
         }
-        Kind::Dir => {
-            fs::create_dir(dst).map_err(|e| format!("フォルダを作れません: {e}"))?;
-            for item in fs::read_dir(src).map_err(|e| format!("フォルダを読めません: {e}"))?
-            {
-                let item = item.map_err(|e| format!("中身を読めません: {e}"))?;
-                copy_and_verify_entry(&item.path(), &dst.join(item.file_name()))?;
-            }
-            Ok(())
+        reason
+    })?;
+    let copied = staging.join("entry");
+    let result = copy_and_verify_entry(src, &copied)
+        .and_then(|()| {
+            entries_match_content(src, &copied).map_err(|e| format!("コピー元の再確認: {e}"))
+        })
+        .and_then(|()| {
+            rename_after_collision_check(&copied, dst)
+                .map_err(|e| path_error(dst, "正式名への確定", e))
+        });
+    let cleanup = if result.is_ok() {
+        #[cfg(test)]
+        if timestamp_test::FAIL_STAGING_CLEANUP.get() {
+            return Ok(Some(cleanup_warning(
+                &staging,
+                io::ErrorKind::PermissionDenied,
+            )));
         }
-        Kind::Symlink => {
-            let target = fs::read_link(src).map_err(|e| format!("リンク先を読めません: {e}"))?;
-            create_symlink(&target, dst)?;
-            Ok(())
-        }
-        Kind::Other => Err("特殊なファイルは別ボリュームへ移せません".into()),
+        fs::remove_dir(&staging)
+    } else {
+        remove_any(&staging)
+    };
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(None),
+        (Err(reason), Ok(())) => Err(reason),
+        (Ok(()), Err(e)) => Ok(Some(cleanup_warning(&staging, e))),
+        (Err(reason), Err(e)) => Err(format!(
+            "{reason} / {}",
+            path_error(&staging, "一時コピーの掃除", e)
+        )),
     }
 }
 
-fn copy_file_hashing(
-    src: &Path,
-    dst: &Path,
-    src_meta: &fs::Metadata,
-) -> Result<hash::Hash, String> {
-    let mut reader = File::open(src).map_err(|e| format!("元を開けません: {e}"))?;
-    let mut writer = File::create(dst).map_err(|e| format!("コピー先を作れません: {e}"))?;
+fn cleanup_warning(path: &Path, error: impl std::fmt::Display) -> String {
+    format!(
+        "警告: {}。一時フォルダが残っています",
+        path_error(path, "一時コピーの掃除", error)
+    )
+}
+
+fn append_reason(reason: String, extra: Option<&str>) -> String {
+    match extra {
+        Some(extra) => format!("{reason} / {extra}"),
+        None => reason,
+    }
+}
+
+fn join_reasons(previous: Option<&str>, warning: Option<String>) -> Option<String> {
+    match warning {
+        Some(warning) => Some(append_reason(warning, previous)),
+        None => previous.map(str::to_owned),
+    }
+}
+
+fn path_error(path: &Path, step: &str, error: impl std::fmt::Display) -> String {
+    format!("{} の{step}に失敗: {error}", path.display())
+}
+
+fn entry_metadata(path: &Path) -> Result<fs::Metadata, String> {
+    fs::symlink_metadata(path).map_err(|e| path_error(path, "項目の取得", e))
+}
+
+fn entry_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(path_error(path, "項目の取得", e)),
+    }
+}
+
+fn read_mtime(path: &Path, meta: &fs::Metadata, step: &str) -> Result<SystemTime, String> {
+    #[cfg(test)]
+    timestamp_test::fail(path, step)?;
+    meta.modified().map_err(|e| path_error(path, step, e))
+}
+
+fn verify_mtime(path: &Path, meta: &fs::Metadata, expected: SystemTime) -> Result<(), String> {
+    let actual = read_mtime(path, meta, "更新日時の再取得")?;
+    #[cfg(test)]
+    let actual = timestamp_test::observed(path, actual);
+    if actual == expected {
+        return Ok(());
+    }
+    Err(path_error(
+        path,
+        "更新日時の照合",
+        format!(
+            "期待値 {}、実測値 {}（Unix 秒）",
+            unix_seconds(expected),
+            unix_seconds(actual)
+        ),
+    ))
+}
+
+fn unix_seconds(time: SystemTime) -> String {
+    let (sign, duration) = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => ("", duration),
+        Err(e) => ("-", e.duration()),
+    };
+    format!(
+        "{sign}{}.{:09}",
+        duration.as_secs(),
+        duration.subsec_nanos()
+    )
+}
+
+#[cfg(unix)]
+pub(super) fn set_mtime(path: &Path, time: SystemTime) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())?;
+    let nanos = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(e) => -(e.duration().as_nanos() as i128),
+    };
+    let seconds = nanos.div_euclid(1_000_000_000);
+    let fraction = nanos.rem_euclid(1_000_000_000);
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT as _,
+        },
+        libc::timespec {
+            tv_sec: seconds
+                .try_into()
+                .map_err(|_| io::ErrorKind::InvalidInput)?,
+            tv_nsec: fraction as _,
+        },
+    ];
+    // SAFETY: path と times は呼び出し中有効。末尾のシンボリックリンクはたどらない。
+    let result = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn set_mtime(path: &Path, time: SystemTime) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_WRITE_ATTRIBUTES,
+    };
+
+    File::options()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?
+        .set_modified(time)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(super) fn set_mtime(_path: &Path, _time: SystemTime) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+fn copy_and_verify_entry(src: &Path, dst: &Path) -> Result<(), String> {
+    let meta = entry_metadata(src)?;
+    let expected_mtime = read_mtime(src, &meta, "更新日時の取得")?;
+    match check::meta_kind(&meta) {
+        Kind::File => {
+            let expected = copy_file_hashing(src, dst)?;
+            if entry_hash(dst)? != expected {
+                return Err(path_error(
+                    dst,
+                    "内容の照合",
+                    "コピー先の blake3 が元と合いません",
+                ));
+            }
+        }
+        Kind::Dir => {
+            fs::create_dir(dst).map_err(|e| path_error(dst, "フォルダの作成", e))?;
+            for name in entry_names(src)? {
+                copy_and_verify_entry(&src.join(&name), &dst.join(name))?;
+            }
+        }
+        Kind::Symlink => {
+            create_symlink(&entry_link(src)?, dst, &meta)
+                .map_err(|e| path_error(dst, "リンクの作成", e))?;
+        }
+        Kind::Other => {
+            return Err(path_error(
+                src,
+                "コピー",
+                "特殊なファイルは別ボリュームへ移せません",
+            ));
+        }
+    }
+    // ファイルの書き込みハンドルが閉じ、フォルダ内の全項目が完成したあとに設定する。
+    #[cfg(test)]
+    timestamp_test::fail(dst, "更新日時の設定")?;
+    set_mtime(dst, expected_mtime).map_err(|e| path_error(dst, "更新日時の設定", e))?;
+    let actual = fs::symlink_metadata(dst).map_err(|e| path_error(dst, "更新日時の再取得", e))?;
+    verify_mtime(dst, &actual, expected_mtime)
+}
+
+fn copy_file_hashing(src: &Path, dst: &Path) -> Result<hash::Hash, String> {
+    let mut reader = File::open(src).map_err(|e| path_error(src, "ファイルを開く処理", e))?;
+    let mut writer = File::create_new(dst).map_err(|e| path_error(dst, "ファイルの作成", e))?;
     let mut hasher = hash::Hasher::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
         let n = reader
             .read(&mut buf)
-            .map_err(|e| format!("元の読み込みに失敗しました: {e}"))?;
+            .map_err(|e| path_error(src, "読み込み", e))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
         writer
             .write_all(&buf[..n])
-            .map_err(|e| format!("コピー先への書き込みに失敗しました: {e}"))?;
+            .map_err(|e| path_error(dst, "書き込み", e))?;
     }
     writer
         .flush()
-        .map_err(|e| format!("コピー先の書き込み完了に失敗しました: {e}"))?;
-    if let Ok(mtime) = src_meta.modified() {
-        let _ = writer.set_modified(mtime);
-    }
+        .map_err(|e| path_error(dst, "書き込み完了", e))?;
     Ok(*hasher.finalize().as_bytes())
 }
 
-fn create_symlink(target: &Path, dst: &Path) -> Result<(), String> {
+fn create_symlink(target: &Path, dst: &Path, _meta: &fs::Metadata) -> io::Result<()> {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(target, dst)
-            .map_err(|e| format!("リンクを作れませんでした: {e}"))
     }
     #[cfg(windows)]
     {
-        let res = if target.is_dir() {
+        use std::os::windows::fs::FileTypeExt;
+
+        if _meta.file_type().is_symlink_dir() {
             std::os::windows::fs::symlink_dir(target, dst)
         } else {
             std::os::windows::fs::symlink_file(target, dst)
-        };
-        res.map_err(|e| format!("リンクを作れませんでした: {e}"))
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (target, dst);
-        Err("リンクのコピーに対応していません".into())
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 
 fn remove_any(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    use std::os::windows::fs::FileTypeExt;
+
     match fs::symlink_metadata(path) {
+        #[cfg(windows)]
+        Ok(meta) if meta.file_type().is_symlink_dir() => fs::remove_dir(path),
         Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
         Ok(_) => fs::remove_file(path),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1112,32 +1335,92 @@ fn remove_any(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 落ちたあとの再開用: 2 つのパスの中身（ファイルは blake3、フォルダは配下のファイル）が一致するか。
-fn entries_match_content(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (fs::symlink_metadata(a), fs::symlink_metadata(b)) else {
-        return false;
-    };
-    let ka = check::meta_kind(&ma);
-    if ka != check::meta_kind(&mb) {
-        return false;
+fn entry_hash(path: &Path) -> Result<hash::Hash, String> {
+    hash::hash_file(path).map_err(|e| path_error(path, "ハッシュの取得", e))
+}
+
+fn entry_link(path: &Path) -> Result<PathBuf, String> {
+    fs::read_link(path).map_err(|e| path_error(path, "リンク先の取得", e))
+}
+
+fn entry_names(path: &Path) -> Result<BTreeSet<std::ffi::OsString>, String> {
+    fs::read_dir(path)
+        .and_then(|items| {
+            items
+                .map(|item| item.map(|item| item.file_name()))
+                .collect()
+        })
+        .map_err(|e| path_error(path, "フォルダの読み取り", e))
+}
+
+/// コピー元の再確認と中断復旧で、更新日時を含むツリー全体を照合する。
+fn entries_match_content(a: &Path, b: &Path) -> Result<(), String> {
+    let ma = entry_metadata(a)?;
+    let mb = entry_metadata(b)?;
+    let kind = check::meta_kind(&ma);
+    if kind != check::meta_kind(&mb) {
+        return Err(path_error(b, "種類の照合", "種類が一致しません"));
     }
-    match ka {
-        Kind::File => ma.len() == mb.len() && hash::hash_file(a).ok() == hash::hash_file(b).ok(),
-        Kind::Symlink => fs::read_link(a).ok() == fs::read_link(b).ok(),
+    let expected_mtime = read_mtime(a, &ma, "更新日時の取得")?;
+    verify_mtime(b, &mb, expected_mtime)?;
+    let same = match kind {
+        Kind::File => ma.len() == mb.len() && entry_hash(a)? == entry_hash(b)?,
+        Kind::Symlink => entry_link(a)? == entry_link(b)?,
         Kind::Dir => {
-            let (Ok(ra), Ok(rb)) = (fs::read_dir(a), fs::read_dir(b)) else {
-                return false;
-            };
-            let mut na: Vec<_> = ra.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
-            let mut nb: Vec<_> = rb.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
-            na.sort();
-            nb.sort();
-            if na != nb {
-                return false;
+            let names = entry_names(a)?;
+            if names != entry_names(b)? {
+                return Err(path_error(b, "名前の照合", "配下の名前が一致しません"));
             }
-            na.iter()
-                .all(|name| entries_match_content(&a.join(name), &b.join(name)))
+            for name in names {
+                entries_match_content(&a.join(&name), &b.join(name))?;
+            }
+            true
         }
-        Kind::Other => false,
+        Kind::Other => return Err(path_error(b, "内容の照合", "特殊なファイルです")),
+    };
+    if !same {
+        return Err(path_error(b, "内容の照合", "内容が一致しません"));
+    }
+    // ハッシュや子の照合中に更新されていないことも確かめる。
+    verify_mtime(a, &entry_metadata(a)?, expected_mtime)?;
+    verify_mtime(b, &entry_metadata(b)?, expected_mtime)
+}
+
+#[cfg(test)]
+pub(super) mod timestamp_test {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        pub(crate) static FAIL_STAGING_CLEANUP: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static FORCE_COPY: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static FAULT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn fail(path: &Path, step: &str) -> Result<(), String> {
+        if path.ends_with("fault.bin") && FAULT.get() == Some(step) {
+            return Err(path_error(path, step, "注入した I/O エラー"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn observed(path: &Path, time: SystemTime) -> SystemTime {
+        if path.ends_with("fault.bin") && FAULT.get() == Some("丸め") {
+            UNIX_EPOCH + Duration::from_secs(time.duration_since(UNIX_EPOCH).unwrap().as_secs())
+        } else {
+            time
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_unsupported_exclusive_rename_errors_allow_fallback() {
+        let unsupported =
+            |errno| exclusive_rename_unsupported(&io::Error::from_raw_os_error(errno));
+        assert!(unsupported(libc::ENOTSUP));
+        assert_eq!(unsupported(libc::EINVAL), cfg!(target_os = "linux"));
+        assert!(!unsupported(libc::EEXIST));
+        assert!(!unsupported(libc::EACCES));
     }
 }

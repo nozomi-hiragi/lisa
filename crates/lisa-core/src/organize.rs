@@ -1267,10 +1267,300 @@ mod tests {
         let dst = h.drive.join("dst.bin");
         fs::write(&src, b"verify-me-with-blake3").unwrap();
 
-        let q = apply::copy_verify_and_quarantine(99, 0, &src, &dst, Some(&h.drive), &h.data_dir)
-            .unwrap();
+        let (q, warning) =
+            apply::copy_verify_and_quarantine(99, 0, &src, &dst, Some(&h.drive), &h.data_dir)
+                .unwrap();
+        assert_eq!(warning, None);
         assert!(!src.exists());
         assert_eq!(fs::read(&dst).unwrap(), b"verify-me-with-blake3");
         assert_eq!(fs::read(&q).unwrap(), b"verify-me-with-blake3");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    mod move_times {
+        use super::*;
+        use apply::timestamp_test::{FAIL_STAGING_CLEANUP, FAULT, FORCE_COPY};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        fn old_time(index: u64) -> SystemTime {
+            UNIX_EPOCH + Duration::new(1_500_000_000 + index, 123_456_700)
+        }
+
+        fn make_tree(root: &Path, links: bool) -> Vec<PathBuf> {
+            fs::create_dir_all(root.join("nested")).unwrap();
+            fs::create_dir(root.join("empty")).unwrap();
+            fs::write(root.join("nested/fault.bin"), b"payload").unwrap();
+            let mut paths = vec![
+                PathBuf::from("nested/fault.bin"),
+                PathBuf::from("nested"),
+                PathBuf::from("empty"),
+            ];
+            #[cfg(unix)]
+            if links {
+                for (name, target) in [
+                    ("relative", "nested/fault.bin"),
+                    ("broken", "missing"),
+                    ("external", "../../outside.bin"),
+                ] {
+                    std::os::unix::fs::symlink(target, root.join(name)).unwrap();
+                    paths.push(PathBuf::from(name));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = links;
+            paths.push(PathBuf::new());
+            for (i, path) in paths.iter().enumerate() {
+                apply::set_mtime(&root.join(path), old_time(i as u64)).unwrap();
+            }
+            paths
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Content {
+            File(Vec<u8>),
+            Directory(Vec<std::ffi::OsString>),
+            Link(PathBuf),
+        }
+
+        fn snapshot(root: &Path, paths: &[PathBuf]) -> Vec<(SystemTime, Content)> {
+            paths
+                .iter()
+                .map(|path| {
+                    let path = if path.as_os_str().is_empty() {
+                        root.to_path_buf()
+                    } else {
+                        root.join(path)
+                    };
+                    let meta = fs::symlink_metadata(&path).unwrap();
+                    let content = if meta.is_symlink() {
+                        Content::Link(fs::read_link(&path).unwrap())
+                    } else if meta.is_dir() {
+                        let mut names: Vec<_> = fs::read_dir(&path)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name())
+                            .collect();
+                        names.sort();
+                        Content::Directory(names)
+                    } else {
+                        Content::File(fs::read(&path).unwrap())
+                    };
+                    (meta.modified().unwrap(), content)
+                })
+                .collect()
+        }
+
+        fn plan_move(h: &mut Harness, src: &Path, dst: &Path) -> i64 {
+            h.scan(true);
+            let result = create_plan(
+                &mut h.db,
+                &h.ctx,
+                "test",
+                None,
+                &[OpInput::Move {
+                    from: src.into(),
+                    to: dst.into(),
+                }],
+                false,
+            )
+            .unwrap();
+            let id = result.id.unwrap_or_else(|| panic!("{:?}", result.checks));
+            approve_plan(&mut h.db, id, false).unwrap();
+            id
+        }
+
+        fn paths(h: &Harness) -> (PathBuf, PathBuf) {
+            let from = h.drive.join("from");
+            let to = h.drive.join("to");
+            fs::create_dir(&from).unwrap();
+            fs::create_dir(&to).unwrap();
+            (from.join("subject"), to.join("subject"))
+        }
+
+        #[test]
+        fn move_and_undo_keep_full_timestamps_and_contents() {
+            for (force_copy, tree) in [(false, false), (false, true), (true, false), (true, true)] {
+                let mut h = Harness::new("timestamp-round-trip");
+                let (src, dst) = paths(&h);
+                let external = h.drive.join("outside.bin");
+                fs::write(&external, b"outside").unwrap();
+                apply::set_mtime(&external, old_time(20)).unwrap();
+                let external_paths = &[PathBuf::from("outside.bin")];
+                let outside_before = snapshot(&h.drive, external_paths);
+                let entries = if tree {
+                    make_tree(&src, true)
+                } else {
+                    fs::write(&src, b"file").unwrap();
+                    apply::set_mtime(&src, old_time(15)).unwrap();
+                    vec![PathBuf::new()]
+                };
+                let before = snapshot(&src, &entries);
+                let id = plan_move(&mut h, &src, &dst);
+                FORCE_COPY.set(force_copy);
+                let moved = execute_plan(&mut h.db, &h.ctx, id).unwrap();
+                assert_eq!(moved.done, 1, "{:?}", get_plan(&h.db, id).unwrap());
+                assert_eq!(
+                    moved.touched_folders,
+                    [src.parent().unwrap(), dst.parent().unwrap()]
+                );
+                assert!(!src.exists());
+                assert_eq!(snapshot(&dst, &entries), before);
+                assert_eq!(snapshot(&h.drive, external_paths), outside_before);
+                let restored = undo_plan(&mut h.db, &h.ctx, id).unwrap();
+                FORCE_COPY.set(false);
+                assert_eq!(restored.undone, 1, "{restored:?}");
+                assert_eq!(restored.touched_folders, moved.touched_folders);
+                assert!(!dst.exists());
+                assert_eq!(snapshot(&src, &entries), before);
+                assert_eq!(snapshot(&h.drive, external_paths), outside_before);
+                assert!(undo_plan(&mut h.db, &h.ctx, id).is_err());
+            }
+        }
+
+        #[test]
+        fn timestamp_failures_leave_source_and_record_reason_in_both_directions() {
+            for undo in [false, true] {
+                for step in [
+                    "更新日時の取得",
+                    "更新日時の設定",
+                    "更新日時の再取得",
+                    "丸め",
+                ] {
+                    let mut h = Harness::new("timestamp-failure");
+                    let (src, dst) = paths(&h);
+                    let entries = make_tree(&src, false);
+                    let before = snapshot(&src, &entries);
+                    let id = plan_move(&mut h, &src, &dst);
+                    FORCE_COPY.set(true);
+                    if undo {
+                        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+                    }
+                    FAULT.set(Some(step));
+                    if undo {
+                        let report = undo_plan(&mut h.db, &h.ctx, id).unwrap();
+                        assert_eq!(report.undone, 0);
+                        assert_eq!(report.skipped.len(), 1);
+                    } else {
+                        let report = execute_plan(&mut h.db, &h.ctx, id).unwrap();
+                        assert_eq!(report.state, PlanState::Partial);
+                        assert_eq!(report.failed, 1);
+                    }
+                    FAULT.set(None);
+                    FORCE_COPY.set(false);
+                    let (_, ops) = get_plan(&h.db, id).unwrap().unwrap();
+                    let reason = ops[0].reason.as_deref().unwrap();
+                    assert!(
+                        reason.contains("nested") && reason.contains("fault.bin"),
+                        "{reason}"
+                    );
+                    if step == "丸め" {
+                        assert!(reason.contains("更新日時の照合"), "{reason}");
+                        assert!(reason.contains("1500000000.123456700"), "{reason}");
+                        assert!(reason.contains("1500000000.000000000"), "{reason}");
+                    } else {
+                        assert!(reason.contains(step) && reason.contains("I/O"), "{reason}");
+                    }
+                    let (original, absent) = if undo { (&dst, &src) } else { (&src, &dst) };
+                    assert_eq!(snapshot(original, &entries), before);
+                    assert_eq!(fs::read_dir(absent.parent().unwrap()).unwrap().count(), 0);
+                }
+            }
+        }
+
+        #[test]
+        fn recovery_compares_child_timestamps_before_quarantine() {
+            for mismatch in [false, true] {
+                let mut h = Harness::new("timestamp-recovery");
+                let (src, dst) = paths(&h);
+                let entries = make_tree(&src, false);
+                let before = snapshot(&src, &entries);
+                let id = plan_move(&mut h, &src, &dst);
+                plan::set_plan_state(&mut h.db, id, PlanState::Running, None).unwrap();
+                plan::set_op_state(&mut h.db, id, 0, OpState::Running, None, None, None).unwrap();
+                apply::copy_verify_and_publish(id, 0, &src, &dst).unwrap();
+                if mismatch {
+                    apply::set_mtime(&dst.join("nested/fault.bin"), old_time(30)).unwrap();
+                }
+                let published = snapshot(&dst, &entries);
+                let reports = recover_running_plans(&mut h.db, &h.ctx).unwrap();
+                assert_eq!(snapshot(&dst, &entries), published);
+                if mismatch {
+                    assert_eq!(reports[0].failed, 1);
+                    assert_eq!(snapshot(&src, &entries), before);
+                    let (_, ops) = get_plan(&h.db, id).unwrap().unwrap();
+                    let reason = ops[0].reason.as_deref().unwrap();
+                    assert!(
+                        reason.contains("中断後") && reason.contains("fault.bin"),
+                        "{reason}"
+                    );
+                    assert!(reason.contains("1500000030.123456700"), "{reason}");
+                } else {
+                    assert_eq!(reports[0].done, 1);
+                    assert!(!src.exists());
+                    assert_eq!(published, before);
+                }
+            }
+        }
+
+        #[test]
+        fn published_copy_completes_both_directions_with_cleanup_warning() {
+            let mut h = Harness::new("timestamp-cleanup-warning");
+            let (src, dst) = paths(&h);
+            fs::write(&src, b"payload").unwrap();
+            let id = plan_move(&mut h, &src, &dst);
+            let staging_name = format!(".lisa-moving-{id}-0-{}", std::process::id());
+            let move_staging = dst.with_file_name(&staging_name);
+            let undo_staging = src.with_file_name(&staging_name);
+            FORCE_COPY.set(true);
+            FAIL_STAGING_CLEANUP.set(true);
+            let applied = execute_plan(&mut h.db, &h.ctx, id).unwrap();
+            assert_eq!(applied.done, 1);
+            assert!(!src.exists());
+            assert_eq!(fs::read(&dst).unwrap(), b"payload");
+            let op = plan::plan_ops(&h.db, id).unwrap().remove(0);
+            let reason = op.reason.unwrap();
+            assert!(reason.contains("警告") && reason.contains(move_staging.to_str().unwrap()));
+            assert_eq!(fs::read_dir(&move_staging).unwrap().count(), 0);
+
+            let restored = undo_plan(&mut h.db, &h.ctx, id).unwrap();
+            FAIL_STAGING_CLEANUP.set(false);
+            FORCE_COPY.set(false);
+            assert_eq!(restored.undone, 1);
+            assert!(!dst.exists());
+            assert_eq!(fs::read(&src).unwrap(), b"payload");
+            let op = plan::plan_ops(&h.db, id).unwrap().remove(0);
+            let reason = op.reason.unwrap();
+            assert!(reason.contains(move_staging.to_str().unwrap()));
+            assert!(reason.contains(undo_staging.to_str().unwrap()));
+            assert_eq!(fs::read_dir(&undo_staging).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn copy_leaves_unowned_staging_and_destination_items_untouched() {
+            let h = Harness::new("timestamp-collisions");
+            let (src, dst) = paths(&h);
+            fs::write(&src, b"source").unwrap();
+            let staging = dst
+                .parent()
+                .unwrap()
+                .join(format!(".lisa-moving-1-0-{}", std::process::id()));
+            fs::write(&staging, b"existing staging entry").unwrap();
+            let reason = apply::copy_verify_and_publish(1, 0, &src, &dst).unwrap_err();
+            assert!(reason.contains("一時フォルダの作成"), "{reason}");
+            assert!(reason.contains(staging.to_str().unwrap()), "{reason}");
+            assert!(
+                reason.contains("前回の残りを確認して削除してから再実行"),
+                "{reason}"
+            );
+            assert_eq!(fs::read(&staging).unwrap(), b"existing staging entry");
+            assert!(!dst.exists());
+
+            fs::remove_file(&staging).unwrap();
+            fs::write(&dst, b"existing destination").unwrap();
+            let reason = apply::copy_verify_and_publish(1, 0, &src, &dst).unwrap_err();
+            assert!(reason.contains("正式名への確定"), "{reason}");
+            assert_eq!(fs::read(&dst).unwrap(), b"existing destination");
+            assert_eq!(fs::read(&src).unwrap(), b"source");
+            assert!(!staging.exists());
+        }
     }
 }
