@@ -174,6 +174,7 @@ pub(crate) fn move_to_quarantine(
     src: &Path,
     drive_mount: Option<&Path>,
     data_dir: &Path,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<PathBuf, String> {
     let base = choose_quarantine_base(data_dir, drive_mount, src)
         .ok_or_else(|| "隔離できない".to_string())?;
@@ -189,7 +190,7 @@ pub(crate) fn move_to_quarantine(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("隔離先を作れません: {e}"))?;
     }
-    fs::rename(src, &dest).map_err(|e| format!("隔離フォルダへ移せませんでした: {e}"))?;
+    rename(src, &dest).map_err(|e| format!("隔離フォルダへ移せませんでした: {e}"))?;
 
     // manifest.json を更新する（失敗してもファイル自体は移り終えているので、ログ扱いで進めずエラーにしない手もあるが、
     // 通常は同じボリュームの自分のフォルダなので書ける）。
