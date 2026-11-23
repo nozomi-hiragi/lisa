@@ -954,6 +954,167 @@ mod tests {
         assert!(!c.exists() && c2.exists());
     }
 
+    fn execute_moves_for_undo(h: &mut Harness) -> i64 {
+        let ops = ["a", "b"].map(|name| {
+            let from = h.drive.join(name);
+            fs::write(&from, name).unwrap();
+            OpInput::Move {
+                from,
+                to: h.drive.join(format!("{name}-moved")),
+            }
+        });
+        h.scan(true);
+        let id = create_plan(&mut h.db, &h.ctx, "cli", None, &ops, false)
+            .unwrap()
+            .id
+            .unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 2);
+        id
+    }
+
+    #[test]
+    fn concurrent_undo_only_runs_once() {
+        let mut h = Harness::new("concurrent-undo");
+        let id = execute_moves_for_undo(&mut h);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let ctx = h.ctx.clone();
+        let first = std::thread::spawn(move || {
+            let mut db = Db::open(&ctx.data_dir.join("lisa.db")).unwrap();
+            apply::plan_start_hook::set(move || {
+                locked_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            undo_plan(&mut db, &ctx, id)
+        });
+
+        locked_rx.recv().unwrap();
+        let ctx = h.ctx.clone();
+        let second = std::thread::spawn(move || {
+            let mut db = Db::open(&ctx.data_dir.join("lisa.db")).unwrap();
+            undo_plan(&mut db, &ctx, id)
+        });
+        resume_tx.send(()).unwrap();
+        let first = first.join().unwrap().unwrap();
+        assert_eq!(first.undone, 2);
+        assert!(first.skipped.is_empty());
+        assert!(
+            second
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .contains("すでに取り消しています")
+        );
+    }
+
+    #[test]
+    fn concurrent_plans_wait_and_both_execute() {
+        let mut h = Harness::new("concurrent-plans");
+        let ops = ["first", "second"].map(|name| {
+            let from = h.drive.join(name);
+            fs::write(&from, name).unwrap();
+            OpInput::Move {
+                from,
+                to: h.drive.join(format!("{name}-moved")),
+            }
+        });
+        h.scan(true);
+        let [first_id, second_id] = ops.map(|op| {
+            let id = create_plan(&mut h.db, &h.ctx, "cli", None, &[op], false)
+                .unwrap()
+                .id
+                .unwrap();
+            approve_plan(&mut h.db, id, false).unwrap();
+            id
+        });
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let ctx = h.ctx.clone();
+        let first = std::thread::spawn(move || {
+            let mut db = Db::open(&ctx.data_dir.join("lisa.db")).unwrap();
+            apply::plan_start_hook::set(move || {
+                locked_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            execute_plan(&mut db, &ctx, first_id)
+        });
+
+        locked_rx.recv().unwrap();
+        let ctx = h.ctx.clone();
+        let second = std::thread::spawn(move || {
+            let mut db = Db::open(&ctx.data_dir.join("lisa.db")).unwrap();
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(execute_plan(&mut db, &ctx, second_id))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+        resume_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap().unwrap().done, 1);
+        second.join().unwrap();
+        assert!(matches!(
+            early,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(result_rx.recv().unwrap().unwrap().done, 1);
+        assert_eq!(fs::read(h.drive.join("first-moved")).unwrap(), b"first");
+        assert_eq!(fs::read(h.drive.join("second-moved")).unwrap(), b"second");
+    }
+
+    #[test]
+    fn undo_refuses_lock_held_by_another_open_file() {
+        let mut h = Harness::new("external-plan-lock");
+        let id = execute_moves_for_undo(&mut h);
+        // プロセス内 Mutex を共有しない相手と同様に、別のハンドルで OS ロックを取る。
+        let external_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(h.data_dir.join("organize.lock"))
+            .unwrap();
+        external_lock.try_lock().unwrap();
+        let mut other_db = Db::open(&h.data_dir.join("lisa.db")).unwrap();
+        assert!(
+            undo_plan(&mut other_db, &h.ctx, id)
+                .unwrap_err()
+                .contains("取り消し中")
+        );
+        drop(external_lock);
+        assert_eq!(undo_plan(&mut other_db, &h.ctx, id).unwrap().undone, 2);
+    }
+
+    #[test]
+    fn interrupted_undo_can_resume_remaining_operations() {
+        let mut h = Harness::new("interrupted-undo");
+        let id = execute_moves_for_undo(&mut h);
+        // 逆順の最初の操作を戻して記録したところで止まった状態。
+        let last_op = plan::plan_ops(&h.db, id).unwrap().pop().unwrap();
+        fs::rename(last_op.dst.unwrap(), last_op.src).unwrap();
+        plan::set_op_state(
+            &mut h.db,
+            id,
+            last_op.seq,
+            OpState::Undone,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(recover_running_plans(&mut h.db, &h.ctx).unwrap().is_empty());
+        let report = undo_plan(&mut h.db, &h.ctx, id).unwrap();
+        assert_eq!(report.state, PlanState::Undone);
+        assert_eq!(report.undone, 1);
+        assert!(report.skipped.is_empty());
+        assert_eq!(fs::read(h.drive.join("a")).unwrap(), b"a");
+        assert_eq!(fs::read(h.drive.join("b")).unwrap(), b"b");
+    }
+
     #[test]
     fn undo_skips_when_original_path_is_occupied() {
         let mut h = Harness::new("undo-occupied");

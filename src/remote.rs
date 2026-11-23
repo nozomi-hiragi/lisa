@@ -48,7 +48,7 @@ impl Plugin for RemotePlugin {
 }
 
 /// 検証用の頼みを受けるか（環境変数 `LISA_DEBUG_REMOTE=1` のときのみ）。
-fn debug_remote_enabled() -> bool {
+pub(crate) fn debug_remote_enabled() -> bool {
     std::env::var("LISA_DEBUG_REMOTE").as_deref() == Ok("1")
 }
 

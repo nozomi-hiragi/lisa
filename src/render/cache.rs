@@ -13,7 +13,7 @@
 //! `view_formats` 不使用で OpenGL でも安全）を通すため、色が食い違わない。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, SystemTime};
@@ -59,18 +59,47 @@ fn image_height() -> u32 {
 }
 
 /// フォルダ `id` のサムネの鍵。Root やファイルは `None`。
+/// 読み直しで変わったローカルフォルダは、以前の読込・撮影結果を使わない。
 ///
 /// - 手元のフォルダ: `DRAW_VERSION` + ディスク上のパス
 /// - LAN の相手のフォルダ: `DRAW_VERSION` + 端末 ID + 端末ノード以下の名前の道のり
 /// - ダミーの木や端末ノードなど: `DRAW_VERSION` + Root からの名前の道のり
 pub fn folder_key(tree: &FileTree, id: NodeId) -> Option<Key> {
+    let key = disk_key(tree, id)?;
+    let Some(generation) = preview_generation(tree, id) else {
+        return Some(key);
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&key);
+    hasher.update(&generation.to_le_bytes());
+    Some(*hasher.finalize().as_bytes())
+}
+
+fn preview_generation(tree: &FileTree, id: NodeId) -> Option<u64> {
+    let path = tree.nodes.get(id)?.path.as_ref()?;
+    tree.preview_generations.get(path).copied()
+}
+
+fn key_hasher() -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&DRAW_VERSION.to_le_bytes());
+    hasher.update(&IMAGE_WIDTH.to_le_bytes());
+    hasher
+}
+
+fn local_disk_key(path: &Path) -> Key {
+    let mut hasher = key_hasher();
+    hasher.update(b"local\0");
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+fn disk_key(tree: &FileTree, id: NodeId) -> Option<Key> {
     let node = tree.nodes.get(id)?;
     if id == FileTree::ROOT || !node.is_dir {
         return None;
     }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&DRAW_VERSION.to_le_bytes());
-    hasher.update(&IMAGE_WIDTH.to_le_bytes());
+    let mut hasher = key_hasher();
     if let Some(remote) = &node.remote {
         hasher.update(b"remote\0");
         hasher.update(remote.device_id.as_bytes());
@@ -98,8 +127,7 @@ pub fn folder_key(tree: &FileTree, id: NodeId) -> Option<Key> {
             hasher.update(name.as_bytes());
         }
     } else if let Some(path) = &node.path {
-        hasher.update(b"local\0");
-        hasher.update(path.as_os_str().as_encoded_bytes());
+        return Some(local_disk_key(path));
     } else {
         hasher.update(b"tree\0");
         hasher.update(tree.path(id).as_bytes());
@@ -177,15 +205,20 @@ fn loaded_image(rgba: Vec<u8>) -> Image {
     image
 }
 
+enum DiskWrite {
+    Save(Key, Vec<u8>),
+    Invalidate(Key),
+}
+
 /// ディスクの画像の置き場と、書く係・読む係・読み戻し結果のやりとり。
 #[derive(Resource)]
 pub struct ImageCache {
     dir: Option<PathBuf>,
-    save: Mutex<Sender<(Key, Vec<u8>)>>,
+    save: Mutex<Sender<DiskWrite>>,
     read_req: Mutex<Sender<(Key, PathBuf)>>,
     read_res: Mutex<Receiver<(Key, Option<Vec<u8>>)>>,
-    capture_tx: Mutex<Sender<(Key, Vec<u8>)>>,
-    capture_rx: Mutex<Receiver<(Key, Vec<u8>)>>,
+    capture_tx: Mutex<Sender<CapturedImage>>,
+    capture_rx: Mutex<Receiver<CapturedImage>>,
 }
 
 impl ImageCache {
@@ -207,14 +240,19 @@ impl ImageCache {
                 })
                 .expect("画像を掃除する係を作る");
         }
-        let (save, save_rx) = channel::<(Key, Vec<u8>)>();
+        let (save, save_rx) = channel::<DiskWrite>();
         let writer_dir = dir.clone();
         std::thread::Builder::new()
             .name("lisa-image-writer".into())
             .spawn(move || {
-                for (key, rgba) in save_rx {
+                for request in save_rx {
                     if let Some(dir) = &writer_dir {
-                        write_webp(dir, &key, &rgba);
+                        match request {
+                            DiskWrite::Save(key, rgba) => write_webp(dir, &key, &rgba),
+                            DiskWrite::Invalidate(key) => {
+                                let _ = std::fs::remove_file(dir.join(file_name(&key)));
+                            }
+                        }
                     }
                 }
             })
@@ -233,7 +271,7 @@ impl ImageCache {
             })
             .expect("画像を読む係を作る");
 
-        let (capture_tx, capture_rx) = channel::<(Key, Vec<u8>)>();
+        let (capture_tx, capture_rx) = channel::<CapturedImage>();
         Self {
             dir,
             save: Mutex::new(save),
@@ -241,6 +279,12 @@ impl ImageCache {
             read_res: Mutex::new(read_res),
             capture_tx: Mutex::new(capture_tx),
             capture_rx: Mutex::new(capture_rx),
+        }
+    }
+
+    pub(crate) fn invalidate_local(&self, path: &Path) {
+        if let Ok(tx) = self.save.lock() {
+            let _ = tx.send(DiskWrite::Invalidate(local_disk_key(path)));
         }
     }
 
@@ -365,12 +409,20 @@ pub struct ThumbnailCapture {
     /// 最後に撮影し終えた `SceneVisit` 番号。
     last_visit: u64,
     /// 最後にディスク確認した `(scene_folder, children.len(), parent_children_len)`。
-    last_disk_scan: Option<(NodeId, usize, usize)>,
+    last_disk_scan: Option<(NodeId, usize, usize, u64)>,
+    visible_dirs: Vec<NodeId>,
+    refreshed: HashMap<Key, u64>,
     /// 撮影中のカメラ。
     active: Option<ActiveCapture>,
     /// ディスクから読み込み中の枚数。
     in_flight_reads: HashSet<Key>,
     in_flight_captures: HashSet<Key>,
+}
+
+struct CapturedImage {
+    folder: NodeId,
+    key: Key,
+    rgba: Vec<u8>,
 }
 
 struct ActiveCapture {
@@ -382,6 +434,7 @@ struct ActiveCapture {
     target: Handle<Image>,
     frames: u32,
     readback_sent: bool,
+    refresh: bool,
 }
 
 impl ThumbnailCapture {
@@ -445,16 +498,29 @@ pub(crate) fn update_thumbnails(
     mut redraw: MessageWriter<RequestRedraw>,
     mut ctx: ThumbContext,
 ) {
+    let capture = &mut *capture;
     let path = scene_path(&ctx.nav, &ctx.tree);
     let scene_folder = path[path.len() - 1].node;
 
     // 1a. 撮影の読み戻し結果を反映する。
     let mut updated_keys: Vec<Key> = Vec::new();
     if let Ok(rx) = cache.capture_rx.lock() {
-        for (key, rgba) in rx.try_iter() {
+        for CapturedImage { folder, key, rgba } in rx.try_iter() {
             capture.in_flight_captures.remove(&key);
+            if !ctx.tree.is_attached(folder) || folder_key(&ctx.tree, folder) != Some(key) {
+                continue;
+            }
             let expected = (IMAGE_WIDTH * image_height() * 4) as usize;
             if rgba.len() == expected {
+                if let Some(disk_key) = disk_key(&ctx.tree, folder) {
+                    if let Some(generation) = preview_generation(&ctx.tree, folder) {
+                        capture.refreshed.insert(disk_key, generation);
+                        debug!("サムネを更新: {}", ctx.tree.nodes[folder].name);
+                    }
+                    if let Ok(tx) = cache.save.lock() {
+                        let _ = tx.send(DiskWrite::Save(disk_key, rgba.clone()));
+                    }
+                }
                 let handle = assets.add(loaded_image(rgba));
                 images.insert(key, handle);
                 updated_keys.push(key);
@@ -494,9 +560,10 @@ pub(crate) fn update_thumbnails(
         scene_folder,
         ctx.tree.nodes[scene_folder].children.len(),
         parent_children_len,
+        ctx.tree.preview_revision,
     );
-    if !busy && capture.last_disk_scan != Some(scan_sig) {
-        capture.last_disk_scan = Some(scan_sig);
+    if !busy && (capture.last_disk_scan != Some(scan_sig) || ctx.tree.is_changed()) {
+        let previous = capture.last_disk_scan.replace(scan_sig);
         let mut visible_dirs = Vec::new();
         for &c in &ctx.tree.nodes[scene_folder].children {
             if ctx.tree.nodes[c].is_dir {
@@ -510,20 +577,37 @@ pub(crate) fn update_thumbnails(
                 }
             }
         }
-        for dir_id in visible_dirs {
+        if let Some((_, _, _, old_revision)) = previous
+            && visible_dirs.iter().any(|&id| {
+                preview_generation(&ctx.tree, id)
+                    .is_some_and(|generation| generation > old_revision)
+            })
+        {
+            sync.request_redraw();
+        }
+        for &dir_id in &visible_dirs {
+            let Some(disk_key) = disk_key(&ctx.tree, dir_id) else {
+                continue;
+            };
+            if preview_generation(&ctx.tree, dir_id)
+                .is_some_and(|generation| capture.refreshed.get(&disk_key) != Some(&generation))
+            {
+                continue;
+            }
             let Some(key) = folder_key(&ctx.tree, dir_id) else {
                 continue;
             };
             if images.images.contains_key(&key) || !images.disk_checked.insert(key) {
                 continue;
             }
-            if let Some(path) = cache.path(&key).filter(|p| p.exists())
+            if let Some(path) = cache.path(&disk_key).filter(|p| p.exists())
                 && let Ok(tx) = cache.read_req.lock()
                 && tx.send((key, path)).is_ok()
             {
                 capture.in_flight_reads.insert(key);
             }
         }
+        capture.visible_dirs = visible_dirs;
     }
 
     // 裏読込や GPU 読み戻しが進行中なら、reactive の 1 秒待ちを待たずに次のフレームを回す。
@@ -540,7 +624,11 @@ pub(crate) fn update_thumbnails(
         if active.visit.is_none() && current_visit {
             active.visit = Some(ctx.visit.0);
         }
-        let stale = !still_requested && (!current_visit || active.visit != Some(ctx.visit.0));
+        let stale = !ctx.tree.is_attached(active.folder)
+            || folder_key(&ctx.tree, active.folder) != Some(active.key)
+            || (!active.refresh
+                && !still_requested
+                && (!current_visit || active.visit != Some(ctx.visit.0)));
         if !active.readback_sent && stale {
             commands.entity(active.camera).despawn();
             commands.entity(active.scene).despawn();
@@ -553,15 +641,18 @@ pub(crate) fn update_thumbnails(
         active.frames += 1;
         if active.frames == CAPTURE_FRAMES && !active.readback_sent {
             let key = active.key;
-            let save = cache.save.lock().expect("画像を書く係").clone();
+            let folder = active.folder;
             let mem = cache.capture_tx.lock().expect("画像を受け取る係").clone();
             commands
                 .spawn(ReadbackOnce::texture(active.target.clone()))
                 .observe(move |event: On<ReadbackComplete>, mut commands: Commands| {
                     let mut data = event.data.clone();
                     straighten_alpha(&mut data);
-                    let _ = save.send((key, data.clone()));
-                    let _ = mem.send((key, data));
+                    let _ = mem.send(CapturedImage {
+                        folder,
+                        key,
+                        rgba: data,
+                    });
                     commands.entity(event.entity).despawn();
                 });
             active.readback_sent = true;
@@ -579,13 +670,16 @@ pub(crate) fn update_thumbnails(
         return;
     }
 
-    // 開いた場所を優先し、次に今まさに寄っている子だけを撮る。
+    // 開いた場所、寄っている子、無効化された画面上のタイルの順で撮る。
     if !ctx.fonts.contains(&ctx.font.0) {
         return;
     }
     let capture_key = |folder: NodeId| {
         let node = &ctx.tree.nodes[folder];
-        if folder == FileTree::ROOT || !node.is_dir || !node.loaded || !ctx.layouts.contains(folder)
+        if folder == FileTree::ROOT
+            || !node.is_dir
+            || !node.loaded
+            || node.state == crate::model::tree::LoadState::Failed
         {
             return None;
         }
@@ -593,21 +687,58 @@ pub(crate) fn update_thumbnails(
         (!capture.in_flight_captures.contains(&key) && !capture.in_flight_reads.contains(&key))
             .then_some(key)
     };
-    let current = (ctx.visit.0 != capture.last_visit)
-        .then(|| capture_key(scene_folder))
-        .flatten()
-        .map(|key| (scene_folder, key, Some(ctx.visit.0)));
-    let target_folder = current.or_else(|| {
-        let folder = requested?;
-        let node = &ctx.tree.nodes[folder];
-        if node.children.is_empty()
-            || node.state == crate::model::tree::LoadState::Failed
-            || images.ready(&ctx.tree, folder).is_some()
+    let needs_refresh = |folder| {
+        preview_generation(&ctx.tree, folder).is_some_and(|generation| {
+            disk_key(&ctx.tree, folder)
+                .is_some_and(|key| capture.refreshed.get(&key) != Some(&generation))
+        })
+    };
+    // 祖先の画像に貼る、変更された子の画像を先に撮る。
+    let capture_with_children = |folder: NodeId, visit: Option<u64>| {
+        let mut target = folder;
+        while let Some(child) = ctx.tree.nodes[target]
+            .children
+            .iter()
+            .copied()
+            .find(|&child| {
+                let node = &ctx.tree.nodes[child];
+                node.is_dir
+                    && node.loaded
+                    && node.state != crate::model::tree::LoadState::Failed
+                    && needs_refresh(child)
+            })
         {
-            return None;
+            target = child;
         }
-        capture_key(folder).map(|key| (folder, key, None))
-    });
+        capture_key(target).map(|key| (target, key, visit.filter(|_| target == folder)))
+    };
+    let current = (ctx.layouts.contains(scene_folder)
+        && (ctx.visit.0 != capture.last_visit || needs_refresh(scene_folder)))
+    .then(|| capture_with_children(scene_folder, Some(ctx.visit.0)))
+    .flatten();
+    let target_folder = current
+        .or_else(|| {
+            let folder = requested?;
+            let node = &ctx.tree.nodes[folder];
+            if !ctx.layouts.contains(folder)
+                || node.children.is_empty()
+                || node.state == crate::model::tree::LoadState::Failed
+                || images.ready(&ctx.tree, folder).is_some()
+            {
+                return None;
+            }
+            capture_with_children(folder, None)
+        })
+        .or_else(|| {
+            if busy {
+                return None;
+            }
+            capture.visible_dirs.iter().copied().find_map(|folder| {
+                needs_refresh(folder)
+                    .then(|| capture_with_children(folder, None))
+                    .flatten()
+            })
+        });
     let Some((folder, key, visit)) = target_folder else {
         return;
     };
@@ -682,6 +813,7 @@ pub(crate) fn update_thumbnails(
         target,
         frames: 0,
         readback_sent: false,
+        refresh: needs_refresh(folder),
     });
     redraw.write(RequestRedraw);
 }
@@ -791,6 +923,27 @@ mod tests {
         );
         assert!(target.texture_descriptor.view_formats.is_empty());
         assert!(loaded.texture_descriptor.view_formats.is_empty());
+    }
+
+    #[test]
+    fn invalidated_local_folder_rejects_old_thumbnail_key() {
+        let mut tree = FileTree::dummy();
+        let device = tree.nodes[FileTree::ROOT].children[0];
+        let [folder, sibling] = tree.nodes[device].children[..2] else {
+            panic!("フォルダが二つ必要");
+        };
+        let path = std::env::temp_dir().join("lisa-thumbnail-key");
+        tree.nodes[folder].path = Some(path.clone());
+        tree.nodes[sibling].path = Some(path.with_extension("sibling"));
+        let old = folder_key(&tree, folder);
+        let other = folder_key(&tree, sibling);
+        tree.preview_generations.insert(path.clone(), 1);
+        let refreshed = folder_key(&tree, folder);
+        assert_ne!(refreshed, old);
+        assert_eq!(disk_key(&tree, folder), old);
+        tree.preview_generations.insert(path, 2);
+        assert_ne!(folder_key(&tree, folder), refreshed);
+        assert_eq!(folder_key(&tree, sibling), other);
     }
 
     #[test]

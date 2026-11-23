@@ -1,12 +1,12 @@
 //! 整理の計画の実行、落ちたあとの再開、取り消し、触ったフォルダの収集。
 //!
-//! - 同時に動く計画は 1 つだけ（プロセス内の Mutex と `<data_dir>/organize.lock`）。
+//! - 同時に動く計画は 1 つだけ（プロセス内の Mutex と `<data_dir>/organize.lock` の OS ロック）。
 //! - 実行の順は `mkdir` → `move` → `trash`（それぞれ計画の `seq` 順）。
 //! - 1 件ごとに `running` を DB に書いて確定してから動かし、済んだら `done`（または `skipped` / `failed`）にする。
 //! - `entry` の表には直接書かない。触ったフォルダの一覧を返すので、アプリは `Request::Hint`、CLI / MCP は `Command::Rescan` で読み直させる。
 
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -24,7 +24,7 @@ use super::check;
 use super::plan::{self, OpKind, OpState, PlanOp, PlanState};
 use super::quarantine;
 
-/// 同じプロセスの中で同時に複数の計画が動かないようにするロック。
+/// 同じプロセスで始まった計画は先行する計画の完了を待つ。
 static RUN_LOCK: Mutex<()> = Mutex::new(());
 
 /// ロックファイルの名前（`<data_dir>/organize.lock`）。
@@ -61,89 +61,42 @@ pub struct UndoReport {
     pub touched_folders: Vec<PathBuf>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct LockInfo {
-    pid: u32,
-    plan_id: i64,
-    started_at: i64,
-}
-
 struct PlanLock {
-    _in_process: MutexGuard<'static, ()>,
-    path: PathBuf,
+    // プロセス内の次の操作を起こす前に、OS ロックを解放する。
+    _file: File,
+    _process: MutexGuard<'static, ()>,
 }
 
-impl PlanLock {
-    fn acquire(data_dir: &Path, plan_id: i64) -> Result<Self, String> {
-        let guard = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let path = data_dir.join(LOCK_FILE);
-        if let Ok(bytes) = fs::read(&path)
-            && let Ok(info) = serde_json::from_slice::<LockInfo>(&bytes)
-            && info.pid != std::process::id()
-            && is_pid_alive(info.pid)
-        {
-            return Err(format!(
-                "別の計画（#{}、PID {}）が実行中です",
-                info.plan_id, info.pid
-            ));
+/// ファイルを閉じるかプロセスが終了すると OS が解放する。
+/// 待っているプロセスが別の inode を開かないよう、ロックファイルは残す。
+fn lock_plans(data_dir: &Path, plan_id: i64) -> Result<PlanLock, String> {
+    let process = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let open_error = |error| format!("整理のロックを開けません: {error}");
+    fs::create_dir_all(data_dir).map_err(open_error)?;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data_dir.join(LOCK_FILE))
+        .map_err(open_error)?;
+    match file.try_lock() {
+        Ok(()) => {
+            #[cfg(test)]
+            plan_start_hook::HOOK.with(|hook| {
+                if let Some(run) = hook.take() {
+                    run();
+                }
+            });
+            Ok(PlanLock {
+                _file: file,
+                _process: process,
+            })
         }
-        let _ = fs::create_dir_all(data_dir);
-        let info = LockInfo {
-            pid: std::process::id(),
-            plan_id,
-            started_at: db::now_ms(),
-        };
-        let bytes = serde_json::to_vec(&info).map_err(|e| e.to_string())?;
-        let tmp = data_dir.join(format!("{LOCK_FILE}.tmp.{}", std::process::id()));
-        if fs::write(&tmp, &bytes).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
-        Ok(Self {
-            _in_process: guard,
-            path,
-        })
-    }
-}
-
-impl Drop for PlanLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn is_pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        // SAFETY: シグナル 0 はプロセスを止めず、生きているか確かめるだけ。
-        unsafe { kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return false;
-            }
-            let mut code: u32 = 0;
-            let ok = GetExitCodeProcess(handle, &mut code) != 0;
-            CloseHandle(handle);
-            ok && code == STILL_ACTIVE as u32
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        false
+        Err(TryLockError::WouldBlock) => Err(format!(
+            "計画 #{plan_id} を開始できません。整理計画の実行中または取り消し中です"
+        )),
+        Err(TryLockError::Error(error)) => Err(format!("整理のロックを取れません: {error}")),
     }
 }
 
@@ -160,7 +113,7 @@ pub fn recover_running_plans(db: &mut Db, ctx: &Context) -> Result<Vec<ApplyRepo
 
 /// 許可済み（`approved`）または途中で落ちた（`running`）計画を順に実行する。
 pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyReport, String> {
-    let _lock = PlanLock::acquire(&ctx.data_dir, plan_id)?;
+    let _lock = lock_plans(&ctx.data_dir, plan_id)?;
 
     let plan = plan::load_plan_required(db, plan_id)?;
     if !matches!(plan.state, PlanState::Approved | PlanState::Running) {
@@ -620,7 +573,7 @@ fn recover_running_ops(
 /// 実行済みの計画（`done` / `partial`）を、逆の順（`trash` → `move` → `mkdir`、各 `seq` 降順）で取り消す。
 /// 許可は要らず、上書きはしない。戻す先が埋まっている・元が変わったものは飛ばして理由を返す。
 pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport, String> {
-    let _lock = PlanLock::acquire(&ctx.data_dir, plan_id)?;
+    let _lock = lock_plans(&ctx.data_dir, plan_id)?;
 
     let plan = plan::load_plan_required(db, plan_id)?;
     if plan.state == PlanState::Undone {
@@ -1422,5 +1375,19 @@ pub(super) mod timestamp_test {
         assert_eq!(unsupported(libc::EINVAL), cfg!(target_os = "linux"));
         assert!(!unsupported(libc::EEXIST));
         assert!(!unsupported(libc::EACCES));
+    }
+}
+
+#[cfg(test)]
+pub(super) mod plan_start_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+    thread_local! {
+        pub(super) static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(in crate::organize) fn set(hook: impl FnOnce() + 'static) {
+        HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
     }
 }
