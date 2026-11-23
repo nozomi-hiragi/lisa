@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use super::{Auth, Server, arg_usize, err};
 
 /// `lisa_plan_status` の `wait` の上限（秒）。
+/// 依頼 ID の計画が対象端末にまだ無いときの理由（依頼元が「未到達」の判断に使う）。
+pub const NO_PLAN_FOR_REQUEST: &str = "この依頼 ID の計画はまだありません";
 const MAX_WAIT_SECS: u64 = 60;
 /// `lisa_plan_status` で待つときのポーリング間隔。
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -25,11 +27,16 @@ const DEFAULT_OPS_LIMIT: usize = 200;
 impl Server {
     fn organize_context(&self) -> Context {
         let settings = self.settings_path();
-        Context::load(self.data_dir.clone(), settings.as_deref())
+        let mut ctx = Context::load(self.data_dir.clone(), settings.as_deref());
+        ctx.keep_client = Some(super::relay_client);
+        ctx
     }
 
     /// 整理の計画を確かめて作る（`dry_run: true` や `refused` があれば作らず結果だけ返す）。
     pub(super) fn plan_create(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
+        if args.get("remote_keep").is_some() {
+            return Err("端末間の計画は lisa_duplicate_plan_create で依頼してください".into());
+        }
         let ops_val = args.get("ops").ok_or("ops（操作の配列）が要ります")?;
         let ops: Vec<OpInput> = serde_json::from_value(ops_val.clone())
             .map_err(|e| format!("ops の形が正しくありません: {e}"))?;
@@ -39,7 +46,111 @@ impl Server {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        self.create_organize_plan(auth, note, &ops, dry_run)
+        self.create_organize_plan(auth, note, &ops, dry_run, peer_request(args, auth)?)
+    }
+
+    pub(super) fn duplicate_local_plan(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
+        use organize::remote_keep::{KeepReference, resolve};
+        let request = peer_request(args, auth)?;
+        let db = self.db()?;
+        let keep: KeepReference = serde_json::from_value(args["keep"].clone()).map_err(err)?;
+        let sources: Vec<KeepReference> =
+            serde_json::from_value(args["sources"].clone()).map_err(err)?;
+        let keep_path = resolve(&db, &keep)?;
+        let mut ops = Vec::with_capacity(sources.len());
+        for source in sources {
+            if source.key != keep.key || source == keep {
+                return Err("整理対象と残す項目が正しくありません".into());
+            }
+            ops.push(OpInput::Trash {
+                path: resolve(&db, &source)?,
+                keep: Some(keep_path.clone()),
+            });
+        }
+        drop(db);
+        self.create_organize_plan(
+            auth,
+            Some("重複の整理"),
+            &ops,
+            args["dry_run"] == true,
+            request,
+        )
+    }
+
+    pub(super) fn duplicate_sources(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
+        use organize::remote_keep::{KeepReference, ProtectedKeep};
+        if !matches!(auth, Auth::Peer { .. }) {
+            return Err("整理対象の確認にはペアリングが必要です".into());
+        }
+        let sources: Vec<KeepReference> =
+            serde_json::from_value(args["sources"].clone()).map_err(err)?;
+        if sources.is_empty() || sources.len() > MAX_OPS {
+            return Err("整理対象の件数が範囲外です".into());
+        }
+        let db = self.db()?;
+        let sources = sources
+            .into_iter()
+            .map(|source| ProtectedKeep::inspect(&db, source))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({"sources": sources}))
+    }
+
+    pub(super) fn duplicate_plan_create(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
+        use organize::remote_keep::{RemotePlan, relay::Route};
+        let Auth::Peer {
+            device_id,
+            name,
+            remote_ip: Some(ip),
+        } = auth
+        else {
+            return Err("端末間の整理はペアリング済みの LAN 接続が必要です".into());
+        };
+        let mut db = self.db()?;
+        let target_device = db
+            .meta("this_device")
+            .map_err(err)?
+            .ok_or("対象端末の ID がありません")?;
+        let port = args["relay_port"]
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+            .ok_or("依頼元の公開ポートが要ります")?;
+        let (requester_device, request) =
+            peer_request(args, auth)?.ok_or("request_id が要ります")?;
+        let secret = args["relay_secret"]
+            .as_str()
+            .filter(|secret| secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or("中継許可が要ります")?;
+        let route = Route {
+            requester_device: requester_device.into(),
+            request_id: request.to_string(),
+            target_device,
+            secret: secret.into(),
+            address: std::net::SocketAddr::new(*ip, port),
+        };
+        let keep = serde_json::from_value(args["keep"].clone()).map_err(err)?;
+        let sources = serde_json::from_value(args["sources"].clone()).map_err(err)?;
+        let by = format!("mcp:{name}");
+        debug_assert_eq!(requester_device, device_id);
+        serde_json::to_value(organize::create_remote_keep_plan(
+            &mut db,
+            &self.organize_context(),
+            &by,
+            args["note"].as_str(),
+            RemotePlan {
+                route,
+                keep,
+                sources,
+                keep_label: args["keep_label"].as_str().map(|label| {
+                    label
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(500)
+                        .collect()
+                }),
+            },
+        )?)
+        .map_err(err)
     }
 
     /// 親フォルダを変えない move の計画を作る。
@@ -76,8 +187,13 @@ impl Server {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         drop(db);
-        let mut result =
-            self.create_organize_plan(auth, Some(note), &[OpInput::Move { from, to }], dry_run)?;
+        let mut result = self.create_organize_plan(
+            auth,
+            Some(note),
+            &[OpInput::Move { from, to }],
+            dry_run,
+            None,
+        )?;
         if result["created"] == true {
             result["state"] = json!(PlanState::Pending);
         }
@@ -90,6 +206,7 @@ impl Server {
         note: Option<&str>,
         ops: &[OpInput],
         dry_run: bool,
+        request: Option<(&str, uuid::Uuid)>,
     ) -> Result<Value, String> {
         let by = match auth {
             Auth::Peer { name, .. } => format!("mcp:{name}"),
@@ -99,7 +216,13 @@ impl Server {
 
         let mut db = self.db()?;
         let ctx = self.organize_context();
-        let res = organize::create_plan(&mut db, &ctx, &by, note, ops, dry_run)?;
+        let res = match request {
+            Some((device, request_id)) if !dry_run => {
+                organize::create_peer_plan(&mut db, &ctx, &by, note, ops, device, request_id)?
+            }
+            Some(_) => return Err("dry_run に依頼 ID は指定できません".into()),
+            None => organize::create_plan(&mut db, &ctx, &by, note, ops, dry_run)?,
+        };
 
         let mut out = serde_json::to_value(&res).map_err(err)?;
         if res.created {
@@ -115,8 +238,17 @@ impl Server {
     }
 
     /// 計画の状態と操作ごとの結果を返す。`wait`（秒、最大 60）があれば許可待ちが変わるまで待つ。
-    pub(super) fn plan_status(&self, args: &Value) -> Result<Value, String> {
-        let id = require_plan_id(args)?;
+    pub(super) fn plan_status(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
+        let id = if let Some((device, request_id)) = peer_request(args, auth)? {
+            if args.get("id").is_some() {
+                return Err("id と request_id は同時に指定できません".into());
+            }
+            organize::peer_plan_id(&self.db()?, device, request_id)
+                .map_err(err)?
+                .ok_or(NO_PLAN_FOR_REQUEST)?
+        } else {
+            require_plan_id(args)?
+        };
         let wait_secs = args
             .get("wait")
             .and_then(Value::as_u64)
@@ -151,6 +283,7 @@ impl Server {
 
         Ok(json!({
             "plan": plan_to_json(&plan),
+            "keep": organize::remote_keep::keep_summary(&self.db()?, id),
             "ops_total": ops_total,
             "ops_offset": ops_offset,
             "ops_limit": ops_limit,
@@ -191,10 +324,21 @@ impl Server {
         }))
     }
 
+    pub(super) fn request_undo(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
+        let (device_id, request_id) = peer_request(args, auth)?.ok_or("request_id が要ります")?;
+        let id = organize::request_peer_restore(&self.db()?, device_id, request_id)?;
+        Ok(json!({"id": id, "restore_requested": true}))
+    }
+
     /// 実行済みの計画を逆の順で取り消す（許可は要らない、上書きしない）。
     pub(super) fn undo(&self, args: &Value) -> Result<Value, String> {
         let id = require_plan_id(args)?;
         let mut db = self.db()?;
+        if organize::peer_managed_plan(&db, id).map_err(err)? {
+            return Err(
+                "この計画の復元は対象端末の Lisa またはローカル CLI で確認してください".into(),
+            );
+        }
         let ctx = self.organize_context();
         let report = organize::undo_plan(&mut db, &ctx, id)?;
         for folder in &report.touched_folders {
@@ -209,6 +353,20 @@ impl Server {
     }
 }
 
+fn peer_request<'a>(args: &Value, auth: &'a Auth) -> Result<Option<(&'a str, uuid::Uuid)>, String> {
+    let Some(value) = args.get("request_id") else {
+        return Ok(None);
+    };
+    let Auth::Peer { device_id, .. } = auth else {
+        return Err("依頼 ID はペアリング済みの端末からだけ使えます".into());
+    };
+    let id = value
+        .as_str()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .ok_or("request_id は UUID で指定してください")?;
+    Ok(Some((device_id, id)))
+}
+
 fn require_plan_id(args: &Value) -> Result<i64, String> {
     args.get("id")
         .and_then(Value::as_i64)
@@ -218,6 +376,7 @@ fn require_plan_id(args: &Value) -> Result<i64, String> {
 fn plan_to_json(p: &Plan) -> Value {
     json!({
         "id": p.id,
+        "restore_requested": p.restore_requested,
         "state": p.state.as_str(),
         "by": p.by,
         "note": p.note,
@@ -437,6 +596,116 @@ mod tests {
         assert_eq!(undone.state, PlanState::Undone);
         assert_eq!(fs::read(&path).unwrap(), b"old");
         assert!(!renamed.exists());
+    }
+
+    #[test]
+    fn peer_request_id_is_durable_and_scoped_to_the_paired_device() {
+        let env = Env::new("peer-request");
+        let kept = env.drive.join("keep.txt");
+        let copy = env.drive.join("copy.txt");
+        for path in [&kept, &copy] {
+            fs::write(path, b"same").unwrap();
+        }
+        env.scan();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let peer = |device_id: &str| Auth::Peer {
+            device_id: device_id.into(),
+            name: "旧PC".into(),
+            remote_ip: None,
+        };
+        let id = json!({"request_id": request_id});
+        let request = json!({
+            "ops": [{"op":"trash", "path":copy, "keep":kept}],
+            "request_id": request_id,
+        });
+        let call = |name, args, auth: &Auth| {
+            env.server
+                .call(&json!({"name":name,"arguments":args}), auth)
+        };
+        let auth = peer("requester");
+        assert_eq!(
+            call("lisa_plan_create", request.clone(), &Auth::Stdio)["isError"],
+            true
+        );
+        let barrier = std::sync::Barrier::new(2);
+        let create = || {
+            barrier.wait();
+            call("lisa_plan_create", request.clone(), &auth)
+        };
+        let (first, retry) = std::thread::scope(|scope| {
+            let first = scope.spawn(create);
+            let retry = create();
+            (first.join().unwrap(), retry)
+        });
+        assert_eq!(first, retry);
+        let plan_id = first["structuredContent"]["id"]
+            .as_i64()
+            .expect("計画ができた");
+        let status = || call("lisa_plan_status", id.clone(), &auth);
+        assert_eq!(status()["structuredContent"]["plan"]["state"], "pending");
+        assert_eq!(
+            call("lisa_plan_status", id.clone(), &peer("other"))["isError"],
+            true
+        );
+        let mut changed = request.clone();
+        changed["note"] = json!("別の依頼");
+        assert_eq!(call("lisa_plan_create", changed, &auth)["isError"], true);
+        assert!(copy.is_file() && kept.is_file());
+
+        let mtime = fs::metadata(&copy).unwrap().modified().unwrap();
+        let mut db = env.server.db().unwrap();
+        assert_eq!(organize::list_plans(&db, None, 10).unwrap().len(), 1);
+        let ctx = env.server.organize_context();
+        organize::approve_plan(&mut db, plan_id, false).unwrap();
+        let result = organize::execute_plan(&mut db, &ctx, plan_id).unwrap();
+        assert_eq!(result.done, 1);
+        assert!(!copy.exists());
+        let saved = organize::plan_ops(&db, plan_id).unwrap();
+        let isolated = saved[0].dst.as_ref().unwrap();
+        assert_eq!(fs::metadata(isolated).unwrap().modified().unwrap(), mtime);
+        drop(db);
+        assert_eq!(status()["structuredContent"]["plan"]["state"], "done");
+        assert_eq!(call("lisa_plan_create", request, &auth), first);
+        let mut db = env.server.db().unwrap();
+        assert!(organize::execute_plan(&mut db, &ctx, plan_id).is_err());
+        assert_eq!(
+            env.call("lisa_undo", json!({"id": plan_id}))["isError"],
+            true
+        );
+        assert_eq!(
+            call("lisa_plan_request_undo", id.clone(), &peer("other"))["isError"],
+            true
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                call("lisa_plan_request_undo", id.clone(), &auth)["structuredContent"]["id"],
+                plan_id
+            );
+        }
+        assert_eq!(
+            status()["structuredContent"]["plan"]["restore_requested"],
+            true
+        );
+        assert!(!copy.exists());
+        fs::write(&copy, b"occupied").unwrap();
+        let undo = organize::undo_plan(&mut db, &ctx, plan_id).unwrap();
+        assert_eq!(undo.skipped.len(), 1);
+        assert_eq!(fs::read(&copy).unwrap(), b"occupied");
+        assert_eq!(fs::read(isolated).unwrap(), b"same");
+        assert_eq!(
+            status()["structuredContent"]["plan"]["restore_requested"],
+            true
+        );
+        fs::remove_file(&copy).unwrap();
+        let restored = organize::undo_plan(&mut db, &ctx, plan_id).unwrap();
+        assert_eq!(restored.undone, 1);
+        assert_eq!(fs::read(&copy).unwrap(), b"same");
+        assert_eq!(fs::metadata(copy).unwrap().modified().unwrap(), mtime);
+        assert_eq!(
+            status()["structuredContent"]["plan"]["restore_requested"],
+            false
+        );
+        assert_eq!(call("lisa_plan_request_undo", id, &auth)["isError"], true);
     }
 
     #[test]
