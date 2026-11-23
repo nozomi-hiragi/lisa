@@ -114,6 +114,8 @@ pub struct FileTree {
     free: Vec<NodeId>,
     /// 木につながっている手元ノードの DB `entry.id` → `NodeId` 索引（`dups`・`catalog`・`resolve_location` 用）。
     by_entry: HashMap<i64, NodeId>,
+    pub(crate) preview_generations: HashMap<PathBuf, u64>,
+    pub(crate) preview_revision: u64,
 }
 
 impl FileTree {
@@ -124,6 +126,8 @@ impl FileTree {
             nodes: Vec::new(),
             free: Vec::new(),
             by_entry: HashMap::new(),
+            preview_generations: HashMap::new(),
+            preview_revision: 0,
         }
     }
 

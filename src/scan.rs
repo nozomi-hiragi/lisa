@@ -52,10 +52,17 @@ impl Plugin for ScanPlugin {
             warn!("クラウドのファイルをダウンロードしない設定にできませんでした: {error}");
         }
         info!("ドライブを調べています");
-        let drives = lisa_core::volumes::list().unwrap_or_else(|error| {
+        let mut drives = lisa_core::volumes::list().unwrap_or_else(|error| {
             warn!("ドライブの一覧が取れませんでした: {error}");
             vec![root_volume()]
         });
+        // 描画の検証で、使い捨てのボリュームだけを読む。
+        if crate::remote::debug_remote_enabled()
+            && let Some(mounts) = std::env::var_os("LISA_DEBUG_SCAN_MOUNTS")
+        {
+            let mounts: HashSet<_> = std::env::split_paths(&mounts).collect();
+            drives.retain(|drive| mounts.contains(&drive.mount_path));
+        }
         info!(
             "ドライブ: {}",
             drives
@@ -686,6 +693,11 @@ impl Scanner {
     }
 }
 
+/// 変更したフォルダから、その内容を映す祖先をドライブまでたどる。
+fn preview_ancestors<'a>(path: &'a Path, mount: &'a Path) -> impl Iterator<Item = &'a Path> {
+    path.ancestors().take_while(move |p| p.starts_with(mount))
+}
+
 /// 届いた結果を受け取る。DB に書いたものは、木にあれば「読み終えた」にするだけ（子は見えるところに
 /// 来たら出す）。DB に書いていないものは、そのまま木に足す。
 ///
@@ -697,7 +709,11 @@ fn receive(
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
     nav: Res<crate::view::Nav>,
-    (location, store): (Res<crate::view::Location>, Res<Store>),
+    (location, store, cache): (
+        Res<crate::view::Location>,
+        Res<Store>,
+        Res<crate::render::cache::ImageCache>,
+    ),
     layouts: Res<Layouts>,
     mut sync: ResMut<crate::view::SyncRequest>,
     animating: Option<Res<crate::view::Animating>>,
@@ -720,6 +736,7 @@ fn receive(
         .collect();
     let mut any = false;
     let mut structure_reset = false;
+    let mut invalidated = HashSet::new();
     for message in messages {
         match message {
             Message::Committed => {
@@ -743,6 +760,15 @@ fn receive(
                 scanner.hashed.insert(path);
             }
             Message::Changed { path } => {
+                if let Some(mount) = store
+                    .roots
+                    .values()
+                    .map(|(_, p)| p)
+                    .filter(|mount| path.starts_with(mount))
+                    .max_by_key(|mount| mount.components().count())
+                {
+                    invalidated.extend(preview_ancestors(&path, mount).map(Path::to_path_buf));
+                }
                 // 木にあれば、子を外して出し直す（このあと届く `Listed` から）。ハッシュができるまで古い。
                 if let Some(&id) = scanner.folders.get(&path)
                     && tree.is_attached(id)
@@ -784,6 +810,15 @@ fn receive(
                 }
                 scanner.recent.insert(path, result);
             }
+        }
+    }
+    if !invalidated.is_empty() {
+        debug!("サムネを無効化したフォルダ: {} 個", invalidated.len());
+        tree.preview_revision += 1;
+        let generation = tree.preview_revision;
+        for path in invalidated {
+            cache.invalidate_local(&path);
+            tree.preview_generations.insert(path, generation);
         }
     }
     if structure_reset {
@@ -1059,6 +1094,20 @@ pub(crate) fn stored_item(store: &Store, path: &Path) -> Option<lisa_core::query
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_invalidation_stops_at_each_drive_and_excludes_siblings() {
+        let base = std::env::temp_dir();
+        let a = base.join("drive-a");
+        let b = base.join("drive-b");
+        let from = a.join("parent/from");
+        let to = b.join("to");
+        let affected: HashSet<_> = preview_ancestors(&from, &a)
+            .chain(preview_ancestors(&to, &b))
+            .map(Path::to_path_buf)
+            .collect();
+        assert_eq!(affected, HashSet::from([from, a.join("parent"), a, to, b]));
+    }
 
     #[test]
     fn rename_location_waits_for_descendant_and_resolves_raw_name() {
