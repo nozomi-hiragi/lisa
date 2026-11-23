@@ -9,6 +9,7 @@ mod apply;
 mod check;
 mod plan;
 mod quarantine;
+pub mod remote_keep;
 
 use std::path::PathBuf;
 
@@ -20,9 +21,10 @@ pub use apply::{
 };
 pub use plan::{
     CheckStatus, CreateResult, OpCheck, OpInput, OpKind, OpState, Plan, PlanOp, PlanState,
-    PlanSummary, approve_plan, can_dismiss_history, cancel_plan, create_plan, dismiss_history,
-    expire_stale_plans, expire_stale_plans_at, get_plan, list_history, list_plans, plan_ops,
-    reject_plan,
+    PlanSummary, approve_plan, approve_plan_with_context, can_dismiss_history, cancel_plan,
+    create_peer_plan, create_plan, create_remote_keep_plan, dismiss_history, expire_stale_plans,
+    expire_stale_plans_at, get_plan, list_history, list_plans, peer_managed_plan, peer_plan_id,
+    plan_ops, reject_plan, request_peer_restore,
 };
 pub use quarantine::{
     MANIFEST_FILE, Manifest, ManifestEntry, PurgeReport, choose_quarantine_base, purge_expired,
@@ -47,6 +49,7 @@ pub struct Context {
     pub catalogs: CatalogSet,
     /// 守る場所の判定で使うホームディレクトリ（`None` なら環境変数 `HOME` / `USERPROFILE`）。
     pub home_dir: Option<PathBuf>,
+    pub keep_client: Option<remote_keep::relay::Client>,
 }
 
 impl Context {
@@ -55,6 +58,7 @@ impl Context {
             data_dir,
             catalogs,
             home_dir: None,
+            keep_client: None,
         }
     }
 
@@ -1150,7 +1154,10 @@ mod tests {
         assert_eq!(saved_plan.state, PlanState::Undone);
         let saved_op = plan::plan_ops(&mut h.db, id).unwrap().remove(0);
         assert_eq!(saved_op.state, OpState::Skipped);
-        assert_eq!(saved_op.reason.as_deref(), Some(undo.skipped[0].reason.as_str()));
+        assert_eq!(
+            saved_op.reason.as_deref(),
+            Some(undo.skipped[0].reason.as_str())
+        );
         assert_eq!(fs::read(&a).unwrap(), b"blocker");
         assert_eq!(fs::read(&b).unwrap(), b"first");
     }
@@ -1380,6 +1387,41 @@ mod tests {
         let undo = undo_plan(&mut h.db, &h.ctx, p3).unwrap();
         assert_eq!(undo.undone, 0);
         assert_eq!(undo.skipped.len(), 1);
+    }
+
+    #[test]
+    fn changed_keep_hash_after_approval_blocks_file_quarantine() {
+        let mut h = Harness::new("changed-keep");
+        let keep = h.drive.join("keep.txt");
+        let copy = h.drive.join("copy.txt");
+        for path in [&keep, &copy] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        let created = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "cli",
+            None,
+            &[OpInput::Trash {
+                path: copy.clone(),
+                keep: Some(keep.clone()),
+            }],
+            false,
+        )
+        .unwrap();
+        let id = created.id.unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        fs::write(&keep, b"else").unwrap();
+        let report = execute_plan(&mut h.db, &h.ctx, id).unwrap();
+        assert_eq!(report.done, 0);
+        assert_eq!(fs::read(&copy).unwrap(), b"same");
+        let op = plan_ops(&h.db, id).unwrap().remove(0);
+        assert_eq!(op.state, OpState::Skipped);
+        assert_eq!(
+            op.reason.as_deref(),
+            Some("残すファイルの中身が変わっています")
+        );
     }
 
     #[test]

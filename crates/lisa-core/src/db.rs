@@ -122,6 +122,39 @@ CREATE TABLE IF NOT EXISTS plan (
     purged_at   INTEGER            -- 隔離から OS のゴミ箱へ送った時刻
 );
 CREATE INDEX IF NOT EXISTS plan_state ON plan(state, id);
+CREATE TABLE IF NOT EXISTS peer_plan_request (
+    device_id    TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
+    payload_hash BLOB NOT NULL,
+    plan_id      INTEGER NOT NULL REFERENCES plan(id),
+    response     TEXT NOT NULL,
+    PRIMARY KEY (device_id, request_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS peer_plan_request_plan ON peer_plan_request(plan_id);
+CREATE TABLE IF NOT EXISTS peer_restore_request (
+    plan_id      INTEGER PRIMARY KEY REFERENCES peer_plan_request(plan_id),
+    requested_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS remote_keep_plan (
+    plan_id INTEGER PRIMARY KEY REFERENCES plan(id),
+    intent  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS keep_relay_grant (
+    target_device TEXT NOT NULL,
+    request_id    TEXT NOT NULL,
+    secret_hash   BLOB NOT NULL,
+    keep          TEXT NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    counter       INTEGER NOT NULL,
+    lease         TEXT,
+    revoked       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (target_device, request_id)
+);
+CREATE TABLE IF NOT EXISTS keep_reservation (
+    token      TEXT PRIMARY KEY,
+    path       TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dismissed_plan (
     plan_id INTEGER PRIMARY KEY REFERENCES plan(id) ON DELETE CASCADE
 );
@@ -213,6 +246,7 @@ pub enum ListingSave {
 }
 
 pub struct Db {
+    pub(crate) instance: uuid::Uuid,
     conn: Connection,
     /// フォルダのパスから `entry.id` を引く（読んだフォルダの子のフォルダを覚えておく）。
     folders: HashMap<PathBuf, i64>,
@@ -251,6 +285,7 @@ impl Db {
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Self {
+            instance: uuid::Uuid::new_v4(),
             conn,
             folders: HashMap::new(),
             folders_version: None,

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,36 @@ use super::plan::{self, OpKind, OpState, PlanOp, PlanState};
 use super::quarantine;
 
 /// 同じプロセスで始まった計画は先行する計画の完了を待つ。
-static RUN_LOCK: Mutex<()> = Mutex::new(());
+static RUN_LOCK: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+static RUN_READY: Condvar = Condvar::new();
+
+struct ProcessLock(PathBuf);
+
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        RUN_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.0);
+        RUN_READY.notify_all();
+    }
+}
+
+fn process_lock(data_dir: &Path, wait: bool) -> Result<ProcessLock, String> {
+    fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
+    let path = data_dir.canonicalize().map_err(|error| error.to_string())?;
+    let mut running = RUN_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    while running.contains(&path) {
+        if !wait {
+            return Err("別の整理が実行中です。重複を再取得して確認してください".into());
+        }
+        running = RUN_READY
+            .wait(running)
+            .unwrap_or_else(|error| error.into_inner());
+    }
+    running.insert(path.clone());
+    Ok(ProcessLock(path))
+}
 
 /// ロックファイルの名前（`<data_dir>/organize.lock`）。
 const LOCK_FILE: &str = "organize.lock";
@@ -61,16 +90,27 @@ pub struct UndoReport {
     pub touched_folders: Vec<PathBuf>,
 }
 
-struct PlanLock {
+pub(super) struct PlanLock {
     // プロセス内の次の操作を起こす前に、OS ロックを解放する。
     _file: File,
-    _process: MutexGuard<'static, ()>,
+    _process: ProcessLock,
 }
 
 /// ファイルを閉じるかプロセスが終了すると OS が解放する。
 /// 待っているプロセスが別の inode を開かないよう、ロックファイルは残す。
-fn lock_plans(data_dir: &Path, plan_id: i64) -> Result<PlanLock, String> {
-    let process = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+pub(super) fn lock_plans(data_dir: &Path, plan_id: i64) -> Result<PlanLock, String> {
+    lock_plans_with(data_dir, plan_id, process_lock(data_dir, true)?)
+}
+
+pub(super) fn try_lock_plans(data_dir: &Path) -> Result<PlanLock, String> {
+    lock_plans_with(data_dir, 0, process_lock(data_dir, false)?)
+}
+
+fn lock_plans_with(
+    data_dir: &Path,
+    plan_id: i64,
+    process: ProcessLock,
+) -> Result<PlanLock, String> {
     let open_error = |error| format!("整理のロックを開けません: {error}");
     fs::create_dir_all(data_dir).map_err(open_error)?;
     let file = File::options()
@@ -113,6 +153,33 @@ pub fn recover_running_plans(db: &mut Db, ctx: &Context) -> Result<Vec<ApplyRepo
 
 /// 許可済み（`approved`）または途中で落ちた（`running`）計画を順に実行する。
 pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyReport, String> {
+    use super::remote_keep::{self, relay::RelayAction};
+    let remote = remote_keep::remote_plan(db, plan_id)?;
+    let _attempt = remote
+        .as_ref()
+        .map(|_| remote_keep::lock_attempt(&ctx.data_dir, plan_id))
+        .transpose()?;
+    let mut recovering_remote = false;
+    if remote.is_some() {
+        let plan = plan::load_plan_required(db, plan_id)?;
+        if !matches!(plan.state, PlanState::Approved | PlanState::Running) {
+            return Err("この端末間計画は実行できる状態ではありません".into());
+        }
+        recovering_remote = plan.state == PlanState::Running;
+    }
+    // 保持側と隔離側のロックの取得順を端末 ID で統一する。
+    let reserve_first = remote
+        .as_ref()
+        .is_some_and(|intent| intent.keep.device_id < intent.route.target_device);
+    let mut lease = None;
+    let mut remote_failure = None;
+    if reserve_first && let Some(intent) = &remote {
+        match reserve_remote(db, ctx, plan_id, intent) {
+            Ok(held) => lease = Some(held),
+            Err(error) if recovering_remote => remote_failure = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
     let _lock = lock_plans(&ctx.data_dir, plan_id)?;
 
     let plan = plan::load_plan_required(db, plan_id)?;
@@ -132,6 +199,22 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
         ));
     }
 
+    let candidates = plan::plan_ops(db, plan_id).map_err(|e| e.to_string())?;
+    super::remote_keep::check_overlap(
+        db.conn(),
+        candidates
+            .iter()
+            .flat_map(|op| std::iter::once(op.src.as_path()).chain(op.dst.as_deref())),
+    )?;
+
+    if !reserve_first && let Some(intent) = &remote {
+        match reserve_remote(db, ctx, plan_id, intent) {
+            Ok(held) => lease = Some(held),
+            Err(error) if recovering_remote => remote_failure = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    let _lease = lease;
     if plan.state == PlanState::Approved {
         plan::set_plan_state(db, plan_id, PlanState::Running, None).map_err(|e| e.to_string())?;
     }
@@ -147,6 +230,19 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
 
     for op in &ops {
         if op.state != OpState::Pending {
+            continue;
+        }
+        if let Some(reason) = &remote_failure {
+            plan::set_op_state(
+                db,
+                plan_id,
+                op.seq,
+                OpState::Skipped,
+                None,
+                Some(reason),
+                Some(db::now_ms()),
+            )
+            .map_err(|e| e.to_string())?;
             continue;
         }
         if plan.skip_risky && op.risky.is_some() {
@@ -165,6 +261,9 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
 
         // 実行の直前にもう一度確かめる。合わなければ skipped にして先へ進む。
         if let Err(reason) = check::recheck_op_before_apply(db, ctx, op) {
+            if remote.is_some() {
+                remote_failure = Some(format!("{reason}。重複を再取得して確認してください"));
+            }
             plan::set_op_state(
                 db,
                 plan_id,
@@ -201,7 +300,37 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
         plan::set_op_state(db, plan_id, op.seq, OpState::Running, None, None, None)
             .map_err(|e| e.to_string())?;
 
-        match run_one_op(plan_id, op, drive_mount.as_deref(), &ctx.data_dir) {
+        let result = if let Some(intent) = &remote {
+            let source = usize::try_from(op.seq)
+                .ok()
+                .and_then(|index| intent.sources.get(index));
+            let result = source
+                .ok_or("隔離対象の記録が見つかりません".to_string())
+                .and_then(|source| {
+                    remote_keep::isolate_source(db, ctx, op, source, || {
+                        remote_keep::call(ctx, intent, RelayAction::Renew)
+                    })
+                })
+                .map(|path| OpExecOutcome::Done {
+                    exact_dst: Some(path),
+                    warning: None,
+                });
+            if let Err(error) = &result {
+                remote_failure = Some(format!("{error}。重複を再取得して確認してください"));
+            }
+            result
+        } else {
+            run_one_op(plan_id, op, drive_mount.as_deref(), &ctx.data_dir)
+        };
+        #[cfg(all(unix, feature = "verify-remote-keep"))]
+        if remote.is_some()
+            && matches!(result, Ok(OpExecOutcome::Done { .. }))
+            && std::env::var("LISA_VERIFY_KEEP_CRASH_AFTER_RENAME").as_deref() == Ok("1")
+        {
+            // 合成ケースで物理操作と状態確定のあいだにプロセスを終了する。
+            std::process::exit(71);
+        }
+        match result {
             Ok(OpExecOutcome::Done { exact_dst, warning }) => {
                 if op.op == OpKind::Mkdir {
                     plan::set_op_result_exact_dst(
@@ -283,6 +412,24 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
         failed,
         touched_folders: touched,
     })
+}
+
+fn reserve_remote<'a>(
+    db: &mut Db,
+    ctx: &'a Context,
+    plan_id: i64,
+    intent: &'a super::remote_keep::RemotePlan,
+) -> Result<super::remote_keep::ActiveLease<'a>, String> {
+    match super::remote_keep::ActiveLease::acquire(ctx, intent) {
+        Ok(lease) => Ok(lease),
+        Err(error) => {
+            db.conn().execute(
+                "UPDATE plan SET state = 'pending', decided_at = NULL WHERE id = ?1 AND state = 'approved'",
+                [plan_id],
+            ).map_err(|e| format!("{error} / 許可状態を確認できませんでした: {e}"))?;
+            Err(error)
+        }
+    }
 }
 
 enum OpExecOutcome {
@@ -586,7 +733,14 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
         ));
     }
 
+    let peer_managed = plan::peer_managed_plan(db, plan_id).map_err(|e| e.to_string())?;
     let mut ops = plan::plan_ops(db, plan_id).map_err(|e| e.to_string())?;
+    super::remote_keep::check_overlap(
+        db.conn(),
+        ops.iter()
+            .filter(|op| op.state == OpState::Done)
+            .flat_map(|op| std::iter::once(op.src.as_path()).chain(op.dst.as_deref())),
+    )?;
     // 実行の逆の順: (phase, seq) の降順。
     ops.sort_by_key(|a| std::cmp::Reverse((a.op.phase(), a.seq)));
 
@@ -595,9 +749,14 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
     let mut undone_ops = Vec::new();
 
     for op in ops.into_iter().filter(|o| o.state == OpState::Done) {
+        let retryable = peer_managed && op.op == OpKind::Trash && plan.purged_at.is_none();
         match undo_one_op(&plan, &op) {
             Ok(warning) => {
-                let reason = join_reasons(op.reason.as_deref(), warning);
+                let reason = if retryable {
+                    warning
+                } else {
+                    join_reasons(op.reason.as_deref(), warning)
+                };
                 plan::set_op_state(
                     db,
                     plan_id,
@@ -614,12 +773,21 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
                 undone_ops.push(marked);
             }
             Err(reason) => {
-                let reason = append_reason(reason, op.reason.as_deref());
+                let reason = if retryable {
+                    reason
+                } else {
+                    append_reason(reason, op.reason.as_deref())
+                };
+                let state = if retryable {
+                    OpState::Done
+                } else {
+                    OpState::Skipped
+                };
                 plan::set_op_state(
                     db,
                     plan_id,
                     op.seq,
-                    OpState::Skipped,
+                    state,
                     None,
                     Some(&reason),
                     Some(db::now_ms()),
@@ -679,7 +847,8 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<Option<String>, String>
             if !parent.is_dir() {
                 return Err("戻す先の親フォルダがありません".into());
             }
-            fs::rename(q_path, &op.src).map_err(|e| format!("隔離から戻せませんでした: {e}"))?;
+            rename_without_replace(q_path, &op.src)
+                .map_err(|e| format!("隔離から戻せませんでした: {e}"))?;
             Ok(None)
         }
         OpKind::Move => {
@@ -834,7 +1003,7 @@ fn shallowest_missing_dir(path: &Path) -> Option<PathBuf> {
 
 // 事前確認のあとに別プロセスが同名項目を作っても、上書きせずに失敗する。
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
+pub(super) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::{CString, c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
 
@@ -882,7 +1051,7 @@ fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
+pub(super) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileW;
 
@@ -917,7 +1086,7 @@ fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn rename_without_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
+pub(super) fn rename_without_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 

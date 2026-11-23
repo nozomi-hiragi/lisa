@@ -488,6 +488,7 @@ pub(crate) fn purge_plan_with(
     now_ms: i64,
     mut delete_fn: impl FnMut(&Path) -> Result<(), String>,
 ) -> Result<PurgeReport, String> {
+    let _lock = super::apply::lock_plans(data_dir, plan_id)?;
     let plan = plan::load_plan_required(db, plan_id)?;
     if !matches!(
         plan.state,

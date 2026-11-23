@@ -6,7 +6,7 @@
 //! - 大きさ 0 のもの、クラウドにだけあるもの、ハッシュの無いものは除く。
 //! - 組は、空く大きさ（大きさ ×（数 − 1））の大きい順。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use rusqlite::Connection;
@@ -14,6 +14,9 @@ use rusqlite::Connection;
 use crate::db::{Db, Result};
 use crate::hash::Hash;
 use crate::listing::Kind;
+
+mod comparison;
+pub use comparison::*;
 
 /// 組の中の 1 か所。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -73,6 +76,9 @@ pub fn signature(db: &Db) -> Result<Option<Signature>> {
     Ok(Some(signature))
 }
 
+/// 除外規則が変わったら以前の一覧を読み込まない。
+pub const CACHE_FILE: &str = "duplicates-v2.json";
+
 /// キャッシュに残す一覧と、そのときの DB の状態。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Cached {
@@ -84,6 +90,21 @@ pub struct Cached {
 struct Shape {
     parent: Vec<i64>,
     total: Vec<u64>,
+    excluded: Vec<bool>,
+}
+
+/// ボリューム直下で OS が管理するフォルダ。
+fn is_volume_metadata(name: &str) -> bool {
+    [
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".DocumentRevisions-V100",
+        ".Trashes",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 impl Shape {
@@ -93,15 +114,25 @@ impl Shape {
         let n = max as usize + 1;
         let mut parent = vec![0i64; n];
         let mut total = vec![0u64; n];
+        let mut excluded = vec![false; n];
         let mut statement =
-            conn.prepare("SELECT id, parent_id, kind, size, cloud_only FROM entry")?;
+            conn.prepare("SELECT id, parent_id, kind, size, name_nfc, cloud_only, other_volume FROM entry ORDER BY id")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
             parent[id as usize] = row.get::<_, Option<i64>>(1)?.unwrap_or(0);
+            let index = id as usize;
+            let p = parent[index] as usize;
+            let name: String = row.get(4)?;
             let kind: String = row.get(2)?;
-            if kind == "file" {
-                total[id as usize] = row.get::<_, i64>(3)? as u64;
+            excluded[index] = excluded[p]
+                || row.get::<_, bool>(5)?
+                || row.get::<_, bool>(6)?
+                || crate::name::is_os_junk(name.as_ref())
+                || crate::name::is_quarantine_dir(name.as_ref())
+                || (p != 0 && parent[p] == 0 && kind == "dir" && is_volume_metadata(&name));
+            if !excluded[index] && kind == "file" {
+                total[index] = row.get::<_, i64>(3)? as u64;
             }
         }
         // 子は親より後に書くので、番号の大きいほうから親へ足し上げればよい。
@@ -111,7 +142,11 @@ impl Shape {
                 total[p] += total[id];
             }
         }
-        Ok(Self { parent, total })
+        Ok(Self {
+            parent,
+            total,
+            excluded,
+        })
     }
 
     /// `id` の祖先（自分は入れない）に `marked` のものがあるか。
@@ -144,13 +179,13 @@ type Found = (Kind, Vec<u8>, u64, Vec<Vec<i64>>);
 /// 実体の見分け（ドライブ、ファイル ID）。
 type Physical = (String, Option<i64>);
 
+const FILE_HASH_INDEX: &str = "CREATE INDEX IF NOT EXISTS entry_hash ON entry(hash)
+    WHERE hash IS NOT NULL AND kind = 'file'";
+
 /// 重複の組を、空く大きさの順に `limit` 個まで。全部の行を一度読むので、大きな DB では数十秒かかる。
 pub fn groups(db: &Db, limit: usize) -> Result<Vec<Group>> {
     let conn = db.conn();
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS entry_hash ON entry(hash)
-             WHERE hash IS NOT NULL AND kind = 'file'",
-    )?;
+    conn.execute_batch(FILE_HASH_INDEX)?;
     let shape = Shape::load(conn)?;
 
     // まず、中身が同じフォルダ。
@@ -160,7 +195,10 @@ pub fn groups(db: &Db, limit: usize) -> Result<Vec<Group>> {
             conn.prepare("SELECT hash, id FROM entry WHERE kind = 'dir' AND hash IS NOT NULL")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
-            folders.entry(row.get(0)?).or_default().push(row.get(1)?);
+            let id: i64 = row.get(1)?;
+            if !shape.excluded[id as usize] && shape.total[id as usize] > 0 {
+                folders.entry(row.get(0)?).or_default().push(id);
+            }
         }
     }
     folders.retain(|_, ids| ids.len() > 1 && shape.total[ids[0] as usize] > 0);
@@ -213,7 +251,7 @@ pub fn groups(db: &Db, limit: usize) -> Result<Vec<Group>> {
                 flush(&current, &mut physical);
                 current = Some((hash, row.get::<_, i64>(4)? as u64));
             }
-            if shape.has_marked_ancestor(id, &in_dup_folder) {
+            if shape.excluded[id as usize] || shape.has_marked_ancestor(id, &in_dup_folder) {
                 continue;
             }
             let key = (row.get::<_, String>(2)?, row.get::<_, Option<i64>>(3)?);
