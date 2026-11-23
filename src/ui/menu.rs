@@ -333,7 +333,7 @@ fn show_popup(popup: Res<Popup>, mut backdrop: Single<&mut Node, With<Backdrop>>
     };
 }
 
-fn menu_button() -> (Node, BackgroundColor) {
+pub(super) fn menu_button() -> (Node, BackgroundColor) {
     (
         Node {
             padding: UiRect::axes(Val::Px(10.0), Val::Px(3.0)),

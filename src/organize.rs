@@ -62,6 +62,8 @@ pub struct PendingPlan {
     pub ops: Vec<PlanOp>,
     /// 対象の `entry.id` の道のり（「場所を見る」用）。
     pub chains: Vec<Vec<i64>>,
+    /// 遠隔の残す側がある計画の、残す側の要約。
+    pub keep: Option<organize::remote_keep::KeepSummary>,
 }
 
 /// 履歴パネルで開いている計画の詳細。
@@ -71,11 +73,13 @@ pub struct PlanDetails {
     pub ops: Vec<PlanOp>,
     /// 各操作に対応する `entry.id` の道のり（あれば）。
     pub chains: Vec<Option<Vec<i64>>>,
+    pub keep: Option<organize::remote_keep::KeepSummary>,
 }
 
 /// 履歴パネルで確認する操作。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HistoryConfirmation {
+    Undo(i64),
     PurgePlan(i64),
     PurgeAll,
     Dismiss(i64),
@@ -163,6 +167,7 @@ impl OrganizeState {
         }
         self.history_confirmation = None;
         match confirmation {
+            HistoryConfirmation::Undo(id) => self.undo(id),
             HistoryConfirmation::PurgePlan(id) => self.purge_plan(id),
             HistoryConfirmation::PurgeAll => self.purge_all(),
             HistoryConfirmation::Dismiss(id) => {
@@ -311,6 +316,7 @@ pub(crate) fn receive_events(
         ResMut<Location>,
     ),
     mut previews: Option<ResMut<crate::preview::PreviewRegistry>>,
+    mut dups: ResMut<crate::dups::Dups>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     let events: Vec<Event> = match &state.receiver {
@@ -365,6 +371,8 @@ pub(crate) fn receive_events(
                 }
             }
             Event::Touched(folders) => {
+                dups.invalidate();
+                dups.refresh_after_scan = true;
                 if let Some(control) = &control {
                     for folder in folders {
                         control.visible(folder.clone());
@@ -412,7 +420,7 @@ pub(crate) fn receive_events(
 }
 
 /// 変化検知用の軽い指紋（変化が無いときは UI へ送らない）。
-type Fingerprint = (Vec<(i64, PlanState, Option<i64>, bool)>, Vec<i64>);
+type Fingerprint = (Vec<(i64, PlanState, Option<i64>, bool, bool)>, Vec<i64>);
 
 fn run_worker(
     rx: Receiver<Action>,
@@ -486,7 +494,7 @@ fn run_worker(
                 match action {
                     Action::Dismiss { .. } => unreachable!(),
                     Action::Approve { id, skip_risky } => {
-                        match organize::approve_plan(&mut db, id, skip_risky)
+                        match organize::approve_plan_with_context(&mut db, &ctx, id, skip_risky)
                             .and_then(|_| organize::execute_plan(&mut db, &ctx, id))
                         {
                             Ok(report) => {
@@ -526,7 +534,10 @@ fn run_worker(
                                     send(Event::Touched(report.touched_folders));
                                 }
                                 let notice = if report.skipped.is_empty() {
-                                    format!("計画 #{id} を取り消しました（戻した {}）", report.undone)
+                                    format!(
+                                        "計画 #{id} を取り消しました（戻した {}）",
+                                        report.undone
+                                    )
                                 } else {
                                     format!(
                                         "計画 #{id} の取り消し結果（戻した {} / 飛ばした {}: {}）",
@@ -912,7 +923,15 @@ fn poll_db(
     let fp: Fingerprint = (
         history
             .iter()
-            .map(|p| (p.id, p.state, p.purged_at, dismissible.contains(&p.id)))
+            .map(|p| {
+                (
+                    p.id,
+                    p.state,
+                    p.purged_at,
+                    p.restore_requested,
+                    dismissible.contains(&p.id),
+                )
+            })
             .collect(),
         pending_rows.iter().map(|p| p.id).collect(),
     );
@@ -925,7 +944,13 @@ fn poll_db(
     for plan in pending_rows {
         let ops = organize::plan_ops(&db, plan.id).unwrap_or_default();
         let chains = resolve_op_chains(&db, &ops);
-        pending.push(PendingPlan { plan, ops, chains });
+        let keep = organize::remote_keep::keep_summary(&db, plan.id);
+        pending.push(PendingPlan {
+            plan,
+            ops,
+            chains,
+            keep,
+        });
     }
 
     if !send(Event::Snapshot {
@@ -954,6 +979,7 @@ fn load_details(db: &Db, plan_id: i64) -> Option<PlanDetails> {
         plan_id,
         ops,
         chains,
+        keep: organize::remote_keep::keep_summary(db, plan_id),
     })
 }
 
@@ -985,7 +1011,8 @@ fn open_env() -> Option<(Db, Context, Option<PathBuf>)> {
     }
     let db = Db::open(&db_path).ok()?;
     let settings = crate::settings::settings_path();
-    let ctx = Context::load(data_dir, settings.as_deref());
+    let mut ctx = Context::load(data_dir, settings.as_deref());
+    ctx.keep_client = Some(lisa_mcp::relay_client);
     Some((db, ctx, settings))
 }
 

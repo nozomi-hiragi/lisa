@@ -805,7 +805,11 @@ fn describe_rows(
     full: bool,
 ) -> Vec<Row> {
     let name_or_path = |value: &str, max| {
-        if full { value.to_owned() } else { shorten_middle(value, max) }
+        if full {
+            value.to_owned()
+        } else {
+            shorten_middle(value, max)
+        }
     };
     let date = |ms| {
         let minute = format_local(ms);
@@ -817,13 +821,22 @@ fn describe_rows(
         }
     };
     let node = &tree.nodes[id];
-    let path = if full { local_item_path(tree, store, id) } else { local_path(tree, id) };
+    let path = if full {
+        local_item_path(tree, store, id)
+    } else {
+        local_path(tree, id)
+    };
     let name = match path.as_deref().and_then(Path::file_name) {
         Some(name) if full && node.depth > 2 => name.to_string_lossy(),
         _ => node.name.as_str().into(),
     };
-    let mut rows = vec![row(if full { "名前" } else { "" }, name_or_path(&name, MAX_NAME_CHARS))];
-    let meta = path.as_deref().and_then(|p| std::fs::symlink_metadata(p).ok().map(|m| (p, m)));
+    let mut rows = vec![row(
+        if full { "名前" } else { "" },
+        name_or_path(&name, MAX_NAME_CHARS),
+    )];
+    let meta = path
+        .as_deref()
+        .and_then(|p| std::fs::symlink_metadata(p).ok().map(|m| (p, m)));
 
     let kind = match node.depth {
         1 => "端末".to_string(),
@@ -924,12 +937,17 @@ pub(super) fn folder_rows(total: Option<FolderTotalDisplay>, loaded_bytes: u64) 
 }
 
 /// ディスク操作には短縮・正規化された表示名ではなく、DB に記録した実パスを使う。
-pub(crate) fn local_item_path(tree: &FileTree, store: Option<&Store>, id: NodeId) -> Option<PathBuf> {
+pub(crate) fn local_item_path(
+    tree: &FileTree,
+    store: Option<&Store>,
+    id: NodeId,
+) -> Option<PathBuf> {
     let node = &tree.nodes[id];
     if node.remote.is_some() {
         return None;
     }
-    node.path.clone()
+    node.path
+        .clone()
         .or_else(|| store?.stored_path(node.entry?))
         .or_else(|| local_path(tree, id))
 }
@@ -1054,7 +1072,7 @@ fn group_digits(n: u64) -> String {
 }
 
 /// UTC の Unix 時刻（ミリ秒）を、この PC の時刻で「2026-11-18 23:45」の形にする。
-fn format_local(ms: i64) -> String {
+pub(super) fn format_local(ms: i64) -> String {
     format_with_offset(ms, local_offset_secs())
 }
 

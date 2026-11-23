@@ -10,12 +10,15 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, channel};
 
-use bevy::camera::visibility::RenderLayers;
+use bevy::camera::{RenderTarget, visibility::RenderLayers};
 use bevy::ecs::system::SystemParam;
 use bevy::input::gestures::PinchGesture;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
+use bevy::picking::pointer::{
+    Location as PointerLocation, PointerAction, PointerButton, PointerId, PointerInput,
+};
 use bevy::prelude::*;
-use bevy::window::{PrimaryWindow, RequestRedraw};
+use bevy::window::{PrimaryWindow, RequestRedraw, WindowRef};
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
 use lisa_core::remote::{
     self, Command, DebugSceneInfo, DebugState, DebugTileRect, Incoming, Reply, State,
@@ -70,6 +73,7 @@ type DebugSceneItem = (
 /// 検証用コマンドで参照する描画・入力まわりのリソース群。
 #[derive(SystemParam)]
 struct DebugContext<'w, 's> {
+    window_entity: Single<'w, 's, Entity, With<PrimaryWindow>>,
     window: Single<'w, 's, &'static Window, With<PrimaryWindow>>,
     camera: Single<'w, 's, DebugCameraItem, With<MainCamera>>,
     layouts: Res<'w, Layouts>,
@@ -88,6 +92,17 @@ struct DebugContext<'w, 's> {
     sync_request: Res<'w, SyncRequest>,
     pinch_writer: MessageWriter<'w, PinchGesture>,
     wheel_writer: MessageWriter<'w, MouseWheel>,
+    ui_text: Query<
+        'w,
+        's,
+        (
+            &'static Text,
+            &'static ComputedNode,
+            &'static bevy::ui::UiGlobalTransform,
+            &'static InheritedVisibility,
+        ),
+    >,
+    pointer_writer: MessageWriter<'w, PointerInput>,
 }
 
 /// 届いた頼みを受け取る口と、書いた `control.json` の場所。
@@ -180,11 +195,15 @@ fn handle(
                 dups.open = open;
                 if !open {
                     dups.selected = None;
+                    dups.selection = Default::default();
                 }
                 if let (true, Some(hash)) = (open, select) {
                     // 一覧がまだなら、できてから選ぶ（`select_pending`）。
                     match index_of(&dups, &hash) {
-                        Some(i) => dups.selected = Some(i),
+                        Some(i) => {
+                            dups.selected = Some(i);
+                            dups.selection = Default::default();
+                        }
                         None => commands.insert_resource(PendingSelect(hash)),
                     }
                 }
@@ -225,6 +244,8 @@ fn handle(
             Command::Rescan { path } => match &control {
                 Some(control) if path.is_dir() => {
                     control.visible(path);
+                    dups.invalidate();
+                    dups.refresh_after_scan = true;
                     Ok(())
                 }
                 Some(_) => Err(format!("{} はフォルダではありません", path.display())),
@@ -333,6 +354,38 @@ fn handle(
                             commands.insert_resource(NavRequest::Up);
                             Ok(())
                         }
+                        "ui_move" | "ui_click" | "ui_press" | "ui_release" => {
+                            if let Some([x, y]) = screen_pos
+                                && let Some(target) = RenderTarget::Window(WindowRef::Primary)
+                                    .normalize(Some(*dbg.window_entity))
+                            {
+                                let location = PointerLocation {
+                                    target,
+                                    position: Vec2::new(x, y),
+                                };
+                                let actions: &[PointerAction] = match action.as_str() {
+                                    "ui_move" => &[PointerAction::Move { delta: Vec2::ZERO }],
+                                    "ui_press" => &[PointerAction::Press(PointerButton::Primary)],
+                                    "ui_release" => {
+                                        &[PointerAction::Release(PointerButton::Primary)]
+                                    }
+                                    _ => &[
+                                        PointerAction::Press(PointerButton::Primary),
+                                        PointerAction::Release(PointerButton::Primary),
+                                    ],
+                                };
+                                for &action in actions {
+                                    dbg.pointer_writer.write(PointerInput::new(
+                                        PointerId::Mouse,
+                                        location.clone(),
+                                        action,
+                                    ));
+                                }
+                                Ok(())
+                            } else {
+                                Err(format!("{action} には screen_pos が必要です"))
+                            }
+                        }
                         "click" => match screen_pos {
                             Some([x, y]) => {
                                 let (camera, camera_global, _, _) = *dbg.camera;
@@ -384,7 +437,7 @@ fn select_pending(
     if let Some(i) = index_of(&dups, &pending.0) {
         dups.selected = Some(i);
         commands.remove_resource::<PendingSelect>();
-    } else if matches!(dups.state, DupsState::Ready(_) | DupsState::Failed(_)) {
+    } else if matches!(dups_state(&dups).0, "ready" | "failed") {
         warn!("頼まれた重複の組が一覧にありません");
         commands.remove_resource::<PendingSelect>();
     }
@@ -393,9 +446,43 @@ fn select_pending(
 /// 一覧の中の、ハッシュ（16 進）が `hash` の組の番号。
 fn index_of(dups: &Dups, hash: &str) -> Option<usize> {
     let hash = hash.trim().to_ascii_lowercase();
-    dups.groups()
-        .iter()
-        .position(|g| lisa_core::query::hex(&g.hash) == hash)
+    (0..dups_state(dups).1).find(|&i| dups_hash(dups, i).as_deref() == Some(hash.as_str()))
+}
+
+fn dups_hash(dups: &Dups, index: usize) -> Option<String> {
+    use crate::dups::remote::{Scope, ViewState};
+    if dups.scope == Scope::default() {
+        return dups
+            .groups()
+            .get(index)
+            .map(|g| lisa_core::query::hex(&g.hash));
+    }
+    match &dups.remote {
+        ViewState::Ready(view) => view
+            .groups
+            .get(index)
+            .map(|group| lisa_core::query::hex(&group.key.hash)),
+        _ => None,
+    }
+}
+
+fn dups_state(dups: &Dups) -> (&'static str, usize) {
+    use crate::dups::remote::{Scope, ViewState};
+    if dups.scope == Scope::default() {
+        let phase = match dups.state {
+            DupsState::NotYet => "not_yet",
+            DupsState::Computing { .. } => "computing",
+            DupsState::Ready(_) => "ready",
+            DupsState::Failed(_) => "failed",
+        };
+        return (phase, dups.groups().len());
+    }
+    match &dups.remote {
+        ViewState::Local => ("not_yet", 0),
+        ViewState::Computing(_) => ("computing", 0),
+        ViewState::Ready(view) => ("ready", view.groups.len()),
+        ViewState::Failed(_) => ("failed", 0),
+    }
 }
 
 /// 検証用の 2 本指パン入力を、プラットフォームの本物の入力経路に流す。
@@ -639,6 +726,21 @@ fn collect_debug_state(
         jump_pending: dbg.jump_to.is_some() || dbg.sync_request.mode.is_some(),
         occluded,
         child_tiles,
+        ui_text: dbg
+            .ui_text
+            .iter()
+            .filter_map(|(text, node, position, visible)| {
+                let point = position.translation * node.inverse_scale_factor;
+                (visible.get()
+                    && node.size.x > 0.0
+                    && node.size.y > 0.0
+                    && point.x >= 0.0
+                    && point.y >= 0.0
+                    && point.x < window.width()
+                    && point.y < window.height())
+                .then(|| (text.0.clone(), point.to_array()))
+            })
+            .collect(),
     }
 }
 
@@ -652,6 +754,7 @@ fn state(
 ) -> State {
     let scene = crate::view::scene_path(nav, tree);
     let folder = scene[scene.len() - 1].node;
+    let (dups_phase, dups_groups) = dups_state(dups);
     let mut state = State {
         folder: tree.nodes[folder].path.clone(),
         breadcrumb: scene
@@ -660,18 +763,9 @@ fn state(
             .collect(),
         entry: tree.nodes[folder].entry,
         dups_open: dups.open,
-        dups_state: match dups.state {
-            DupsState::NotYet => "not_yet",
-            DupsState::Computing { .. } => "computing",
-            DupsState::Ready(_) => "ready",
-            DupsState::Failed(_) => "failed",
-        }
-        .into(),
-        dups_groups: dups.groups().len(),
-        dups_selected: dups
-            .selected
-            .and_then(|i| dups.groups().get(i))
-            .map(|g| lisa_core::query::hex(&g.hash)),
+        dups_state: dups_phase.into(),
+        dups_groups,
+        dups_selected: dups.selected.and_then(|i| dups_hash(dups, i)),
         paused: control.is_some_and(|c| c.control.paused.load(Ordering::Relaxed)),
         ..default()
     };

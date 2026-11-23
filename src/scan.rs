@@ -61,7 +61,14 @@ impl Plugin for ScanPlugin {
             && let Some(mounts) = std::env::var_os("LISA_DEBUG_SCAN_MOUNTS")
         {
             let mounts: HashSet<_> = std::env::split_paths(&mounts).collect();
-            drives.retain(|drive| mounts.contains(&drive.mount_path));
+            drives.retain_mut(|drive| {
+                let selected = mounts.contains(&drive.mount_path);
+                if selected {
+                    // 検証用ディスクイメージは Finder に表示されない場所にもマウントできる。
+                    drive.hidden = false;
+                }
+                selected
+            });
         }
         info!(
             "ドライブ: {}",
@@ -715,7 +722,7 @@ fn receive(
         Res<crate::render::cache::ImageCache>,
     ),
     layouts: Res<Layouts>,
-    mut sync: ResMut<crate::view::SyncRequest>,
+    (mut sync, mut dups): (ResMut<crate::view::SyncRequest>, ResMut<crate::dups::Dups>),
     animating: Option<Res<crate::view::Animating>>,
     fades: Query<(), With<crate::view::Fade>>,
     gesture: Res<crate::input::gesture::Gesture>,
@@ -742,6 +749,12 @@ fn receive(
             Message::Committed => {
                 scanner.recent.clear();
                 scanner.hashed.clear();
+                if dups.refresh_after_scan {
+                    dups.refresh_after_scan = false;
+                    if dups.scope == crate::dups::remote::Scope::default() {
+                        dups.invalidate();
+                    }
+                }
                 if let crate::view::Location::Renamed(path) = &*location
                     && (store.entry_chain_at(path).is_some()
                         || std::fs::symlink_metadata(path).is_err())
