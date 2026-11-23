@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Lisa を MCP（Model Context Protocol）で使うためのサーバー（stdio / HTTP）"
 
+[features]
+verify-remote-keep = ["lisa-core/verify-remote-keep"]
+# 実機検証用の読み書き口（lisa-verify- で始まるフォルダの中だけ）。debug ビルドだけで使える。
+verify-fs = []
+
 [dependencies]
 directories = "6.0.0"
 lisa-core = { path = "../lisa-core" }

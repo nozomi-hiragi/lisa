@@ -36,13 +36,16 @@ fn scroll_side_panels(
     mut wheel: MessageReader<MouseWheel>,
     window: Single<&Window, With<PrimaryWindow>>,
     panels: Query<&Node>,
+    debug_cursor: Option<Res<crate::input::gesture::DebugCursor>>,
     mut lists: Query<(&SidePanelList, &ChildOf, &ComputedNode, &mut ScrollPosition)>,
 ) {
-    let over_panel = window
-        .cursor_position()
-        .is_some_and(|p| p.x > crate::view::view_width(&window) && p.y > menu::BAR_PX);
     for event in wheel.read() {
-        if !over_panel {
+        let cursor = if event.window == Entity::PLACEHOLDER {
+            debug_cursor.as_deref().and_then(|cursor| cursor.0)
+        } else {
+            window.cursor_position()
+        };
+        if !cursor.is_some_and(|p| p.x > crate::view::view_width(&window) && p.y > menu::BAR_PX) {
             continue;
         }
         for (list, parent, node, mut scroll) in &mut lists {

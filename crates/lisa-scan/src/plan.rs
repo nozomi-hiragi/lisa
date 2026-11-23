@@ -62,7 +62,8 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     let cmd = parse_args(args)?;
     let data_dir = app_data_dir()?;
     let settings = settings_path();
-    let ctx = Context::load(data_dir.clone(), settings.as_deref());
+    let mut ctx = Context::load(data_dir.clone(), settings.as_deref());
+    ctx.keep_client = Some(lisa_mcp::relay_client);
     let mut db = app_db()?;
     run_with(&mut db, &ctx, settings.as_deref(), cmd)
 }
@@ -147,6 +148,10 @@ fn run_with(
             if let Some(t) = plan.purged_at {
                 println!("ゴミ箱へ送り済み: {t} ms");
             }
+            if let Some(keep) = organize::remote_keep::keep_summary(db, id) {
+                println!("{}", keep.line());
+                println!("{}", keep.note());
+            }
             println!("--");
             for op in &ops {
                 let size = op.size.map(human).unwrap_or_default();
@@ -183,7 +188,7 @@ fn run_with(
             Ok(())
         }
         PlanCmd::Approve { id, skip_risky } => {
-            organize::approve_plan(db, id, skip_risky)?;
+            organize::approve_plan_with_context(db, ctx, id, skip_risky)?;
             let report = organize::execute_plan(db, ctx, id)?;
             notify_rescan(&ctx.data_dir, &report.touched_folders);
             println!(

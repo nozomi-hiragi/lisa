@@ -83,7 +83,8 @@ pub enum Command {
         cursor: Option<[f32; 2]>,
     },
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: クリックや親へ戻る操作を送る。
-    /// `action` は `"up"` または `"click"`（`screen_pos` に論理ピクセル座標を指定）。
+    /// `action` は `"up"`、`"click"`、`"ui_move"`、`"ui_click"`、`"ui_press"`、`"ui_release"`。
+    /// 位置が必要なときは `screen_pos` に論理ピクセル座標を指定。
     DebugNav {
         action: String,
         #[serde(default)]
@@ -209,6 +210,8 @@ pub struct DebugState {
     pub jump_pending: bool,
     pub occluded: bool,
     pub child_tiles: Vec<DebugTileRect>,
+    #[serde(default)]
+    pub ui_text: Vec<(String, [f32; 2])>,
 }
 
 /// アプリの今の様子。

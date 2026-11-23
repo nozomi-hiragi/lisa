@@ -96,6 +96,7 @@ pub struct LanPlugin;
 
 impl Plugin for LanPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<RemoteRefresh>();
         if std::env::var_os("LISA_DUMMY").is_some() {
             return;
         }
@@ -123,6 +124,7 @@ struct RunningListener {
     http: ListenerHandle,
     stop_udp: Arc<AtomicBool>,
     udp_port: u16,
+    http_port: u16,
 }
 
 impl RunningListener {
@@ -199,6 +201,16 @@ pub(crate) struct LanState {
 }
 
 impl LanState {
+    pub(crate) fn relay_port(&self) -> Option<u16> {
+        self.listener.as_ref().map(|listener| listener.http_port)
+    }
+
+    pub(crate) fn paired_devices(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.saved
+            .iter()
+            .map(|peer| (peer.device_id.as_str(), peer.name.as_str()))
+    }
+
     /// ペアリング済みの相手を `device_id` で引く。
     pub(crate) fn saved_peer(&self, device_id: &str) -> Option<SavedPeer> {
         self.saved
@@ -606,6 +618,7 @@ fn start_listener(lan: &LanState) -> Result<RunningListener, String> {
         http: http_handle,
         stop_udp,
         udp_port,
+        http_port,
     })
 }
 
@@ -627,6 +640,12 @@ fn poll_discovery(
     fades: Query<(), With<crate::view::Fade>>,
     gesture: Res<crate::input::gesture::Gesture>,
 ) {
+    // 合成端末での画面検証では、実際の LAN に問い合わせない。
+    if crate::remote::debug_remote_enabled()
+        && std::env::var("LISA_DEBUG_LAN_DISCOVERY").as_deref() == Ok("0")
+    {
+        return;
+    }
     let Some(mut lan) = lan else {
         return;
     };
@@ -637,6 +656,38 @@ fn poll_discovery(
     if let Ok(rx) = lan.discover_rx.lock() {
         while let Ok(found) = rx.try_recv() {
             lan.discovering = false;
+            // 逆向きにペア登録されていない依頼元にも、ローカル CLI から最新の発見結果を使える。
+            // 接続先の応答はペアリング鍵で照合するので、発見パケットだけで実行を許可しない。
+            let seen_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let relay_endpoints: serde_json::Map<_, _> = found
+                .iter()
+                .filter(|peer| {
+                    lan.authorized_peers
+                        .iter()
+                        .any(|allowed| allowed.device_id == peer.device_id)
+                })
+                .map(|peer| {
+                    (
+                        peer.device_id.clone(),
+                        json!({
+                            "address": SocketAddr::new(peer.addr,peer.port),
+                            "seen_at": seen_at,
+                        }),
+                    )
+                })
+                .collect();
+            let path = lan
+                .data_dir
+                .join(lisa_core::organize::remote_keep::relay::DISCOVERY_FILE);
+            let tmp = path.with_extension("tmp");
+            if let Ok(bytes) = serde_json::to_vec(&relay_endpoints)
+                && std::fs::write(&tmp, bytes).is_ok()
+            {
+                let _ = std::fs::rename(tmp, path);
+            }
             let mut any_saved_changed = false;
             for peer in found {
                 // 覚えている相手の IP やポートが変わっていたら更新して保存する。
@@ -978,10 +1029,24 @@ fn poll_worker_events(
     }
 }
 
+/// 重複一覧から相手の階層を開く。足りない段は既存の LAN 読み取りを使う。
+#[derive(Resource, Default)]
+pub(crate) struct RemoteRefresh(pub std::collections::HashSet<String>);
+
+#[derive(Resource)]
+pub(crate) struct RemoteJump {
+    pub device: String,
+    pub chain: Vec<i64>,
+}
+
 /// 相手の端末やフォルダが見えるところに来るか開かれたら、裏のスレッドで中身を取りに行く（操作中は保留）。
 #[allow(clippy::too_many_arguments)]
 fn request_remote_nodes(
     lan: Option<ResMut<LanState>>,
+    jump: Option<Res<RemoteJump>>,
+    mut refresh: ResMut<RemoteRefresh>,
+    mut sync: ResMut<crate::view::SyncRequest>,
+    mut commands: Commands,
     nav: Res<Nav>,
     layouts: Res<Layouts>,
     mut tree: ResMut<FileTree>,
@@ -997,7 +1062,39 @@ fn request_remote_nodes(
         return;
     }
     let lan = &mut *lan;
+    let mut refreshed = Vec::new();
+    for &device_node in &tree.nodes[FileTree::ROOT].children {
+        let Some(reference) = &tree.nodes[device_node].remote else {
+            continue;
+        };
+        if refresh.0.contains(&reference.device_id)
+            && !lan.in_flight.iter().any(|&node| {
+                tree.nodes[node]
+                    .remote
+                    .as_ref()
+                    .is_some_and(|other| other.device_id == reference.device_id)
+            })
+        {
+            refreshed.push((device_node, reference.device_id.clone()));
+        }
+    }
+    for (node, device) in refreshed {
+        tree.reset_children(node);
+        tree.set_remote_state(node, LoadState::Unloaded, false);
+        tree.preview_revision = tree.preview_revision.wrapping_add(1);
+        if !tree.is_attached(nav.top().node) || !tree.is_attached(layouts.anchor) {
+            sync.request_reset();
+        }
+        changed.pending = true;
+        refresh.0.remove(&device);
+    }
+    refresh
+        .0
+        .retain(|device| lan.saved.iter().any(|peer| peer.device_id == *device));
     let top = nav.top().node;
+    if !tree.is_attached(top) {
+        return;
+    }
     let opened_new = lan.last_top != Some(top);
     lan.last_top = Some(top);
 
@@ -1015,6 +1112,34 @@ fn request_remote_nodes(
     }
 
     let mut candidates: Vec<NodeId> = Vec::new();
+    if let Some(jump) = jump {
+        use crate::model::{display_path, tree::RemoteRef};
+        if let Some(peer) = lan.saved_peer(&jump.device) {
+            tree.ensure_remote_device(&peer.device_id, &peer.name, LoadState::Unloaded);
+            let steps: Vec<_> = std::iter::once(None)
+                .chain(jump.chain.iter().copied().map(Some))
+                .map(|entry_id| {
+                    display_path::Step::Remote(RemoteRef {
+                        device_id: jump.device.clone(),
+                        entry_id,
+                    })
+                })
+                .collect();
+            let path = display_path::resolve_steps(&tree, &steps);
+            let deepest = *path.last().unwrap_or(&FileTree::ROOT);
+            if path.len() == steps.len() + 1 || tree.nodes[deepest].loaded {
+                commands.remove_resource::<RemoteJump>();
+                commands.insert_resource(crate::ui::menu::BreadcrumbJump(steps));
+            } else if tree.nodes[deepest].state == LoadState::Failed {
+                commands.remove_resource::<RemoteJump>();
+                commands.insert_resource(crate::ui::menu::BreadcrumbError(Instant::now()));
+            } else {
+                candidates.push(deepest);
+            }
+        } else {
+            commands.remove_resource::<RemoteJump>();
+        }
+    }
     // 開いているノード自身を最優先にする。
     if tree.nodes[top].remote.is_some() {
         candidates.push(top);
@@ -1831,6 +1956,15 @@ mod tests {
             let listing = lisa_core::listing::read_dir(&sub_dir).map_err(|e| e.to_string());
             db.save_listing("drive:a", &sub_dir, &sub_dir, &listing)
                 .unwrap();
+            lisa_core::hash::hash_drive(
+                &mut db,
+                "drive:a",
+                &sub_dir,
+                1,
+                &mut |_| {},
+                &lisa_core::hash::Pace::FREE,
+            )
+            .unwrap();
         }
 
         // A の HttpListener を立ち上げ、ペアリングを許可する口を付ける。
@@ -1842,7 +1976,7 @@ mod tests {
                 data_dir: dir_a.clone(),
                 cache_dir: None,
             },
-            token,
+            token.clone(),
         )
         .unwrap()
         .with_pair_handler(Box::new(move |req| {
@@ -1879,6 +2013,30 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, "hello.txt");
         assert_eq!(children[0].size, 5);
+
+        let call =
+            |key: &str, tool: &str, args| call_mcp_tool(&paired.addr, paired.port, key, tool, args);
+        let tool = "lisa_duplicate_catalog";
+        assert!(
+            call(&token, tool, json!({}))
+                .unwrap_err()
+                .1
+                .contains("ペアリング")
+        );
+        let page: lisa_core::dups::CatalogPage =
+            serde_json::from_value(call(&paired.key, tool, json!({})).unwrap()).unwrap();
+        assert!(page.complete);
+        assert_eq!(page.keys.len(), 1);
+        let found: Vec<lisa_core::dups::Locations> = serde_json::from_value(
+            call(
+                &paired.key,
+                "lisa_duplicate_locations",
+                json!({"generation": page.generation, "keys": page.keys}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(found[0].entries[0].chain, [root_entry_id, children[0].id]);
 
         handle.unblock();
         server_thread.join().unwrap();

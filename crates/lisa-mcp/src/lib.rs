@@ -10,7 +10,13 @@
 //!   sidecar に頼む `lisa_update` だけ、`lisa` / `lisa-mcp` の実行ファイルを入れ替える。
 
 mod catalog;
+mod keep_relay;
+pub use keep_relay::relay_client;
 mod organize;
+pub use organize::NO_PLAN_FOR_REQUEST;
+mod remote_keep;
+#[cfg(feature = "verify-fs")]
+mod verify_fs;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -235,6 +241,15 @@ impl Server {
             "lisa_info" => self.info(args),
             "lisa_search" => self.search(args),
             "lisa_duplicates" => self.duplicates(args),
+            "lisa_duplicate_catalog" | "lisa_duplicate_locations" | "lisa_duplicate_groups" => {
+                require_peer(auth).and_then(|_| self.duplicate_comparison(name, args, auth))
+            }
+            "lisa_keep_inspect" | "lisa_keep_reserve" | "lisa_keep_renew" | "lisa_keep_release" => {
+                self.signed_duplicate_keep(name, args, auth)
+            }
+            "lisa_keep_relay_issue" | "lisa_keep_relay_revoke" => {
+                self.keep_relay_grant(name, args, auth)
+            }
             "lisa_copies" => self.copies(args),
             "lisa_snapshots" => self.snapshots(args),
             "lisa_logs" => self.logs(args),
@@ -264,6 +279,18 @@ impl Server {
             "lisa_screenshot" => require_peer(auth)
                 .and_then(|_| require_sidecar(sidecar, name))
                 .and_then(|_| self.screenshot(args)),
+            #[cfg(feature = "verify-fs")]
+            "lisa_verify_fs" => require_peer(auth)
+                .and_then(|_| require_sidecar(sidecar, name))
+                .and_then(|_| verify_fs::call(args)),
+            #[cfg(feature = "verify-fs")]
+            "lisa_verify_control" => require_peer(auth)
+                .and_then(|_| require_sidecar(sidecar, name))
+                .and_then(|_| {
+                    let command: Command =
+                        serde_json::from_value(args["command"].clone()).map_err(err)?;
+                    serde_json::to_value(remote::send(&self.data_dir, command)?).map_err(err)
+                }),
             "lisa_app_alive" => self.app_alive(),
             "lisa_catalogs" => self.catalogs(args),
             "lisa_catalog_matches" => self.catalog_matches(args),
@@ -274,10 +301,14 @@ impl Server {
             "lisa_assign" => self.assign(args),
             "lisa_unassign" => self.unassign(args),
             "lisa_plan_create" => self.plan_create(args, auth),
+            "lisa_duplicate_sources" => self.duplicate_sources(args, auth),
+            "lisa_duplicate_local_plan" => self.duplicate_local_plan(args, auth),
+            "lisa_duplicate_plan_create" => self.duplicate_plan_create(args, auth),
             "lisa_rename" => self.rename(args, auth),
-            "lisa_plan_status" => self.plan_status(args),
+            "lisa_plan_status" => self.plan_status(args, auth),
             "lisa_plans" => self.plans(args),
             "lisa_plan_cancel" => self.plan_cancel(args),
+            "lisa_plan_request_undo" => self.request_undo(args, auth),
             "lisa_undo" => self.undo(args),
             _ => Err(format!("知らない道具: {name}")),
         };
@@ -399,6 +430,34 @@ impl Server {
         Ok(json!({"count": found.len(), "limit": limit, "found": found}))
     }
 
+    /// LAN の重複パネル専用の読み取り操作。
+    fn duplicate_comparison(&self, name: &str, args: &Value, auth: &Auth) -> Result<Value, String> {
+        use lisa_core::dups;
+        // 比較索引の写しは依頼元ごとに最新の 1 つだけ持つ。
+        let owner = match auth {
+            Auth::Peer { device_id, .. } => device_id.as_str(),
+            Auth::Token | Auth::Stdio => "",
+        };
+        let db = self.db()?;
+        let generation = args.get("generation").and_then(Value::as_str);
+        match name {
+            "lisa_duplicate_catalog" => serde_json::to_value(dups::catalog_page(
+                &db,
+                generation,
+                arg_usize(args, "offset", 0),
+                owner,
+            )?)
+            .map_err(err),
+            "lisa_duplicate_locations" => {
+                let generation = generation.ok_or("索引の世代が要ります")?;
+                let keys = serde_json::from_value::<Vec<dups::ContentKey>>(args["keys"].clone())
+                    .map_err(err)?;
+                serde_json::to_value(dups::locations(&db, generation, &keys)?).map_err(err)
+            }
+            _ => serde_json::to_value(dups::device_groups(&db, MAX_GROUPS)?).map_err(err),
+        }
+    }
+
     /// 重複の一覧。アプリのキャッシュが今の DB と合えばそれを、合わなければ作る（数十秒かかる）。
     fn duplicates(&self, args: &Value) -> Result<Value, String> {
         let db = self.db()?;
@@ -406,7 +465,7 @@ impl Server {
         let cached: Option<lisa_core::dups::Cached> = self
             .cache_dir
             .as_ref()
-            .and_then(|d| std::fs::read(d.join("duplicates.json")).ok())
+            .and_then(|d| std::fs::read(d.join(lisa_core::dups::CACHE_FILE)).ok())
             .and_then(|b| serde_json::from_slice(&b).ok());
         let (groups, from_cache) = match cached {
             Some(c) if signature.is_some() && signature.as_ref() == Some(&c.signature) => {
@@ -1891,6 +1950,10 @@ pub const ALLOWED_APP_ENV_KEYS: &[&str] = &[
     "LISA_UPDATE_MODE",
     "RUST_LOG",
 ];
+/// 検証用ビルドだけ、アプリの制御口の検証用の頼み（`LISA_DEBUG_REMOTE`）を開けられる。
+fn verify_env_key(key: &str) -> bool {
+    cfg!(feature = "verify-fs") && matches!(key, "LISA_DEBUG_REMOTE" | "LISA_WINDOW_SIZE")
+}
 /// `lisa_app_start` で渡す環境変数の値の最大文字数。
 const MAX_APP_ENV_VALUE_LEN: usize = 64;
 
@@ -1918,7 +1981,7 @@ pub fn parse_app_start_env(args: &Value) -> Result<Vec<(String, String)>, String
 
 /// `lisa_app_start` に渡す環境変数 1 組（キーと値）が許されるものか検査する。
 pub fn validate_app_env_pair(key: &str, value: &str) -> Result<(), String> {
-    if !ALLOWED_APP_ENV_KEYS.contains(&key) {
+    if !ALLOWED_APP_ENV_KEYS.contains(&key) && !verify_env_key(key) {
         return Err(format!(
             "env のキー {key:?} は使えません（使えるのは {} だけです）",
             ALLOWED_APP_ENV_KEYS.join("、")
@@ -2246,6 +2309,14 @@ pub fn tools() -> Value {
     };
     let read_only = json!({"readOnlyHint": true, "openWorldHint": false});
     let app_hint = json!({"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false});
+    let request_undo = json!({
+        "name": "lisa_plan_request_undo",
+        "description": "ペアリング済みの依頼元が、自分の計画の隔離項目の復元を対象端末に依頼する。対象端末で人が確認するまでファイルは戻さない。",
+        "inputSchema": {"type": "object", "properties": {
+            "request_id": {"type": "string", "format": "uuid"}
+        }, "required": ["request_id"]},
+        "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+    });
     json!([
         {
             "name": "lisa_drives",
@@ -2513,6 +2584,7 @@ pub fn tools() -> Value {
                             "required": ["op"],
                         },
                     },
+                    "request_id": {"type": "string", "format": "uuid", "description": "ペアリング済み依頼元の再送に使う UUID（任意）"},
                     "note": {"type": "string", "description": "計画の説明（許可画面で人に見せる）"},
                     "dry_run": {"type": "boolean", "description": "true なら計画を作らず確かめだけ行う（既定 false）"},
                 },
@@ -2520,6 +2592,7 @@ pub fn tools() -> Value {
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
         },
+        request_undo,
         {
             "name": "lisa_plan_status",
             "description": "計画の状態と操作ごとの結果を返す。許可は人が画面で押す。wait（秒、最大 60）を付けると、許可待ち（や実行中）が終わるまで待つ。",
@@ -2527,11 +2600,12 @@ pub fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer", "description": "計画の番号（lisa_plan_create の id）"},
+                    "request_id": {"type": "string", "format": "uuid", "description": "計画の番号の代わりに依頼元が指定した UUID"},
                     "wait": {"type": "integer", "description": "許可待ちが変わるまで待つ秒数（0〜60、既定 0）"},
                     "ops_offset": {"type": "integer", "description": "操作の一覧で飛ばす件数（既定 0）"},
                     "ops_limit": {"type": "integer", "description": "操作の一覧で出す件数（既定 200、最大 5000）"},
                 },
-                "required": ["id"],
+                "oneOf": [{"required": ["id"]}, {"required": ["request_id"]}],
             },
             "annotations": read_only,
         },
@@ -3047,6 +3121,26 @@ fn serve_request(
     }
     if path == "/pair" {
         serve_pair(request, pair, active_pairs);
+        return;
+    }
+
+    if path == "/keep-relay" {
+        if *request.method() != Method::Post {
+            let _ = request.respond(empty(405));
+            return;
+        }
+        let body = match read_body(&mut request) {
+            Ok(body) => body,
+            Err(code) => {
+                let _ = request.respond(empty(code));
+                return;
+            }
+        };
+        let response = match server.handle_keep_relay(&body) {
+            Ok(value) => json!({"ok": true, "result": value}),
+            Err(message) => json!({"ok": false, "error": message}),
+        };
+        let _ = request.respond(json_response(200, &response));
         return;
     }
 

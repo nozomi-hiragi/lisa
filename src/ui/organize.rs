@@ -480,6 +480,22 @@ fn build_approval_popup(
                 TextColor(TEXT_COLOR),
             ));
         }
+        if let Some(keep) = &active.keep {
+            banner.spawn((
+                Text::new(lisa_core::display_path::wrap_at_separators(&keep.line())),
+                bevy::text::TextLayout::linebreak(bevy::text::LineBreak::WordOrCharacter),
+                small_font.clone(),
+                TextColor(TEXT_COLOR),
+            ));
+        }
+        if let Some(keep) = &active.keep {
+            banner.spawn((
+                Text::new(lisa_core::display_path::wrap_at_separators(&keep.note())),
+                bevy::text::TextLayout::linebreak(bevy::text::LineBreak::WordOrCharacter),
+                small_font.clone(),
+                TextColor(DIM_COLOR),
+            ));
+        }
         banner.spawn((
             Text::new(summary_line),
             small_font.clone(),
@@ -687,6 +703,13 @@ fn build_approval_popup(
     });
 }
 
+#[derive(Default)]
+struct OutgoingHistoryKey {
+    entries: Vec<crate::dups::requests::Request>,
+    notice: Option<String>,
+    busy: bool,
+}
+
 /// 履歴パネルの中身を作り直す。
 fn fill_panel(
     mut commands: Commands,
@@ -698,13 +721,28 @@ fn fill_panel(
         Single<Entity, With<List>>,
         Single<Entity, With<PanelStatus>>,
     ),
-    mut rendered_key: Local<Option<PanelKey>>,
+    (mut rendered_key, requests, mut remote_key): (
+        Local<Option<PanelKey>>,
+        Res<crate::dups::requests::Requests>,
+        Local<OutgoingHistoryKey>,
+    ),
 ) {
     let key = PanelKey::from_state(&state, names.generation);
-    if rendered_key.as_ref() == Some(&key) {
+    let history_changed = requests.is_changed()
+        && (remote_key.entries != requests.entries
+            || remote_key.notice != requests.notice
+            || remote_key.busy != requests.busy());
+    if rendered_key.as_ref() == Some(&key) && !history_changed {
         return;
     }
     *rendered_key = Some(key);
+    if history_changed {
+        *remote_key = OutgoingHistoryKey {
+            entries: requests.entries.clone(),
+            notice: requests.notice.clone(),
+            busy: requests.busy(),
+        };
+    }
     let list = *list;
     commands.entity(list).despawn_children();
     commands.entity(*status).despawn_children();
@@ -731,7 +769,13 @@ fn fill_panel(
         }
 
         if let Some(confirming) = state.history_confirmation {
+            let confirm_label = match confirming {
+                HistoryConfirmation::Undo(_) => "復元する",
+                HistoryConfirmation::Dismiss(_) => "削除",
+                _ => "送る",
+            };
             let message = match confirming {
+                HistoryConfirmation::Undo(id) => format!("計画 #{id} の隔離項目を元の場所に戻しますか？"),
                 HistoryConfirmation::PurgePlan(id) => format!(
                     "計画 #{id} の隔離ファイルを OS のゴミ箱へ送りますか？（取り消せなくなります）"
                 ),
@@ -772,7 +816,7 @@ fn fill_panel(
                                     ..default()
                                 },
                                 BackgroundColor(REJECT_COLOR),
-                                children![(Text::new(if matches!(confirming, HistoryConfirmation::Dismiss(_)) { "削除" } else { "送る" }), small.clone(), TextColor(REJECT_TEXT_COLOR))],
+                                children![(Text::new(confirm_label), small.clone(), TextColor(REJECT_TEXT_COLOR))],
                             ))
                             .observe(
                                 move |mut click: On<PointerClick>,
@@ -832,7 +876,10 @@ fn fill_panel(
         })
         .with_children(|hdr| {
             hdr.spawn((
-                Text::new(format!("整理の履歴  {} 件", state.history.len())),
+                Text::new(format!(
+                    "整理の履歴  {} 件",
+                    state.history.len() + requests.entries.len()
+                )),
                 big.clone(),
                 TextColor(TEXT_COLOR),
             ));
@@ -867,7 +914,16 @@ fn fill_panel(
             TextColor(DIM_COLOR),
         ));
 
-        if state.history.is_empty() {
+        if !requests.entries.is_empty() {
+            if let Some(notice) = &requests.notice {
+                list.spawn((Text::new(notice.clone()), small.clone(), TextColor(ACCENT)));
+            }
+            for request in &requests.entries {
+                spawn_request_card(list, request, requests.busy(), &big, &small);
+            }
+        }
+
+        if state.history.is_empty() && requests.entries.is_empty() {
             list.spawn((
                 Node {
                     padding: UiRect::axes(Val::Px(8.0), Val::Px(10.0)),
@@ -901,7 +957,7 @@ struct PanelKey {
     busy: bool,
     selected_plan: Option<i64>,
     notice: Option<String>,
-    history: Vec<(i64, PlanState, Option<i64>, bool)>,
+    history: Vec<(i64, PlanState, Option<i64>, bool, bool)>,
     dismissing: Option<i64>,
     details_id: Option<i64>,
     details_ops: Option<Vec<(usize, OpState)>>,
@@ -924,15 +980,17 @@ impl PanelKey {
                         p.id,
                         p.state,
                         p.purged_at,
+                        p.restore_requested,
                         state.dismissible.contains(&p.id),
                     )
                 })
                 .collect(),
             dismissing: state.dismissing,
             details_id: state.selected_details.as_ref().map(|d| d.plan_id),
-            details_ops: state.selected_details.as_ref().map(|d| {
-                d.ops.iter().map(|o| (o.seq as usize, o.state)).collect()
-            }),
+            details_ops: state
+                .selected_details
+                .as_ref()
+                .map(|d| d.ops.iter().map(|o| (o.seq as usize, o.state)).collect()),
             history_confirmation: state.history_confirmation,
             names,
         }
@@ -950,12 +1008,13 @@ fn spawn_plan_card(
     small: &TextFont,
     paths: Option<&lisa_core::display_path::DisplayPaths>,
 ) {
+    let restore_requested = plan.restore_requested;
     let plan_id = plan.id;
     let busy = state.busy;
     let can_dismiss = state.dismissible.contains(&plan_id);
     let dismiss_disabled = busy || state.dismissing.is_some();
-    let can_undo = matches!(plan.state, PlanState::Done | PlanState::Partial)
-        && plan.purged_at.is_none();
+    let can_undo =
+        matches!(plan.state, PlanState::Done | PlanState::Partial) && plan.purged_at.is_none();
     let undo_busy = busy;
     let can_purge = matches!(
         plan.state,
@@ -964,67 +1023,62 @@ fn spawn_plan_card(
         && plan.summary.trash > 0;
     let state_color = plan_state_color(plan.state);
 
-    list.spawn((
-        Node {
-            flex_direction: FlexDirection::Column,
-            padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
-            row_gap: Val::Px(3.0),
-            border_radius: BorderRadius::all(Val::Px(4.0)),
-            border: UiRect::left(Val::Px(3.0)),
-            flex_shrink: 0.0,
-            ..default()
-        },
-        BorderColor::all(state_color),
-        BackgroundColor(if selected { SELECTED_COLOR } else { ROW_COLOR }),
-    ))
-    .observe(
-        move |_: On<PointerClick>, mut state: ResMut<OrganizeState>| {
-            if state.selected_plan == Some(plan_id) {
-                state.select_plan(None);
-            } else {
-                state.select_plan(Some(plan_id));
-            }
-        },
-    )
-    .with_children(|card| {
-        card.spawn((
-            Text::new(format!(
-                "#{}  {}  {}  {}",
-                plan.id,
-                plan_state_label(plan.state),
-                plan.by,
-                format_epoch_ms(plan.created_at),
-            )),
-            big.clone(),
-            TextColor(state_color),
-        ));
-        if let Some(note) = plan.note.as_deref().filter(|n| !n.trim().is_empty()) {
+    list.spawn(history_card(state_color, selected))
+        .observe(
+            move |_: On<PointerClick>, mut state: ResMut<OrganizeState>| {
+                if state.selected_plan == Some(plan_id) {
+                    state.select_plan(None);
+                } else {
+                    state.select_plan(Some(plan_id));
+                }
+            },
+        )
+        .with_children(|card| {
             card.spawn((
-                Text::new(note.to_string()),
-                small.clone(),
-                TextColor(TEXT_COLOR),
+                Text::new(format!(
+                    "#{}  {}  {}  {}",
+                    plan.id,
+                    plan_state_label(plan.state),
+                    plan.by,
+                    format_epoch_ms(plan.created_at),
+                )),
+                big.clone(),
+                TextColor(state_color),
             ));
-        }
-        let mut meta = format!(
-            "{} 件（移動 {}・空く {}）",
-            plan.summary.total,
-            human(plan.summary.move_bytes),
-            human(plan.summary.free_bytes),
-        );
-        if plan.purged_at.is_some() {
-            meta.push_str("  ゴミ箱へ送り済み");
-        }
-        card.spawn((Text::new(meta), small.clone(), TextColor(DIM_COLOR)));
+            if restore_requested {
+                card.spawn((
+                    Text::new("取り消し依頼あり"),
+                    small.clone(),
+                    TextColor(RISKY_COLOR),
+                ));
+            }
+            if let Some(note) = plan.note.as_deref().filter(|n| !n.trim().is_empty()) {
+                card.spawn((
+                    Text::new(note.to_string()),
+                    small.clone(),
+                    TextColor(TEXT_COLOR),
+                ));
+            }
+            let mut meta = format!(
+                "{} 件（移動 {}・空く {}）",
+                plan.summary.total,
+                human(plan.summary.move_bytes),
+                human(plan.summary.free_bytes),
+            );
+            if plan.purged_at.is_some() {
+                meta.push_str("  ゴミ箱へ送り済み");
+            }
+            card.spawn((Text::new(meta), small.clone(), TextColor(DIM_COLOR)));
 
-        if can_undo || can_purge || can_dismiss {
-            card.spawn(Node {
-                column_gap: Val::Px(6.0),
-                margin: UiRect::top(Val::Px(3.0)),
-                ..default()
-            })
-            .with_children(|actions| {
-                if can_undo {
-                    actions
+            if can_undo || can_purge || can_dismiss {
+                card.spawn(Node {
+                    column_gap: Val::Px(6.0),
+                    margin: UiRect::top(Val::Px(3.0)),
+                    ..default()
+                })
+                .with_children(|actions| {
+                    if can_undo {
+                        actions
                         .spawn((
                             Node {
                                 padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
@@ -1042,13 +1096,18 @@ fn spawn_plan_card(
                             move |mut click: On<PointerClick>, mut state: ResMut<OrganizeState>| {
                                 click.propagate(false);
                                 if !busy && !state.busy {
-                                    state.undo(plan_id);
+                                    if restore_requested {
+                                        state.history_confirmation =
+                                            Some(HistoryConfirmation::Undo(plan_id));
+                                    } else {
+                                        state.undo(plan_id);
+                                    }
                                 }
                             },
                         );
-                }
-                if can_dismiss {
-                    actions
+                    }
+                    if can_dismiss {
+                        actions
                         .spawn((
                             Node {
                                 padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
@@ -1082,9 +1141,9 @@ fn spawn_plan_card(
                                 }
                             },
                         );
-                }
-                if can_purge {
-                    actions
+                    }
+                    if can_purge {
+                        actions
                         .spawn((
                             Node {
                                 padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
@@ -1107,10 +1166,10 @@ fn spawn_plan_card(
                                 }
                             },
                         );
-                }
-            });
-        }
-    });
+                    }
+                });
+            }
+        });
 
     if !selected {
         return;
@@ -1133,6 +1192,22 @@ fn spawn_plan_card(
         return;
     };
 
+    if let Some(keep) = &details.keep {
+        list.spawn((
+            Node {
+                margin: UiRect::left(Val::Px(10.0)),
+                padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
+                flex_shrink: 0.0,
+                ..default()
+            },
+            children![(
+                Text::new(lisa_core::display_path::wrap_at_separators(&keep.line())),
+                bevy::text::TextLayout::linebreak(bevy::text::LineBreak::WordOrCharacter),
+                small.clone(),
+                TextColor(TEXT_COLOR)
+            )],
+        ));
+    }
     for (op, chain) in details.ops.iter().zip(&details.chains) {
         let mut line = format!(
             "#{} {} [{}]  {}",
@@ -1195,6 +1270,116 @@ fn spawn_plan_card(
             });
         }
     }
+}
+
+fn history_card(color: Color, selected: bool) -> (Node, BorderColor, BackgroundColor) {
+    (
+        Node {
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+            row_gap: Val::Px(3.0),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
+            border: UiRect::left(Val::Px(3.0)),
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BorderColor::all(color),
+        BackgroundColor(if selected { SELECTED_COLOR } else { ROW_COLOR }),
+    )
+}
+
+fn spawn_request_card(
+    list: &mut ChildSpawnerCommands,
+    request: &crate::dups::requests::Request,
+    busy: bool,
+    big: &TextFont,
+    small: &TextFont,
+) {
+    let value = request.result.as_ref();
+    let state = request.state();
+    let color = state.map_or(DIM_COLOR, plan_state_color);
+    let title = format!(
+        "{}　{}",
+        request.device,
+        state.map_or(
+            if request.unreached {
+                "未到達"
+            } else {
+                "依頼を照会中"
+            },
+            plan_state_label
+        )
+    );
+    list.spawn(history_card(color, false))
+        .with_children(|card| {
+            card.spawn((Text::new(title), big.clone(), TextColor(color)));
+            if let Some(error) = &request.connection_error {
+                card.spawn((Text::new(error.clone()), small.clone(), TextColor(ACCENT)));
+            }
+            if request.unreached {
+                card.spawn((
+                    Text::new("対象端末に依頼が届いていません。再度依頼するか、手元から破棄できます"),
+                    small.clone(),
+                    TextColor(ACCENT),
+                ));
+                card.spawn((
+                    super::menu::menu_button(),
+                    children![(
+                        Text::new("手元から破棄"),
+                        small.clone(),
+                        TextColor(if busy { DIM_COLOR } else { TEXT_COLOR })
+                    )],
+                ))
+                .observe({
+                    let id = request.id.clone();
+                    move |_: On<PointerClick>, mut requests: ResMut<crate::dups::requests::Requests>| {
+                        requests.discard(&id);
+                    }
+                });
+            }
+            let ops = value.and_then(|value| value["ops"].as_array());
+            for (index, path) in request.paths.iter().enumerate() {
+                let op = ops.and_then(|ops| {
+                    ops.iter()
+                        .find(|op| op["seq"].as_i64() == Some(index as i64))
+                });
+                let label = op
+                    .and_then(|op| op["state"].as_str())
+                    .and_then(OpState::from_name)
+                    .map_or("", op_state_label);
+                let reason = op.and_then(|op| op["reason"].as_str()).unwrap_or_default();
+                let path = lisa_core::display_path::wrap_at_separators(path);
+                card.spawn((
+                    Text::new(format!("{path}  {label} {reason}")),
+                    small.clone(),
+                    TextColor(TEXT_COLOR),
+                ));
+            }
+            if request.undo_requested {
+                card.spawn((
+                    Text::new("対象端末で復元確認待ち"),
+                    small.clone(),
+                    TextColor(ACCENT),
+                ));
+            } else if request.can_undo() {
+                let id = request.id.clone();
+                card.spawn((
+                    super::menu::menu_button(),
+                    children![(
+                        Text::new("取り消しを依頼"),
+                        small.clone(),
+                        TextColor(if busy { DIM_COLOR } else { TEXT_COLOR })
+                    )],
+                ))
+                .observe(
+                    move |_: On<PointerClick>,
+                          mut requests: ResMut<crate::dups::requests::Requests>,
+                          lan: Option<Res<crate::lan::LanState>>| {
+                        requests.undo(lan.as_deref(), &id);
+                    },
+                );
+            }
+        });
 }
 
 fn plan_state_label(state: PlanState) -> &'static str {

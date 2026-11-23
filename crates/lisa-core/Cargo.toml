@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Lisa のスキャンの中身（Bevy に依存しない）"
 
+[features]
+verify-remote-keep = []
+
 [dependencies]
 blake3 = "1.8.7"
 regex = "1.13.2"

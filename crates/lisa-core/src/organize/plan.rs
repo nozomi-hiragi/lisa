@@ -9,6 +9,7 @@ use crate::db::{self, Db};
 use crate::hash::Hash;
 
 use super::check::{self, PreparedOp};
+use super::remote_keep::{self, ProtectedKeep, RemotePlan, relay::RelayAction};
 use super::{Context, PENDING_EXPIRE_MS};
 
 /// 計画に渡す 1 件の操作（入力の形）。
@@ -251,6 +252,8 @@ pub struct Plan {
     pub decided_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub purged_at: Option<i64>,
+    #[serde(default)]
+    pub restore_requested: bool,
 }
 
 /// DB の `plan_op` の 1 行。
@@ -274,7 +277,10 @@ pub struct PlanOp {
 }
 
 const PLAN_COLUMNS: &str =
-    "id, state, by, note, summary, skip_risky, created_at, decided_at, finished_at, purged_at";
+    "id, state, by, note, summary, skip_risky, created_at, decided_at, finished_at, purged_at,
+     purged_at IS NULL AND state IN ('done','partial')
+         AND EXISTS (SELECT 1 FROM peer_restore_request WHERE plan_id = plan.id)
+         AND EXISTS (SELECT 1 FROM plan_op WHERE plan_id = plan.id AND op = 'trash' AND state = 'done')";
 
 const PLAN_OP_COLUMNS: &str =
     "plan_id, seq, op, drive_id, src, dst, keep, size, mtime, hash, risky, state, reason, done_at";
@@ -295,6 +301,7 @@ fn row_to_plan(r: &rusqlite::Row<'_>) -> db::Result<Plan> {
         decided_at: r.get(7)?,
         finished_at: r.get(8)?,
         purged_at: r.get(9)?,
+        restore_requested: r.get(10)?,
     })
 }
 
@@ -334,7 +341,164 @@ pub fn create_plan(
     ops: &[OpInput],
     dry_run: bool,
 ) -> Result<CreateResult, String> {
-    let prepared = check::prepare_ops(db, ctx, ops)?;
+    create_plan_inner(db, ctx, by, note, ops, dry_run, None)
+}
+
+/// ペアリング済みの依頼元と依頼 ID を計画と同時に保存する。
+pub fn create_peer_plan(
+    db: &mut Db,
+    ctx: &Context,
+    by: &str,
+    note: Option<&str>,
+    ops: &[OpInput],
+    device_id: &str,
+    request_id: uuid::Uuid,
+) -> Result<CreateResult, String> {
+    let payload = serde_json::to_vec(&(note, ops)).map_err(|e| e.to_string())?;
+    let request = PeerRequest {
+        device_id,
+        request_id: request_id.to_string(),
+        hash: *blake3::hash(&payload).as_bytes(),
+        remote: None,
+    };
+    create_plan_inner(db, ctx, by, note, ops, false, Some(&request))
+}
+
+/// 端末間の計画ではローカルの keep パスを作らず、参照と許可を保存する。
+pub fn create_remote_keep_plan(
+    db: &mut Db,
+    ctx: &Context,
+    by: &str,
+    note: Option<&str>,
+    remote: RemotePlan,
+) -> Result<CreateResult, String> {
+    let payload = serde_json::to_vec(&(note, &remote)).map_err(|error| error.to_string())?;
+    let request_id = uuid::Uuid::parse_str(&remote.route.request_id)
+        .map_err(|_| "依頼 ID が正しくありません")?;
+    let request = PeerRequest {
+        device_id: &remote.route.requester_device,
+        request_id: request_id.to_string(),
+        hash: *blake3::hash(&payload).as_bytes(),
+        remote: Some(&remote),
+    };
+    if let Some(saved) = request.previous(db.conn())? {
+        return Ok(saved);
+    }
+    if remote.sources.is_empty()
+        || remote.sources.len() > super::MAX_OPS
+        || db
+            .meta("this_device")
+            .map_err(|e| e.to_string())?
+            .as_deref()
+            != Some(&remote.route.target_device)
+        || remote.keep.device_id == remote.route.target_device
+        || remote.keep.identity == [0; 2]
+    {
+        return Err("端末間の整理計画に使える保持項目と隔離対象が必要です".into());
+    }
+    let mut physical = std::collections::HashSet::from([remote.keep.identity]);
+    let mut ops = Vec::new();
+    for source in &remote.sources {
+        if source.key != remote.keep.key
+            || source.identity == [0; 2]
+            || !physical.insert(source.identity)
+        {
+            return Err("同じ中身で独立した実体だと確認できません".into());
+        }
+        let path = remote_keep::resolve(db, source)?;
+        ProtectedKeep::open(db, source)?;
+        ops.push(OpInput::Trash { path, keep: None });
+    }
+    remote_keep::call(ctx, &remote, RelayAction::Inspect)?;
+    create_plan_inner(db, ctx, by, note, &ops, false, Some(&request))
+}
+
+struct PeerRequest<'a> {
+    device_id: &'a str,
+    request_id: String,
+    hash: Hash,
+    remote: Option<&'a RemotePlan>,
+}
+
+impl PeerRequest<'_> {
+    fn previous(&self, conn: &rusqlite::Connection) -> Result<Option<CreateResult>, String> {
+        let row: Option<(Vec<u8>, String)> = conn.query_row(
+            "SELECT payload_hash, response FROM peer_plan_request WHERE device_id = ?1 AND request_id = ?2",
+            params![self.device_id, self.request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some((hash, response)) = row {
+            if hash != self.hash {
+                return Err("同じ依頼 ID は別の内容に使えません".into());
+            }
+            return serde_json::from_str(&response)
+                .map(Some)
+                .map_err(|e| e.to_string());
+        }
+        Ok(None)
+    }
+}
+
+pub fn peer_plan_id(db: &Db, device_id: &str, request_id: uuid::Uuid) -> db::Result<Option<i64>> {
+    db.conn()
+        .query_row(
+            "SELECT plan_id FROM peer_plan_request WHERE device_id = ?1 AND request_id = ?2",
+            params![device_id, request_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+pub fn peer_managed_plan(db: &Db, plan_id: i64) -> db::Result<bool> {
+    db.conn().query_row(
+        "SELECT EXISTS (SELECT 1 FROM peer_plan_request WHERE plan_id = ?1)",
+        [plan_id],
+        |row| row.get(0),
+    )
+}
+
+/// 依頼元は隔離の復元を申請できる。復元は対象端末で行う。
+pub fn request_peer_restore(
+    db: &Db,
+    device_id: &str,
+    request_id: uuid::Uuid,
+) -> Result<i64, String> {
+    let plan_id = peer_plan_id(db, device_id, request_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("この依頼 ID の計画はまだありません")?;
+    let changed = db
+        .conn()
+        .execute(
+            "INSERT INTO peer_restore_request(plan_id, requested_at)
+         SELECT id, ?2 FROM plan
+         WHERE id = ?1 AND state IN ('done', 'partial') AND purged_at IS NULL
+           AND EXISTS (SELECT 1 FROM plan_op WHERE plan_id = ?1 AND op = 'trash' AND state = 'done')
+           AND NOT EXISTS (SELECT 1 FROM plan_op WHERE plan_id = ?1 AND op != 'trash')
+         ON CONFLICT(plan_id) DO UPDATE SET requested_at = requested_at",
+            params![plan_id, db::now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("復元を依頼できる隔離項目がありません".into());
+    }
+    Ok(plan_id)
+}
+
+fn create_plan_inner(
+    db: &mut Db,
+    ctx: &Context,
+    by: &str,
+    note: Option<&str>,
+    ops: &[OpInput],
+    dry_run: bool,
+    request: Option<&PeerRequest<'_>>,
+) -> Result<CreateResult, String> {
+    if let Some(request) = request
+        && let Some(previous) = request.previous(db.conn())?
+    {
+        return Ok(previous);
+    }
+    let prepared = check::prepare_ops(db, ctx, ops, request.is_some_and(|r| r.remote.is_some()))?;
     let summary = summarize(&prepared);
     let checks: Vec<OpCheck> = prepared.iter().map(PreparedOp::to_check).collect();
 
@@ -350,7 +514,26 @@ pub fn create_plan(
 
     let now = db::now_ms();
     let summary_json = serde_json::to_string(&summary).map_err(|e| e.to_string())?;
-    let tx = db.conn_mut().transaction().map_err(|e| e.to_string())?;
+    let behavior = if request.is_some() {
+        TransactionBehavior::Immediate
+    } else {
+        TransactionBehavior::Deferred
+    };
+    let tx = db
+        .conn_mut()
+        .transaction_with_behavior(behavior)
+        .map_err(|e| e.to_string())?;
+    if let Some(request) = request
+        && let Some(previous) = request.previous(&tx)?
+    {
+        return Ok(previous);
+    }
+    super::remote_keep::check_overlap(
+        &tx,
+        prepared
+            .iter()
+            .flat_map(|op| std::iter::once(op.src.as_path()).chain(op.dst.as_deref())),
+    )?;
     let plan_id: i64 = tx
         .query_row(
             "INSERT INTO plan (state, by, note, summary, skip_risky, created_at)
@@ -390,15 +573,40 @@ pub fn create_plan(
             .map_err(|e| e.to_string())?;
         }
     }
-    tx.commit().map_err(|e| e.to_string())?;
-
-    Ok(CreateResult {
+    let response = CreateResult {
         id: Some(plan_id),
         created: true,
         dry_run: false,
         summary,
         checks,
-    })
+    };
+    if let Some(request) = request {
+        let body = serde_json::to_string(&response).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO peer_plan_request (device_id, request_id, payload_hash, plan_id, response)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                request.device_id,
+                request.request_id,
+                &request.hash[..],
+                plan_id,
+                body
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(remote) = request.and_then(|request| request.remote) {
+        tx.execute(
+            "INSERT INTO remote_keep_plan(plan_id,intent) VALUES (?1,?2)",
+            params![
+                plan_id,
+                serde_json::to_string(remote).map_err(|error| error.to_string())?
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(response)
 }
 
 fn summarize(prepared: &[PreparedOp]) -> PlanSummary {
@@ -580,6 +788,31 @@ pub fn expire_stale_plans_at(db: &mut Db, now_ms: i64) -> db::Result<usize> {
 
 /// 許可待ちの計画を許可する（`pending` → `approved`）。実行はまだしない。
 pub fn approve_plan(db: &mut Db, id: i64, skip_risky: bool) -> Result<Plan, String> {
+    if remote_keep::remote_plan(db, id)?.is_some() {
+        return Err(
+            "端末間の計画は対象端末の Lisa または中継に対応する CLI で承認してください".into(),
+        );
+    }
+    approve_local_state(db, id, skip_risky)
+}
+
+pub fn approve_plan_with_context(
+    db: &mut Db,
+    ctx: &Context,
+    id: i64,
+    skip_risky: bool,
+) -> Result<Plan, String> {
+    if let Some(remote) = remote_keep::remote_plan(db, id)? {
+        let saved = load_plan_required(db, id)?;
+        if saved.state != PlanState::Pending {
+            return Err("計画は許可待ちではありません".into());
+        }
+        remote_keep::call(ctx, &remote, RelayAction::Inspect)?;
+    }
+    approve_local_state(db, id, skip_risky)
+}
+
+fn approve_local_state(db: &mut Db, id: i64, skip_risky: bool) -> Result<Plan, String> {
     let _ = expire_stale_plans(db);
     let now = db::now_ms();
     let plan = load_plan_required(db, id)?;
@@ -589,6 +822,13 @@ pub fn approve_plan(db: &mut Db, id: i64, skip_risky: bool) -> Result<Plan, Stri
             plan.state.as_str()
         ));
     }
+    let candidates = plan_ops(db, id).map_err(|error| error.to_string())?;
+    super::remote_keep::check_overlap(
+        db.conn(),
+        candidates
+            .iter()
+            .flat_map(|op| std::iter::once(op.src.as_path()).chain(op.dst.as_deref())),
+    )?;
     let changed = db
         .conn()
         .execute(

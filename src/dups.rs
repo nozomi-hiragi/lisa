@@ -1,8 +1,7 @@
 //! 重複の一覧（`lisa_core::dups`）を裏で作り、選んだ組のコピーを木の上で光らせる。
-//! 表示だけで、ファイルは何も動かさない。
 //!
 //! 一覧は、画面の横の一覧（`ui/dups.rs`）を開くたびに、裏のスレッドで確かめる。作った一覧は、DB の状態
-//! （ドライブごとの一番上のハッシュ、`dups::signature`）と一緒にキャッシュ（`duplicates.json`）に残し、
+//! （ドライブごとの一番上のハッシュ、`dups::signature`）と一緒にキャッシュ（`duplicates-v2.json`）に残し、
 //! 状態が同じならそれをすぐ出す。違えば、前の一覧を出したまま作り直し、できたら差し替える。
 //! 選んだ組のコピーは、木にあれば太い枠（`DupHighlight::copies`）、まだ木に出していなければ、
 //! 出してある一番深い祖先に細い枠（`around`）を付ける（`render/scene.rs` の `mark_duplicate`）。
@@ -18,6 +17,10 @@ use lisa_core::dups::Group;
 use crate::model::tree::{FileTree, NodeId};
 use crate::view::SyncRequest;
 
+pub mod remote;
+pub(crate) mod requests;
+use remote::{Scope, ViewState, compute_remote};
+
 /// 一覧に出す組の数の上限。
 const MAX_GROUPS: usize = 300;
 
@@ -27,7 +30,11 @@ impl Plugin for DupsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Dups>()
             .init_resource::<DupHighlight>()
-            .add_systems(Update, (compute, update_highlight).chain());
+            .init_resource::<requests::Requests>()
+            .add_systems(
+                Update,
+                (requests::update, compute, compute_remote, update_highlight).chain(),
+            );
     }
 }
 
@@ -39,6 +46,32 @@ pub struct Dups {
     pub state: DupsState,
     /// 選んだ組（`state` の一覧の番号）。
     pub selected: Option<usize>,
+    pub scope: Scope,
+    pub refresh: u64,
+    pub(crate) revision: u64,
+    pub(crate) refresh_after_scan: bool,
+    pub(crate) selection: requests::Selection,
+    pub(crate) remote: ViewState,
+}
+
+impl Dups {
+    pub(crate) fn invalidate(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.set_scope(self.scope.clone());
+    }
+
+    pub(crate) fn select_group(&mut self, index: usize) {
+        self.selected = (self.selected != Some(index)).then_some(index);
+        self.selection = Default::default();
+    }
+
+    pub fn set_scope(&mut self, scope: Scope) {
+        self.scope = scope;
+        self.refresh = self.refresh.wrapping_add(1);
+        self.selected = None;
+        self.selection = Default::default();
+        self.remote = ViewState::Local;
+    }
 }
 
 #[derive(Default)]
@@ -77,7 +110,7 @@ pub enum Found {
 
 /// キャッシュの場所。
 fn cache_path() -> Option<std::path::PathBuf> {
-    crate::scan::cache_dir().map(|d| d.join("duplicates.json"))
+    crate::scan::cache_dir().map(|d| d.join(lisa_core::dups::CACHE_FILE))
 }
 
 /// DB の状態を確かめ、キャッシュが使えればそれを、使えなければ作り直したものを送る。
@@ -138,12 +171,15 @@ pub struct DupHighlight {
 fn compute(
     mut dups: ResMut<Dups>,
     mut was_open: Local<bool>,
+    mut revision: Local<u64>,
     occluded: Res<crate::view::WindowOccludedState>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    let opened = dups.open && !*was_open;
-    *was_open = dups.open;
+    let local = dups.open && dups.scope == Scope::default();
+    let opened = local && (!*was_open || *revision != dups.revision);
+    *was_open = local;
     if opened && !matches!(dups.state, DupsState::Computing { .. }) {
+        *revision = dups.revision;
         let previous = match std::mem::take(&mut dups.state) {
             DupsState::Ready(groups) => Some(groups),
             _ => None,
@@ -181,8 +217,9 @@ fn compute(
                     .iter()
                     .zip(&groups)
                     .all(|(a, b)| a.hash == b.hash);
-            if !same {
+            if !same && local {
                 dups.selected = None;
+                dups.selection = Default::default();
             }
             dups.state = DupsState::Ready(groups);
         }
@@ -204,7 +241,10 @@ fn update_highlight(
         return;
     }
     let mut chains: Vec<&[i64]> = Vec::new();
-    if let (true, Some(group)) = (dups.open, dups.selected.and_then(|i| dups.groups().get(i))) {
+    if let (true, Some(group)) = (
+        dups.open && dups.scope == Scope::default(),
+        dups.selected.and_then(|i| dups.groups().get(i)),
+    ) {
         chains.extend(group.copies.iter().map(|c| c.chain.as_slice()));
     }
     if let Some(plan_hl) = &plan_hl {

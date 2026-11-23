@@ -73,6 +73,7 @@ pub(crate) fn prepare_ops(
     db: &Db,
     ctx: &Context,
     ops: &[OpInput],
+    remote_keep: bool,
 ) -> Result<Vec<PreparedOp>, String> {
     if ops.is_empty() {
         return Err("操作が 1 件もありません".into());
@@ -155,6 +156,7 @@ pub(crate) fn prepare_ops(
             &planned_mkdirs,
             &trashed_entry_ids,
             &trashed_paths,
+            remote_keep,
             item,
         )?);
     }
@@ -436,6 +438,7 @@ fn check_single_op(
     planned_mkdirs: &[PathBuf],
     trashed_entry_ids: &HashSet<i64>,
     trashed_paths: &[PathBuf],
+    remote_keep: bool,
     item: ResolvedInput,
 ) -> Result<PreparedOp, String> {
     match item.op {
@@ -571,6 +574,7 @@ fn check_single_op(
                 role_info.effective,
                 trashed_entry_ids,
                 trashed_paths,
+                remote_keep,
             )?;
 
             Ok(PreparedOp {
@@ -663,6 +667,7 @@ fn check_db_and_disk_source(db: &Db, loc: &Located) -> Result<VerifiedSource, St
     Ok(VerifiedSource { stored, disk_mtime })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_trash_risk(
     db: &Db,
     loc: &Located,
@@ -671,6 +676,8 @@ fn evaluate_trash_risk(
     effective_role: Option<Role>,
     trashed_entry_ids: &HashSet<i64>,
     trashed_paths: &[PathBuf],
+    // 遠隔の残す側は実行直前に予約と完全ハッシュで確認するので、「最後の 1 つ」とは数えない。
+    remote_keep: bool,
 ) -> Result<CheckStatus, String> {
     // cache・install・log の中の trash は危なくない（作り直せる・入れ直せる）。
     if matches!(
@@ -702,7 +709,9 @@ fn evaluate_trash_risk(
                     )? {
                         reasons.push("残す予定の keep が見つからないか中身が違います".to_string());
                     }
-                } else if !has_other_copy(db, loc, stored, &hash, trashed_entry_ids)? {
+                } else if !remote_keep
+                    && !has_other_copy(db, loc, stored, &hash, trashed_entry_ids)?
+                {
                     reasons.push("同じ中身の残りが他にありません（最後の 1 つ）".to_string());
                 }
             }
@@ -909,24 +918,35 @@ pub(crate) fn recheck_op_before_apply(db: &Db, ctx: &Context, op: &PlanOp) -> Re
                     return Err("ファイルの中身が DB のハッシュと違っています".into());
                 }
             }
-            // keep が指定されていれば、残す方がまだディスクにあるか見る（同じ計画の move で動いた先も許す）。
-            if let Some(keep) = op.keep.as_deref()
-                && !keep_exists_on_disk_or_moved_in_plan(db, op.plan_id, keep)?
-            {
-                return Err("残す予定の keep が見つかりません".into());
+            // 同じ計画で先に move した keep は、移動先の現物で確かめる。
+            if let Some(keep) = op.keep.as_deref() {
+                let path = keep_path_for_apply(db, op.plan_id, keep)?
+                    .ok_or("残す予定の keep が見つかりません")?;
+                if verified.stored.kind == Kind::File
+                    && let Some(expected) = op.hash
+                {
+                    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                        format!("残すファイルを確かめられませんでした: {error}")
+                    })?;
+                    if !metadata.is_file() || metadata.len() != verified.stored.size {
+                        return Err("残すファイルの種類か大きさが変わっています".into());
+                    }
+                    let actual = hash::hash_file(&path).map_err(|error| {
+                        format!("残すファイルのハッシュを確かめられませんでした: {error}")
+                    })?;
+                    if actual != expected {
+                        return Err("残すファイルの中身が変わっています".into());
+                    }
+                }
             }
             Ok(())
         }
     }
 }
 
-fn keep_exists_on_disk_or_moved_in_plan(
-    db: &Db,
-    plan_id: i64,
-    keep: &Path,
-) -> Result<bool, String> {
+fn keep_path_for_apply(db: &Db, plan_id: i64, keep: &Path) -> Result<Option<PathBuf>, String> {
     if fs::symlink_metadata(keep).is_ok() {
-        return Ok(true);
+        return Ok(Some(keep.to_path_buf()));
     }
     let keep_s = super::plan::path_to_string(keep);
     let moved_dst: Option<String> = db
@@ -940,7 +960,9 @@ fn keep_exists_on_disk_or_moved_in_plan(
         .optional()
         .map_err(|e| e.to_string())?
         .flatten();
-    Ok(moved_dst.is_some_and(|d| fs::symlink_metadata(Path::new(&d)).is_ok()))
+    Ok(moved_dst
+        .map(PathBuf::from)
+        .filter(|path| fs::symlink_metadata(path).is_ok()))
 }
 
 /// 計画を作ったときの記録（大きさ・更新日時・ハッシュ）と、今のディスクが合っているか確かめる。
