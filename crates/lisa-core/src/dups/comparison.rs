@@ -199,7 +199,7 @@ fn build(
         let mut cursor = statement.query([]).map_err(read_error)?;
         while let Some(row) = cursor.next().map_err(read_error)? {
             let id: i64 = row.get(0).map_err(read_error)?;
-            if shape.excluded[id as usize] {
+            if shape.excluded[id as usize] || shape.contains_marker[id as usize] {
                 continue;
             }
             let directory = row.get_ref(1).map_err(read_error)?.as_str() == Ok("dir");
@@ -299,7 +299,7 @@ pub fn locations(
         crate::display_path::DisplayPaths::read(db, &Default::default()).map_err(read_error)?;
     let mut current = conn
         .prepare_cached(
-            "SELECT drive_id, file_id, kind, size, hash, cloud_only, other_volume
+            "SELECT drive_id, file_id, kind, size, hash, cloud_only, other_volume, merged IS NOT NULL
              FROM entry WHERE id = ?1",
         )
         .map_err(read_error)?;
@@ -316,7 +316,9 @@ pub fn locations(
                             row.get::<_, String>(2)? == "dir",
                             row.get::<_, i64>(3)? as u64,
                             row.get::<_, Option<Vec<u8>>>(4)?,
-                            row.get::<_, bool>(5)? || row.get::<_, bool>(6)?,
+                            row.get::<_, bool>(5)?
+                                || row.get::<_, bool>(6)?
+                                || row.get::<_, bool>(7)?,
                         ))
                     })
                     .optional()

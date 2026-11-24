@@ -64,6 +64,8 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     let settings = settings_path();
     let mut ctx = Context::load(data_dir.clone(), settings.as_deref());
     ctx.keep_client = Some(lisa_mcp::relay_client);
+    ctx.link_client = Some(lisa_mcp::link_relay_client);
+    ctx.relocation_client = Some(lisa_mcp::relocation_client);
     let mut db = app_db()?;
     run_with(&mut db, &ctx, settings.as_deref(), cmd)
 }

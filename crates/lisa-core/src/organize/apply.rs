@@ -59,6 +59,9 @@ fn process_lock(data_dir: &Path, wait: bool) -> Result<ProcessLock, String> {
 /// ロックファイルの名前（`<data_dir>/organize.lock`）。
 const LOCK_FILE: &str = "organize.lock";
 
+/// 他の記述子が一瞬だけロックを持っている場合に取り直す長さ。
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// 実行の結果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyReport {
@@ -120,7 +123,15 @@ fn lock_plans_with(
         .truncate(false)
         .open(data_dir.join(LOCK_FILE))
         .map_err(open_error)?;
-    match file.try_lock() {
+    // 同じプロセスの別スレッドが子プロセスを起こした直後などに、ロックが数ミリ秒だけ他の記述子に
+    // 持たれていることがある。別の計画が本当に動いているかは、少し待って取り直してから判断する。
+    let started = std::time::Instant::now();
+    let mut result = file.try_lock();
+    while matches!(result, Err(TryLockError::WouldBlock)) && started.elapsed() < LOCK_RETRY {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        result = file.try_lock();
+    }
+    match result {
         Ok(()) => {
             #[cfg(test)]
             plan_start_hook::HOOK.with(|hook| {
@@ -214,7 +225,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             Err(error) => return Err(error),
         }
     }
-    let _lease = lease;
+    let lease = lease;
     if plan.state == PlanState::Approved {
         plan::set_plan_state(db, plan_id, PlanState::Running, None).map_err(|e| e.to_string())?;
     }
@@ -228,11 +239,13 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
     let mut ops = plan::plan_ops(db, plan_id).map_err(|e| e.to_string())?;
     ops.sort_by_key(|o| (o.op.phase(), o.seq));
 
+    let mut linked_touched = Vec::new();
     for op in &ops {
         if op.state != OpState::Pending {
             continue;
         }
         if let Some(reason) = &remote_failure {
+            super::markers::abandon(db, op)?;
             plan::set_op_state(
                 db,
                 plan_id,
@@ -246,6 +259,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             continue;
         }
         if plan.skip_risky && op.risky.is_some() {
+            super::markers::abandon(db, op)?;
             plan::set_op_state(
                 db,
                 plan_id,
@@ -264,6 +278,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             if remote.is_some() {
                 remote_failure = Some(format!("{reason}。重複を再取得して確認してください"));
             }
+            super::markers::abandon(db, op)?;
             plan::set_op_state(
                 db,
                 plan_id,
@@ -283,6 +298,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             && quarantine::choose_quarantine_base(&ctx.data_dir, drive_mount.as_deref(), &op.src)
                 .is_none()
         {
+            super::markers::abandon(db, op)?;
             plan::set_op_state(
                 db,
                 plan_id,
@@ -296,10 +312,31 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             continue;
         }
 
-        // 1 件ごとに「始めた（running）」を DB に確定してから動かす。
-        plan::set_op_state(db, plan_id, op.seq, OpState::Running, None, None, None)
-            .map_err(|e| e.to_string())?;
+        let marker_preparation = super::markers::prepare(
+            db,
+            op,
+            remote.as_ref().map(|intent| (ctx, intent)),
+            lease.as_ref().and_then(|lease| lease.location.clone()),
+        );
+        let preparation_warning = marker_preparation
+            .as_ref()
+            .err()
+            .map(|reason| format!("隔離済み／目印を作成できませんでした: {reason}"));
 
+        // 1 件ごとに「始めた（running）」を DB に確定してから動かす。
+        plan::set_op_state(
+            db,
+            plan_id,
+            op.seq,
+            OpState::Running,
+            None,
+            preparation_warning.as_deref(),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let updated_links = super::linked_delete::prepare_delete(db, ctx, op)?;
+        linked_touched.extend(updated_links);
         let result = if let Some(intent) = &remote {
             let source = usize::try_from(op.seq)
                 .ok()
@@ -308,7 +345,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
                 .ok_or("隔離対象の記録が見つかりません".to_string())
                 .and_then(|source| {
                     remote_keep::isolate_source(db, ctx, op, source, || {
-                        remote_keep::call(ctx, intent, RelayAction::Renew)
+                        remote_keep::call(ctx, intent, RelayAction::Renew).map(|_| ())
                     })
                 })
                 .map(|path| OpExecOutcome::Done {
@@ -332,6 +369,14 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
         }
         match result {
             Ok(OpExecOutcome::Done { exact_dst, warning }) => {
+                super::linked_delete::update_missing(db, op, true)?;
+                let marker_warning = match marker_preparation {
+                    Ok(()) => super::markers::publish(db, op, exact_dst.as_deref()).unwrap_or_else(
+                        |reason| Some(format!("隔離済み／目印の状態を記録できません: {reason}")),
+                    ),
+                    Err(_) => preparation_warning,
+                };
+                let warning = join_reasons(warning.as_deref(), marker_warning);
                 if op.op == OpKind::Mkdir {
                     plan::set_op_result_exact_dst(
                         db,
@@ -357,6 +402,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
                 }
             }
             Ok(OpExecOutcome::Skipped(reason)) => {
+                super::markers::abandon(db, op)?;
                 plan::set_op_state(
                     db,
                     plan_id,
@@ -369,6 +415,7 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
                 .map_err(|e| e.to_string())?;
             }
             Err(reason) => {
+                super::markers::abandon(db, op)?;
                 plan::set_op_state(
                     db,
                     plan_id,
@@ -403,7 +450,10 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
     };
     plan::set_plan_state(db, plan_id, state, Some(db::now_ms())).map_err(|e| e.to_string())?;
 
-    let touched = touched_folders(&final_ops);
+    let mut touched = touched_folders(&final_ops);
+    touched.extend(linked_touched);
+    touched.sort_unstable();
+    touched.dedup();
     Ok(ApplyReport {
         plan_id,
         state,
@@ -671,13 +721,20 @@ fn recover_running_ops(
                     });
                 match (src_exists, q_dest) {
                     (false, Some(dest)) => {
+                        super::linked_delete::update_missing(db, &op, true)?;
+                        let warning = super::markers::publish(db, &op, Some(&dest)).unwrap_or_else(
+                            |reason| {
+                                Some(format!("隔離済み／目印の状態を記録できません: {reason}"))
+                            },
+                        );
+                        let warning = join_reasons(op.reason.as_deref(), warning);
                         plan::set_op_state(
                             db,
                             plan_id,
                             op.seq,
                             OpState::Done,
                             Some(&dest),
-                            None,
+                            warning.as_deref(),
                             Some(now),
                         )
                         .map_err(|e| e.to_string())?;
@@ -752,6 +809,11 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
         let retryable = peer_managed && op.op == OpKind::Trash && plan.purged_at.is_none();
         match undo_one_op(&plan, &op) {
             Ok(warning) => {
+                super::linked_delete::update_missing(db, &op, false)?;
+                let marker_warning = super::markers::remove_after_undo(db, &op)
+                    .err()
+                    .map(|reason| format!("復元済み／目印が残っています: {reason}"));
+                let warning = join_reasons(warning.as_deref(), marker_warning);
                 let reason = if retryable {
                     warning
                 } else {

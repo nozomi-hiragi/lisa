@@ -199,6 +199,8 @@ pub struct Item {
     pub id: i64,
     pub name: String,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged: Option<crate::merged::Marker>,
     /// ファイルの大きさ。フォルダは 0（`folder_total` で足す）。
     pub size: u64,
     /// 更新日時（UTC の Unix 時刻、ミリ秒）。
@@ -218,6 +220,7 @@ impl From<crate::db::Stored> for Item {
             id: s.id,
             name: s.name_nfc,
             kind: kind_str(s.kind).to_string(),
+            merged: s.merged,
             size: s.size,
             mtime: s.mtime,
             hash: s.hash.map(|h| hex(&h)),

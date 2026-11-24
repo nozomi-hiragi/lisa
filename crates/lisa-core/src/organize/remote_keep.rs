@@ -85,12 +85,17 @@ pub(super) fn remote_plan(db: &Db, plan_id: i64) -> Result<Option<RemotePlan>, S
 pub(super) struct ActiveLease<'a> {
     ctx: &'a super::Context,
     plan: &'a RemotePlan,
+    pub(super) location: Option<crate::merged::Location>,
 }
 
 impl<'a> ActiveLease<'a> {
     pub(super) fn acquire(ctx: &'a super::Context, plan: &'a RemotePlan) -> Result<Self, String> {
-        call(ctx, plan, relay::RelayAction::Reserve)?;
-        Ok(Self { ctx, plan })
+        let location = call(ctx, plan, relay::RelayAction::Reserve)?;
+        Ok(Self {
+            ctx,
+            plan,
+            location,
+        })
     }
 }
 
@@ -119,12 +124,12 @@ pub(super) fn call(
     ctx: &super::Context,
     plan: &RemotePlan,
     action: relay::RelayAction,
-) -> Result<(), String> {
+) -> Result<Option<crate::merged::Location>, String> {
     let client = ctx
         .keep_client
         .ok_or("依頼元への接続を使えません。Mac の Lisa を起動して再度承認してください")?;
     let started = std::time::Instant::now();
-    client(&ctx.data_dir, &plan.route, &plan.keep, action).map_err(|error| format!(
+    let location = client(&ctx.data_dir, &plan.route, &plan.keep, action).map_err(|error| format!(
         "依頼元または残す側を確認できません。Mac の Lisa を起動して重複を再取得してください: {error}"
     ))?;
     if matches!(
@@ -134,7 +139,7 @@ pub(super) fn call(
     {
         return Err("中継の確認中に予約期限が近づきました。重複を再取得してください".into());
     }
-    Ok(())
+    Ok(location)
 }
 
 pub fn resolve(db: &Db, keep: &KeepReference) -> Result<PathBuf, String> {
@@ -271,6 +276,11 @@ impl ProtectedKeep {
             protected,
             path: path.to_path_buf(),
         })
+    }
+
+    pub fn location(&self, db: &Db, keep: &KeepReference) -> Option<crate::merged::Location> {
+        crate::merged::Location::local(db, &keep.drive_id, &self.path)
+            .filter(|location| location.device_id == keep.device_id)
     }
 
     fn assert_path(&self, path: &Path) -> Result<(), String> {

@@ -40,6 +40,8 @@ pub struct ManifestEntry {
     pub rel_path: String,
     pub quarantined_path: PathBuf,
     pub quarantined_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_marker_path: Option<PathBuf>,
 }
 
 /// OS のゴミ箱へ送った結果。
@@ -211,6 +213,7 @@ pub(crate) fn move_to_quarantine(
             rel_path: rel_str,
             quarantined_path: dest.clone(),
             quarantined_at: db::now_ms(),
+            merge_marker_path: None,
         },
         plan_id,
     );
@@ -255,8 +258,33 @@ fn append_manifest(plan_dir: &Path, entry: ManifestEntry, plan_id: i64) -> Resul
     if !manifest.entries.iter().any(|e| e.seq == entry.seq) {
         manifest.entries.push(entry);
     }
+    save_manifest(plan_dir, &manifest)
+}
+
+pub(super) fn record_merge_marker(
+    quarantined: &Path,
+    plan_id: i64,
+    seq: i64,
+    marker_path: &Path,
+) -> Result<(), String> {
+    let plan_dir = find_plan_dir_ancestor(quarantined, &plan_id.to_string())
+        .ok_or("隔離計画のフォルダが見つかりません")?;
+    let bytes = fs::read(plan_dir.join(MANIFEST_FILE)).map_err(|error| error.to_string())?;
+    let mut manifest: Manifest =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let entry = manifest
+        .entries
+        .iter_mut()
+        .find(|entry| entry.seq == seq && entry.quarantined_path == quarantined)
+        .ok_or("隔離マニフェストの項目が見つかりません")?;
+    entry.merge_marker_path = Some(marker_path.to_path_buf());
+    save_manifest(&plan_dir, &manifest)
+}
+
+fn save_manifest(plan_dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    let path = plan_dir.join(MANIFEST_FILE);
     let tmp = plan_dir.join(format!(".{MANIFEST_FILE}.tmp.{}", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec_pretty(manifest).map_err(|e| e.to_string())?;
     fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
     fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
     Ok(())

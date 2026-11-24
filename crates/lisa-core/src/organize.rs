@@ -7,6 +7,8 @@
 
 mod apply;
 mod check;
+mod linked_delete;
+pub(crate) mod markers;
 mod plan;
 mod quarantine;
 pub mod remote_keep;
@@ -50,7 +52,25 @@ pub struct Context {
     /// 守る場所の判定で使うホームディレクトリ（`None` なら環境変数 `HOME` / `USERPROFILE`）。
     pub home_dir: Option<PathBuf>,
     pub keep_client: Option<remote_keep::relay::Client>,
+    pub link_client: Option<LinkClient>,
+    pub relocation_client: Option<RelocationClient>,
 }
+
+pub type LinkClient = fn(
+    &std::path::Path,
+    &remote_keep::relay::Route,
+    &crate::merged::links::Update,
+) -> Result<(), String>;
+
+pub type RelocationClient =
+    fn(&std::path::Path, &str, &TransferRequest) -> Result<TransferReply, String>;
+
+pub use linked_delete::{
+    DeleteChoice, DeleteRequest, TransferAction, TransferManifest, TransferReply, TransferRequest,
+    clean_expired_receives, linked_delete_sources, receive_transfer,
+};
+
+pub use markers::flush_links;
 
 impl Context {
     pub fn new(data_dir: PathBuf, catalogs: CatalogSet) -> Self {
@@ -59,6 +79,8 @@ impl Context {
             catalogs,
             home_dir: None,
             keep_client: None,
+            link_client: None,
+            relocation_client: None,
         }
     }
 
@@ -146,50 +168,50 @@ pub(crate) fn is_name_alias(from: &std::path::Path, to: &std::path::Path) -> std
     Ok(found_from)
 }
 
-#[cfg(unix)]
 fn same_file_identity(from: &std::path::Path, to: &std::path::Path) -> bool {
+    file_identity(from).is_some_and(|id| Some(id) == file_identity(to))
+}
+
+#[cfg(unix)]
+pub(crate) fn file_identity(path: &std::path::Path) -> Option<(u64, [u8; 16])> {
     use std::os::unix::fs::MetadataExt;
-    let (Ok(from), Ok(to)) = (
-        std::fs::symlink_metadata(from),
-        std::fs::symlink_metadata(to),
-    ) else {
-        return false;
-    };
-    (from.dev(), from.ino()) == (to.dev(), to.ino()) && from.ino() != 0
+
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    (metadata.ino() != 0).then_some((
+        metadata.dev() as u64,
+        u128::from(metadata.ino()).to_le_bytes(),
+    ))
 }
 
 #[cfg(windows)]
-fn same_file_identity(from: &std::path::Path, to: &std::path::Path) -> bool {
+pub(crate) fn file_identity(path: &std::path::Path) -> Option<(u64, [u8; 16])> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FileIdInfo,
         GetFileInformationByHandleEx,
     };
 
-    let identity = |path| {
-        let file = std::fs::OpenOptions::new()
-            .access_mode(0)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .ok()?;
-        // SAFETY: 開いたハンドルと FILE_ID_INFO 用の書き込み先は呼び出し中有効。
-        unsafe {
-            let mut info: FILE_ID_INFO = std::mem::zeroed();
-            let ok = GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                FileIdInfo,
-                (&mut info as *mut FILE_ID_INFO).cast(),
-                size_of::<FILE_ID_INFO>() as u32,
-            );
-            (ok != 0).then_some((info.VolumeSerialNumber, info.FileId.Identifier))
-        }
-    };
-    identity(from).is_some_and(|id| Some(id) == identity(to))
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .ok()?;
+    // SAFETY: ハンドルと書き込み先は呼び出し中有効。
+    unsafe {
+        let mut info: FILE_ID_INFO = std::mem::zeroed();
+        let ok = GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        );
+        (ok != 0).then_some((info.VolumeSerialNumber, info.FileId.Identifier))
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file_identity(_from: &std::path::Path, _to: &std::path::Path) -> bool {
-    false
+pub(crate) fn file_identity(_path: &std::path::Path) -> Option<(u64, [u8; 16])> {
+    None
 }
 
 #[cfg(test)]
@@ -1387,6 +1409,356 @@ mod tests {
         let undo = undo_plan(&mut h.db, &h.ctx, p3).unwrap();
         assert_eq!(undo.undone, 0);
         assert_eq!(undo.skipped.len(), 1);
+    }
+
+    #[test]
+    fn merged_file_survives_name_collision_and_preserves_ancestor_hash() {
+        let mut h = Harness::new("merge-marker");
+        let source_parent = h.drive.join("a").join("b");
+        fs::create_dir_all(&source_parent).unwrap();
+        let keep = h.drive.join("keep.txt");
+        let source = source_parent.join("海 写真.txt");
+        let collision = source_parent.join("海 写真.txt.lmf");
+        fs::write(&collision, b"same").unwrap();
+        fs::write(&source, b"same").unwrap();
+        fs::write(&keep, b"same").unwrap();
+        h.scan(true);
+        let before = h.db.drive_root("test:vol1").unwrap().unwrap().hash;
+        let signature = crate::dups::signature(&h.db).unwrap();
+
+        let id = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "cli",
+            None,
+            &[OpInput::Trash {
+                path: source.clone(),
+                keep: Some(keep),
+            }],
+            false,
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&collision).unwrap(), b"same");
+        let marker_path = source_parent.join("海 写真.txt (2).lmf");
+        let marker = crate::merged::read(&marker_path).unwrap();
+        assert_eq!(crate::merged::inspect(&marker_path).unwrap(), marker);
+        assert!(
+            crate::merged::inspect(&collision)
+                .unwrap_err()
+                .contains("形式ではありません")
+        );
+        let renamed = source_parent.join("種類違い.lmd");
+        fs::copy(&marker_path, &renamed).unwrap();
+        assert!(
+            crate::merged::inspect(&renamed)
+                .unwrap_err()
+                .contains("種類が一致しません")
+        );
+        fs::remove_file(&renamed).unwrap();
+        assert!(
+            crate::merged::inspect(&source_parent.join("無い.lmf"))
+                .unwrap_err()
+                .contains("開けません")
+        );
+        assert_eq!(marker.source.relative_path.last().unwrap(), "海 写真.txt");
+        assert_eq!(marker.target.relative_path, ["keep.txt"]);
+        assert_eq!(marker.kind, Kind::File);
+        h.scan(true);
+        assert_eq!(h.db.drive_root("test:vol1").unwrap().unwrap().hash, before);
+        assert_ne!(crate::dups::signature(&h.db).unwrap(), signature);
+        let groups = crate::dups::groups(&h.db, 5).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].copies.len(), 2);
+        assert!(groups[0].copies.iter().any(|copy| copy.path == collision));
+
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+        assert_eq!(fs::read(source).unwrap(), b"same");
+        assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn opening_a_marker_resolves_only_the_recorded_unchanged_target() {
+        let mut h = Harness::new("merge-target");
+        let keep = h.drive.join("keep.txt");
+        let source = h.drive.join("copy.txt");
+        for path in [&source, &keep] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        let id = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "cli",
+            None,
+            &[OpInput::Trash {
+                path: source,
+                keep: Some(keep.clone()),
+            }],
+            false,
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+        let marker = crate::merged::read(&h.drive.join("copy.txt.lmf")).unwrap();
+        let expected = query::locate(&h.db, &keep).unwrap().unwrap().chain;
+        assert_eq!(
+            crate::merged::resolve_target(&h.db, &marker).unwrap(),
+            expected
+        );
+        fs::write(&keep, b"else").unwrap();
+        assert!(
+            crate::merged::resolve_target(&h.db, &marker)
+                .unwrap_err()
+                .contains("内容が変わっています")
+        );
+        fs::write(&keep, b"same").unwrap();
+        fs::rename(&keep, h.drive.join("renamed.txt")).unwrap();
+        assert!(
+            crate::merged::resolve_target(&h.db, &marker)
+                .unwrap_err()
+                .contains("移動・改名")
+        );
+    }
+
+    #[test]
+    fn folder_target_remains_verifiable_after_a_child_becomes_a_link() {
+        let mut h = Harness::new("merge-nested-marker");
+        let retained = h.drive.join("retained");
+        let source = h.drive.join("source");
+        let kept_child = h.drive.join("child.txt");
+        fs::write(&kept_child, b"same").unwrap();
+        for folder in [&retained, &source] {
+            fs::create_dir(folder).unwrap();
+            fs::write(folder.join("child.txt"), b"same").unwrap();
+        }
+        h.scan(true);
+
+        for (copy, keep) in [
+            (source, retained.clone()),
+            (retained.join("child.txt"), kept_child),
+        ] {
+            let id = create_plan(
+                &mut h.db,
+                &h.ctx,
+                "cli",
+                None,
+                &[OpInput::Trash {
+                    path: copy,
+                    keep: Some(keep),
+                }],
+                false,
+            )
+            .unwrap()
+            .id
+            .unwrap();
+            approve_plan(&mut h.db, id, false).unwrap();
+            assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+            h.scan(true);
+        }
+        let marker = crate::merged::read(&h.drive.join("source.lmd")).unwrap();
+        let expected = query::locate(&h.db, &retained).unwrap().unwrap().chain;
+        assert_eq!(
+            crate::merged::resolve_target(&h.db, &marker).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn undo_keeps_a_marker_whose_text_was_edited() {
+        use std::io::Write;
+
+        let mut h = Harness::new("merge-undo-edit");
+        let keep = h.drive.join("keep.txt");
+        let source = h.drive.join("copy.txt");
+        for path in [&source, &keep] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        let id = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "cli",
+            None,
+            &[OpInput::Trash {
+                path: source.clone(),
+                keep: Some(keep),
+            }],
+            false,
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+        let marker = h.drive.join("copy.txt.lmf");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&marker)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+        assert!(source.exists());
+        assert!(marker.exists());
+        let op = plan_ops(&h.db, id).unwrap().remove(0);
+        assert!(op.reason.unwrap().contains("目印が残っています"));
+    }
+
+    #[test]
+    fn recovery_creates_folder_marker_once_and_does_not_restore_a_deleted_marker() {
+        for already_published in [false, true] {
+            let mut h = Harness::new("merge-recovery");
+            let keep = h.drive.join("keep");
+            let source = h.drive.join("copy");
+            for path in [&source, &keep] {
+                fs::create_dir_all(path).unwrap();
+                fs::write(path.join("child"), b"same").unwrap();
+            }
+            h.scan(true);
+            let before = h.db.drive_root("test:vol1").unwrap().unwrap().hash;
+            let id = create_plan(
+                &mut h.db,
+                &h.ctx,
+                "cli",
+                None,
+                &[OpInput::Trash {
+                    path: source.clone(),
+                    keep: Some(keep.clone()),
+                }],
+                false,
+            )
+            .unwrap()
+            .id
+            .unwrap();
+            approve_plan(&mut h.db, id, false).unwrap();
+            plan::set_plan_state(&mut h.db, id, PlanState::Running, None).unwrap();
+            plan::set_op_state(&mut h.db, id, 0, OpState::Running, None, None, None).unwrap();
+            let op = plan_ops(&h.db, id).unwrap().remove(0);
+            markers::prepare(&mut h.db, &op, None, None).unwrap();
+            let quarantined = quarantine::move_to_quarantine(
+                id,
+                0,
+                OpKind::Trash,
+                &source,
+                Some(&h.drive),
+                &h.data_dir,
+                |from, to| fs::rename(from, to),
+            )
+            .unwrap();
+            let path = h.drive.join("copy.lmd");
+            if already_published {
+                markers::publish(&mut h.db, &op, Some(&quarantined)).unwrap();
+                fs::remove_file(&path).unwrap();
+            }
+            assert_eq!(recover_running_plans(&mut h.db, &h.ctx).unwrap()[0].done, 1);
+            assert_eq!(path.exists(), !already_published);
+            if !already_published {
+                let marker = crate::merged::read(&path).unwrap();
+                assert_eq!(marker.kind, Kind::Dir);
+                assert_eq!(marker.size, 4);
+                h.scan(true);
+                assert_eq!(h.db.drive_root("test:vol1").unwrap().unwrap().hash, before);
+                assert!(crate::dups::groups(&h.db, 5).unwrap().is_empty());
+            }
+            assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+            assert_eq!(fs::read(source.join("child")).unwrap(), b"same");
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn deleting_linked_actual_requires_a_choice_and_retargets_other_local_links() {
+        let mut h = Harness::new("linked-delete");
+        let a = h.drive.join("keeper.txt");
+        let b = h.drive.join("restore.txt");
+        let c = h.drive.join("other.txt");
+        for path in [&a, &b, &c] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        let merge = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "cli",
+            None,
+            &[
+                OpInput::Trash {
+                    path: b.clone(),
+                    keep: Some(a.clone()),
+                },
+                OpInput::Trash {
+                    path: c.clone(),
+                    keep: Some(a.clone()),
+                },
+            ],
+            false,
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        approve_plan(&mut h.db, merge, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, merge).unwrap().done, 2);
+        h.scan(true);
+
+        let pending = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "cli",
+            None,
+            &[OpInput::Trash {
+                path: a.clone(),
+                keep: None,
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(!pending.created);
+        assert!(pending.checks[0].check.contains("確認待ち"));
+        let sources = linked_delete_sources(&h.db, &a).unwrap();
+        assert_eq!(sources.len(), 2);
+        let marker_b = crate::merged::read(&h.drive.join("restore.txt.lmf")).unwrap();
+        let result = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "cli",
+            None,
+            &[OpInput::TrashLinked {
+                path: a.clone(),
+                decision: DeleteRequest {
+                    choice: DeleteChoice::Restore {
+                        link_id: marker_b.link_id.clone(),
+                    },
+                    links: sources
+                        .into_iter()
+                        .map(|link| link.marker.link_id)
+                        .collect(),
+                },
+            }],
+            false,
+        )
+        .unwrap();
+        let id = result.id.unwrap_or_else(|| panic!("{:?}", result.checks));
+        assert_eq!(result.summary.risky, 0, "戻し先があれば最後の 1 つではない");
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+        assert!(!a.exists());
+        assert_eq!(fs::read(&b).unwrap(), b"same");
+        assert!(!h.drive.join("restore.txt.lmf").exists());
+        let marker_c = crate::merged::read(&h.drive.join("other.txt.lmf")).unwrap();
+        assert_eq!(marker_c.target, marker_b.source);
+        h.scan(true);
+        let expected = query::locate(&h.db, &b).unwrap().unwrap().chain;
+        assert_eq!(
+            crate::merged::resolve_target(&h.db, &marker_c).unwrap(),
+            expected
+        );
     }
 
     #[test]

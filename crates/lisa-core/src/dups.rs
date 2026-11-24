@@ -73,11 +73,28 @@ pub fn signature(db: &Db) -> Result<Option<Signature>> {
         }
         signature.push((id, hash));
     }
+    // 目印への置き換えでは親のハッシュを維持するが、重複候補は変わる。
+    let mut statement = db
+        .conn()
+        .prepare("SELECT id, parent_id, merged FROM entry WHERE merged IS NOT NULL ORDER BY id")?;
+    let mut rows = statement.query([])?;
+    let mut markers = blake3::Hasher::new();
+    while let Some(row) = rows.next()? {
+        markers.update(&row.get::<_, i64>(0)?.to_le_bytes());
+        markers.update(&row.get::<_, i64>(1)?.to_le_bytes());
+        let json: String = row.get(2)?;
+        markers.update(&(json.len() as u64).to_le_bytes());
+        markers.update(json.as_bytes());
+    }
+    signature.push((
+        "lisa-merged".to_string(),
+        Some(*markers.finalize().as_bytes()),
+    ));
     Ok(Some(signature))
 }
 
 /// 除外規則が変わったら以前の一覧を読み込まない。
-pub const CACHE_FILE: &str = "duplicates-v2.json";
+pub const CACHE_FILE: &str = "duplicates-v3.json";
 
 /// キャッシュに残す一覧と、そのときの DB の状態。
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -91,6 +108,7 @@ struct Shape {
     parent: Vec<i64>,
     total: Vec<u64>,
     excluded: Vec<bool>,
+    contains_marker: Vec<bool>,
 }
 
 /// ボリューム直下で OS が管理するフォルダ。
@@ -115,8 +133,9 @@ impl Shape {
         let mut parent = vec![0i64; n];
         let mut total = vec![0u64; n];
         let mut excluded = vec![false; n];
+        let mut contains_marker = vec![false; n];
         let mut statement =
-            conn.prepare("SELECT id, parent_id, kind, size, name_nfc, cloud_only, other_volume FROM entry ORDER BY id")?;
+            conn.prepare("SELECT id, parent_id, kind, size, name_nfc, cloud_only, other_volume, merged IS NOT NULL FROM entry ORDER BY id")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(0)?;
@@ -131,7 +150,8 @@ impl Shape {
                 || crate::name::is_os_junk(name.as_ref())
                 || crate::name::is_quarantine_dir(name.as_ref())
                 || (p != 0 && parent[p] == 0 && kind == "dir" && is_volume_metadata(&name));
-            if !excluded[index] && kind == "file" {
+            contains_marker[index] = row.get(7)?;
+            if !excluded[index] && !contains_marker[index] && kind == "file" {
                 total[index] = row.get::<_, i64>(3)? as u64;
             }
         }
@@ -140,12 +160,14 @@ impl Shape {
             let p = parent[id] as usize;
             if p != 0 {
                 total[p] += total[id];
+                contains_marker[p] |= contains_marker[id];
             }
         }
         Ok(Self {
             parent,
             total,
             excluded,
+            contains_marker,
         })
     }
 
@@ -196,7 +218,10 @@ pub fn groups(db: &Db, limit: usize) -> Result<Vec<Group>> {
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let id: i64 = row.get(1)?;
-            if !shape.excluded[id as usize] && shape.total[id as usize] > 0 {
+            if !shape.excluded[id as usize]
+                && !shape.contains_marker[id as usize]
+                && shape.total[id as usize] > 0
+            {
                 folders.entry(row.get(0)?).or_default().push(id);
             }
         }
@@ -227,7 +252,7 @@ pub fn groups(db: &Db, limit: usize) -> Result<Vec<Group>> {
             "SELECT e.hash, e.id, e.drive_id, e.file_id, e.size FROM entry e
              JOIN (SELECT hash FROM entry WHERE kind = 'file' AND hash IS NOT NULL
                    GROUP BY hash HAVING count(*) > 1) d ON e.hash = d.hash
-             WHERE e.kind = 'file' AND e.size > 0 AND e.cloud_only = 0
+             WHERE e.kind = 'file' AND e.size > 0 AND e.cloud_only = 0 AND e.merged IS NULL
              ORDER BY e.hash, e.id",
         )?;
         let mut rows = statement.query([])?;
