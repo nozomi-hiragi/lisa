@@ -8,6 +8,9 @@ edition = "2024"
 members = ["crates/lisa-core", "crates/lisa-scan", "crates/lisa-mcp"]
 default-members = ["."]
 
+[features]
+verify-fs = ["lisa-mcp/verify-fs"]
+
 [dependencies]
 bevy = "0.20.1"
 lisa-core = { path = "crates/lisa-core" }

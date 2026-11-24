@@ -52,10 +52,7 @@ impl Plugin for ScanPlugin {
             warn!("クラウドのファイルをダウンロードしない設定にできませんでした: {error}");
         }
         info!("ドライブを調べています");
-        let mut drives = lisa_core::volumes::list().unwrap_or_else(|error| {
-            warn!("ドライブの一覧が取れませんでした: {error}");
-            vec![root_volume()]
-        });
+        let mut drives = scan_volumes();
         // 描画の検証で、使い捨てのボリュームだけを読む。
         if crate::remote::debug_remote_enabled()
             && let Some(mounts) = std::env::var_os("LISA_DEBUG_SCAN_MOUNTS")
@@ -275,6 +272,33 @@ impl Store {
             .filter_map(|&child| self.roots.get(&child)?.0.clone())
             .collect()
     }
+}
+
+fn scan_volumes() -> Vec<lisa_core::volumes::Volume> {
+    #[cfg(all(windows, feature = "verify-fs"))]
+    if let Some(root) = std::env::var_os("LISA_VERIFY_SCAN_ROOT") {
+        let Some(path) = root
+            .to_str()
+            .and_then(|root| lisa_mcp::isolated_directory(root).ok())
+        else {
+            warn!("検証用の走査ルートを確認できませんでした");
+            return Vec::new();
+        };
+        if let Err(error) = lisa_mcp::validate_isolated_tree(&path) {
+            warn!("検証用の走査ツリーを確認できませんでした: {error}");
+            return Vec::new();
+        }
+        return vec![lisa_core::volumes::Volume {
+            id: Some("verify:synthetic".into()),
+            label: "検証用".into(),
+            mount_path: path,
+            ..root_volume()
+        }];
+    }
+    lisa_core::volumes::list().unwrap_or_else(|error| {
+        warn!("ドライブの一覧が取れませんでした: {error}");
+        vec![root_volume()]
+    })
 }
 
 /// ドライブの一覧が取れない OS（開発用の Linux など）では、「/」だけを出す。
@@ -562,6 +586,7 @@ pub struct ScanProgress(pub Arc<Mutex<Progress>>);
 /// 読む係から届く結果を受け取る。
 #[derive(Resource)]
 pub(crate) struct Scanner {
+    control: Arc<worker::Control>,
     results: Mutex<Receiver<Message>>,
     /// 木にあって、まだ読み終えていないフォルダ（パスからノードを引く）。
     pending: HashMap<PathBuf, NodeId>,
@@ -573,6 +598,14 @@ pub(crate) struct Scanner {
     hashed: HashSet<PathBuf>,
     /// 読み直したら変わっていて、まだハッシュし直していないフォルダ（子を出し直しても古いにする）。
     stale: HashSet<PathBuf>,
+}
+
+impl Drop for Scanner {
+    fn drop(&mut self) {
+        self.control
+            .closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 enum Message {
@@ -639,12 +672,13 @@ fn start_workers(
     // 監視: 変わったところを、読み直しの知らせとして読む係に送る。
     let watcher = watch(&watched, requests.clone());
     commands.insert_resource(ScanControl {
-        control,
+        control: control.clone(),
         requests: Mutex::new(requests),
         _watcher: watcher.map(Mutex::new),
     });
     commands.insert_resource(progress);
     let mut scanner = Scanner {
+        control,
         results: Mutex::new(receiver),
         pending: HashMap::new(),
         recent: HashMap::new(),
@@ -1169,6 +1203,7 @@ mod tests {
         };
         let (_sender, receiver) = channel();
         let mut scanner = Scanner {
+            control: Arc::new(worker::Control::default()),
             results: Mutex::new(receiver),
             pending: HashMap::new(),
             recent: HashMap::new(),

@@ -54,6 +54,8 @@ pub fn hash_file_paced(path: &Path, step: &(dyn Fn(u64) -> bool + Sync)) -> io::
 pub struct Pace<'a> {
     /// 裏で読む分か（I/O を後回しにする。`pace::set_thread_background`）。
     pub background: bool,
+    /// GUI の裏作業で、今の希望に合わせて呼び出し元スレッドの優先度を切り替える。
+    pub priority: Option<&'a (dyn Fn() + Sync)>,
     /// 読むたびに呼ぶ（読んだ大きさ。フォルダの切れ目では 0）。false ならやめる。
     pub step: &'a (dyn Fn(u64) -> bool + Sync),
 }
@@ -62,8 +64,17 @@ impl Pace<'_> {
     /// いつでも読んでよく、やめない。
     pub const FREE: Pace<'static> = Pace {
         background: false,
+        priority: None,
         step: &|_| true,
     };
+
+    fn apply_priority(&self) {
+        if let Some(priority) = self.priority {
+            priority();
+        } else {
+            crate::pace::set_thread_background(self.background);
+        }
+    }
 }
 
 /// フォルダのハッシュの元になる子の 1 件。
@@ -215,8 +226,7 @@ fn walk(
     folder: &Stored,
     path: PathBuf,
 ) -> db::Result<()> {
-    let previous = pace.background;
-    crate::pace::set_thread_background(pace.background);
+    pace.apply_priority();
     let mut walker = Walker {
         db,
         threads: threads.max(1),
@@ -225,11 +235,12 @@ fn walk(
         last_commit: Instant::now(),
     };
     let result = walker.visit(folder, path);
-    walker.db.commit()?;
-    (walker.on)(Event::Committed);
-    if previous {
+    let committed = walker.db.commit();
+    if pace.background {
         crate::pace::set_thread_background(false);
     }
+    committed?;
+    (walker.on)(Event::Committed);
     result.map(|_| ())
 }
 
@@ -358,10 +369,14 @@ impl Walker<'_> {
             .iter()
             .map(|&i| dir.join(crate::name::from_raw_bytes(&children[i].name_raw)))
             .collect();
-        let step = self.pace.step;
-        let background = self.pace.background;
+        let step = |bytes| {
+            if let Some(priority) = self.pace.priority {
+                priority();
+            }
+            (self.pace.step)(bytes)
+        };
         if paths.len() == 1 || self.threads == 1 {
-            return paths.iter().map(|p| hash_file_paced(p, step)).collect();
+            return paths.iter().map(|p| hash_file_paced(p, &step)).collect();
         }
         let next = AtomicUsize::new(0);
         let results: Mutex<Vec<Option<io::Result<Hash>>>> =
@@ -369,11 +384,11 @@ impl Walker<'_> {
         std::thread::scope(|scope| {
             for _ in 0..self.threads.min(paths.len()) {
                 scope.spawn(|| {
-                    crate::pace::set_thread_background(background);
+                    self.pace.apply_priority();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(path) = paths.get(i) else { break };
-                        let result = hash_file_paced(path, step);
+                        let result = hash_file_paced(path, &step);
                         results.lock().expect("結果")[i] = Some(result);
                     }
                 });
@@ -389,6 +404,9 @@ impl Walker<'_> {
 
     /// 続けてよいか（フォルダの切れ目で聞く）。
     fn keep_going(&self) -> bool {
+        if let Some(priority) = self.pace.priority {
+            priority();
+        }
         (self.pace.step)(0)
     }
 

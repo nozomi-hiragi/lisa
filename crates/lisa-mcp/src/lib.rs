@@ -18,6 +18,9 @@ mod remote_keep;
 #[cfg(feature = "verify-fs")]
 mod verify_fs;
 
+#[cfg(all(windows, feature = "verify-fs"))]
+pub use verify_fs::{isolated_directory, validate_isolated_tree};
+
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -325,6 +328,17 @@ impl Server {
                 .and_then(|_| {
                     let command: Command =
                         serde_json::from_value(args["command"].clone()).map_err(err)?;
+                    #[cfg(windows)]
+                    if let Some(path) = args.get("data_dir") {
+                        let path = path.as_str().ok_or("data_dir は文字列で指定してください")?;
+                        let dir = isolated_directory(path)?;
+                        let mut reply =
+                            serde_json::to_value(remote::send(&dir, command)?).map_err(err)?;
+                        if args["include_log"] == true {
+                            reply["log"] = read_log_tail(&dir.join("logs").join("lisa.log"), 100);
+                        }
+                        return Ok(reply);
+                    }
                     let capture = match &command {
                         Command::Capture { name } => Some(name.clone()),
                         _ => None,
@@ -738,6 +752,55 @@ impl Server {
     }
 
     fn app_start(&self, args: &Value) -> Result<Value, String> {
+        #[cfg(all(windows, feature = "verify-fs"))]
+        if let Some(env) = args.get("env").and_then(Value::as_object)
+            && (env.contains_key("LISA_DATA_DIR") || env.contains_key("LISA_VERIFY_SCAN_ROOT"))
+        {
+            if env.len() != 2 {
+                return Err("検証起動にはデータと走査ルートの 2 項目を指定してください".into());
+            }
+            let data = isolated_directory(
+                env["LISA_DATA_DIR"]
+                    .as_str()
+                    .ok_or("LISA_DATA_DIR が必要です")?,
+            )?;
+            let root = isolated_directory(
+                env["LISA_VERIFY_SCAN_ROOT"]
+                    .as_str()
+                    .ok_or("LISA_VERIFY_SCAN_ROOT が必要です")?,
+            )?;
+            verify_fs::validate_isolated_tree(&data)?;
+            verify_fs::validate_isolated_tree(&root)?;
+            let folded_data = PathBuf::from(data.to_string_lossy().to_ascii_lowercase());
+            let folded_root = PathBuf::from(root.to_string_lossy().to_ascii_lowercase());
+            if folded_data.starts_with(&folded_root) || folded_root.starts_with(&folded_data) {
+                return Err("検証データと走査ルートは別ディレクトリにしてください".into());
+            }
+            if args.get("restart").and_then(Value::as_bool) == Some(true)
+                || self.app_alive()?["process_alive"] == true
+            {
+                return Err("検証起動の前に Lisa を終了してください".into());
+            }
+            let exe = current_exe_dir()?.join(bin_file_name("lisa"));
+            let env = [
+                ("LISA_DATA_DIR".into(), data.to_string_lossy().into_owned()),
+                (
+                    "LISA_VERIFY_SCAN_ROOT".into(),
+                    root.to_string_lossy().into_owned(),
+                ),
+                ("LISA_DEBUG_REMOTE".into(), "1".into()),
+                ("LISA_DEBUG_LAN_DISCOVERY".into(), "0".into()),
+            ];
+            let pid = spawn_detached_app(&exe, &data, &env)?;
+            set_known_app_pid(pid);
+            thread::sleep(Duration::from_secs(5));
+            return Ok(json!({
+                "pid": pid,
+                "alive": is_process_alive(pid),
+                "responding": remote::send(&data, Command::State).is_ok_and(|r| r.ok),
+                "log": read_log_tail(&data.join("logs").join("lisa.log"), 100),
+            }));
+        }
         let env = parse_app_start_env(args)?;
         let restart = args
             .get("restart")

@@ -60,8 +60,16 @@ pub enum Rest {
     Disk = 4,
 }
 
+const ACTIVE: u64 = 1;
+const BOOSTED: u64 = 2;
+const PRIORITY_FAILED: u64 = 4;
+const MODE_FLAGS: u64 = ACTIVE | BOOSTED | PRIORITY_FAILED;
+const MODE_REVISION: u64 = MODE_FLAGS + 1;
+
 /// UI と読む係で分け合う、裏で読むときの決まり。
 pub struct Control {
+    /// UI が走査結果の受け取りを終えた。
+    pub(super) closed: AtomicBool,
     /// 一時停止（メニューのボタン）。
     pub paused: AtomicBool,
     /// まだ済んでいない見ているところの頼みの数。0 でなければ、裏の分はやめる。
@@ -76,23 +84,100 @@ pub struct Control {
     pub disk_limit: AtomicU64,
     /// 今休んでいる理由（`Rest`）。
     pub resting: AtomicU8,
+    /// 作業中か、希望する優先度、優先度変更の失敗と、その変更の世代。
+    mode: AtomicU64,
+    #[cfg(all(debug_assertions, feature = "verify-fs"))]
+    fail_boost_priority: bool,
 }
 
 impl Default for Control {
     fn default() -> Self {
         Self {
-            paused: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            paused: AtomicBool::new(
+                cfg!(all(windows, feature = "verify-fs"))
+                    && std::env::var_os("LISA_VERIFY_SCAN_ROOT").is_some(),
+            ),
             urgent: AtomicUsize::new(0),
             limit: AtomicU64::new(0),
             rest_on_battery: AtomicBool::new(true),
             cpu_limit: AtomicU32::new(100),
             disk_limit: AtomicU64::new(0),
             resting: AtomicU8::new(Rest::No as u8),
+            mode: AtomicU64::new(0),
+            #[cfg(all(debug_assertions, feature = "verify-fs"))]
+            fail_boost_priority: crate::remote::debug_remote_enabled()
+                && std::env::var_os("LISA_DEBUG_BOOST_PRIORITY_FAILURE").is_some(),
         }
     }
 }
 
 impl Control {
+    pub fn boost_status(&self) -> (bool, bool, bool) {
+        let mode = self.mode.load(Ordering::Relaxed);
+        (
+            mode & ACTIVE != 0,
+            mode & BOOSTED != 0,
+            mode & PRIORITY_FAILED != 0,
+        )
+    }
+
+    pub fn set_boost(&self, on: bool) {
+        let desired = if on { BOOSTED } else { 0 };
+        let _ = self
+            .mode
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |mode| {
+                (mode & ACTIVE != 0 && mode & BOOSTED != desired)
+                    .then(|| (mode & !MODE_FLAGS).wrapping_add(MODE_REVISION) | ACTIVE | desired)
+            });
+    }
+
+    fn set_active(&self, active: bool) {
+        let desired = if active { ACTIVE } else { 0 };
+        let _ = self
+            .mode
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |mode| {
+                (mode & ACTIVE != desired)
+                    .then(|| (mode & !MODE_FLAGS).wrapping_add(MODE_REVISION) | desired)
+            });
+    }
+
+    fn apply_priority(&self) {
+        let mode = self.mode.load(Ordering::Relaxed);
+        let background = mode & BOOSTED == 0;
+        #[cfg(all(debug_assertions, feature = "verify-fs"))]
+        let simulated_failure = !background && self.fail_boost_priority;
+        #[cfg(not(all(debug_assertions, feature = "verify-fs")))]
+        let simulated_failure = false;
+        let result = if simulated_failure {
+            Err(-1)
+        } else {
+            lisa_core::pace::try_set_thread_background(background, mode & !MODE_FLAGS)
+        };
+        #[cfg(all(windows, feature = "verify-fs"))]
+        if result == Ok(true) && std::env::var_os("LISA_VERIFY_SCAN_ROOT").is_some() {
+            bevy::log::info!(
+                "検証: SetThreadPriority 成功（裏の分: {background}、スレッド: {:?}）",
+                std::thread::current().id()
+            );
+        }
+        if let Err(error) = result
+            && self.mark_priority_failure(mode & !MODE_FLAGS)
+        {
+            warn!("OS優先度の変更に失敗（裏の分: {background}、エラー: {error}）");
+        }
+    }
+
+    fn mark_priority_failure(&self, revision: u64) -> bool {
+        // 世代の照合と失敗フラグの更新を、同じ CAS で行う。
+        self.mode
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |mode| {
+                (mode & !MODE_FLAGS == revision && mode & PRIORITY_FAILED == 0)
+                    .then_some(mode | PRIORITY_FAILED)
+            })
+            .is_ok()
+    }
+
     pub fn rest(&self) -> Rest {
         match self.resting.load(Ordering::Relaxed) {
             1 => Rest::Paused,
@@ -104,13 +189,36 @@ impl Control {
     }
 }
 
+#[derive(Default)]
+struct RestChecks {
+    sampled: Option<Instant>,
+    cpu_revision: u64,
+    battery: bool,
+    cpu: bool,
+    disk: bool,
+}
+
+impl RestChecks {
+    fn reason(&self, boosted: bool) -> Rest {
+        if self.battery {
+            Rest::Battery
+        } else if !boosted && self.cpu {
+            Rest::Cpu
+        } else if self.disk {
+            Rest::Disk
+        } else {
+            Rest::No
+        }
+    }
+}
+
 /// 裏の分の読み方（速さの上限と、休むかどうか）。
 struct Background {
     control: Arc<Control>,
     /// 速さの上限を守るための、この秒の始まりと、その秒に読んだ量。
     window: Mutex<(Instant, u64)>,
     /// 最後に電池と CPU とディスクを見た時刻と、そのときの答え。
-    checked: Mutex<(Option<Instant>, Rest)>,
+    checked: Mutex<RestChecks>,
     /// 前に見たディスクの読み書きの累計と、それから自分で読んだ量（ほかのアプリの分を出すため）。
     disk: Mutex<Option<u64>>,
     ours: AtomicU64,
@@ -121,7 +229,7 @@ impl Background {
         Self {
             control,
             window: Mutex::new((Instant::now(), 0)),
-            checked: Mutex::new((None, Rest::No)),
+            checked: Mutex::new(RestChecks::default()),
             disk: Mutex::new(None),
             ours: AtomicU64::new(0),
         }
@@ -134,19 +242,26 @@ impl Background {
             Rest::Paused
         } else {
             let mut checked = self.checked.lock().expect("休むかどうか");
-            if checked.0.is_none_or(|t| t.elapsed() >= CHECK_EVERY) {
-                let seconds = checked.0.map(|t| t.elapsed().as_secs_f64());
-                let battery =
-                    c.rest_on_battery.load(Ordering::Relaxed) && lisa_core::pace::on_battery();
+            let mode = c.mode.load(Ordering::Relaxed);
+            let boosted = mode & BOOSTED != 0;
+            let revision = mode & !MODE_FLAGS;
+            let sample = checked.sampled.is_none_or(|t| t.elapsed() >= CHECK_EVERY);
+            if !boosted && (sample || checked.cpu_revision != revision) {
                 let limit = c.cpu_limit.load(Ordering::Relaxed);
-                let cpu = limit < 100
+                checked.cpu = limit < 100
                     && lisa_core::pace::cpu_load_percent().is_some_and(|p| p > limit as f32);
+                checked.cpu_revision = revision;
+            }
+            if sample {
+                let seconds = checked.sampled.map(|t| t.elapsed().as_secs_f64());
+                checked.battery =
+                    c.rest_on_battery.load(Ordering::Relaxed) && lisa_core::pace::on_battery();
                 // ほかのアプリのディスクの読み書き = 全体の増えた分 − 自分で読んだ分。
                 let disk_limit = c.disk_limit.load(Ordering::Relaxed);
                 let total = lisa_core::pace::disk_bytes();
                 let ours = self.ours.swap(0, Ordering::Relaxed);
                 let mut last = self.disk.lock().expect("ディスク");
-                let disk = match (disk_limit, *last, total, seconds) {
+                checked.disk = match (disk_limit, *last, total, seconds) {
                     (1.., Some(before), Some(now), Some(seconds)) if seconds > 0.0 => {
                         let others = now.saturating_sub(before).saturating_sub(ours);
                         others as f64 / seconds > disk_limit as f64
@@ -154,20 +269,9 @@ impl Background {
                     _ => false,
                 };
                 *last = total;
-                *checked = (
-                    Some(Instant::now()),
-                    if battery {
-                        Rest::Battery
-                    } else if cpu {
-                        Rest::Cpu
-                    } else if disk {
-                        Rest::Disk
-                    } else {
-                        Rest::No
-                    },
-                );
+                checked.sampled = Some(Instant::now());
             }
-            checked.1
+            checked.reason(boosted)
         };
         c.resting.store(rest as u8, Ordering::Relaxed);
         rest
@@ -179,10 +283,22 @@ impl Background {
     }
 
     /// 裏の分を続けてよいか。`bytes` だけ読んだので、速さの上限を超えていれば待つ。
-    fn step(&self, bytes: u64) -> bool {
+    fn step(&self, bytes: u64, cancelled: impl Fn() -> bool) -> bool {
         self.ours.fetch_add(bytes, Ordering::Relaxed);
-        if self.urgent() || self.rest() != Rest::No {
-            return false;
+        loop {
+            if self.control.closed.load(Ordering::Relaxed) || self.urgent() || cancelled() {
+                return false;
+            }
+            match self.rest() {
+                Rest::No => break,
+                // ファイルを読んでいる間は DB の書き込みの鍵がない。CPU 待機だけなら
+                // 読んだ分を捨てずに、次のブーストや負荷の低下まで待てる。
+                Rest::Cpu if bytes > 0 => {
+                    std::thread::sleep(NAP);
+                    self.control.apply_priority();
+                }
+                _ => return false,
+            }
         }
         let limit = self.control.limit.load(Ordering::Relaxed);
         if limit == 0 || bytes == 0 {
@@ -201,7 +317,7 @@ impl Background {
         if wait > 0.0 {
             std::thread::sleep(Duration::from_secs_f64(wait.min(1.0)));
         }
-        !self.urgent()
+        !self.control.closed.load(Ordering::Relaxed) && !self.urgent() && !cancelled()
     }
 }
 
@@ -268,19 +384,25 @@ fn push_initial_children(
 impl Worker {
     pub fn run(mut self) {
         let background = Background::new(self.control.clone());
+        self.run_jobs(&background);
+        self.control.set_active(false);
+    }
+
+    fn run_jobs(&mut self, background: &Background) {
         // 前回終わってから変わったところ（Mac の FSEvents の履歴）を、読み直しの知らせにする。
         self.changes_since_last_run();
         let mut stack = self.initial_stack();
+        self.control
+            .set_active(!stack.is_empty() || self.db.is_some());
         if stack.is_empty() {
             report(&self.progress, |p| p.finished = Some(Instant::now()));
         }
         // 1. 親から順に読む。
         let mut batch_limit = INITIAL_FOLDERS;
         while !stack.is_empty() {
-            if !self.wait_turn(&background) {
+            if !self.wait_turn(background) {
                 return;
             }
-            lisa_core::pace::set_thread_background(true);
             let (alive, done, failed) = self.initial_batch(&mut stack, &mut batch_limit);
             report(&self.progress, |p| {
                 p.done += done;
@@ -311,36 +433,72 @@ impl Worker {
         // 2. ハッシュの無いものを、下からハッシュする。
         if self.db.is_some() {
             report(&self.progress, |p| p.hash.started = Some(Instant::now()));
-            if !self.hash_all(&background) {
+            if !self.hash_all(background) {
                 return;
             }
-            self.snapshot_all(&background);
+            self.control.set_active(false);
+            self.snapshot_all(background);
             report(&self.progress, |p| {
                 p.hash.folder = None;
                 p.hash.finished = Some(Instant::now());
             });
             self.wake();
         }
+        self.control.set_active(false);
         // 3. あとは頼みを待つ。監視の知らせは裏の分として読み直し、ハッシュを消したら、裏で祖先を
         //    作り直す。
         loop {
+            if !self.hints.is_empty() || (self.dirty && self.db.is_some()) {
+                self.control.set_active(true);
+                report(&self.progress, |p| {
+                    *p = Progress {
+                        started: Some(Instant::now()),
+                        ..Default::default()
+                    };
+                });
+                self.wake();
+            }
             while !self.hints.is_empty() {
-                if !self.wait_turn(&background) {
+                if !self.wait_turn(background) {
                     return;
                 }
                 let Some(path) = self.hints.pop_first() else {
                     break;
                 };
+                report(&self.progress, |p| {
+                    p.current = Some(path.clone());
+                    p.queued = self.hints.len();
+                });
                 if !self.reread(&path, true) {
                     return;
                 }
+                report(&self.progress, |p| p.done += 1);
             }
             if self.dirty && self.db.is_some() {
                 self.dirty = false;
-                if !self.hash_all(&background) {
+                report(&self.progress, |p| {
+                    p.current = None;
+                    p.finished = Some(Instant::now());
+                    p.hash.started = p.finished;
+                });
+                if !self.hash_all(background) {
                     return;
                 }
-                self.snapshot_all(&background);
+                self.control.set_active(false);
+                self.snapshot_all(background);
+                report(&self.progress, |p| {
+                    p.hash.folder = None;
+                    p.hash.finished = Some(Instant::now());
+                });
+                self.wake();
+            }
+            if self.control.boost_status().0 {
+                self.control.set_active(false);
+                self.control.apply_priority();
+                report(&self.progress, |p| {
+                    p.current = None;
+                    p.finished = Some(Instant::now());
+                });
                 self.wake();
             }
             // 知らせが続くあいだは、少しまとめてから読み直す。
@@ -425,7 +583,7 @@ impl Worker {
         let Some(db) = self.db.as_mut() else {
             return;
         };
-        let step = || background.step(0);
+        let step = || background.step(0, || false);
         match db.fill_trees(&step) {
             Ok(n) if n > 0 => bevy::log::info!("フォルダの中身を {n} 個残しました"),
             Ok(_) => {}
@@ -456,14 +614,16 @@ impl Worker {
                 }
                 let interrupted = AtomicBool::new(false);
                 let step = |bytes: u64| {
-                    let go = background.step(bytes);
+                    let go = background.step(bytes, || interrupted.load(Ordering::Relaxed));
                     if !go {
                         interrupted.store(true, Ordering::Relaxed);
                     }
                     go
                 };
+                let priority = || background.control.apply_priority();
                 let pace = Pace {
                     background: true,
+                    priority: Some(&priority),
                     step: &step,
                 };
                 if !self.hash(index, None, &pace) {
@@ -619,6 +779,7 @@ impl Worker {
                     return false;
                 }
             }
+            self.control.apply_priority();
             if background.rest() == Rest::No {
                 return true;
             }
@@ -683,7 +844,11 @@ impl Worker {
     /// フォルダ `path` を 1 段読み直す（`background` なら I/O を後回しに）。変わっていたら、新しく
     /// できたフォルダの中も読み、あとで裏でハッシュし直す。UI が閉じたら false。
     fn reread(&mut self, path: &Path, background: bool) -> bool {
-        lisa_core::pace::set_thread_background(background);
+        if background {
+            self.control.apply_priority();
+        } else {
+            lisa_core::pace::set_thread_background(false);
+        }
         bevy::log::debug!("読み直し: {}", path.display());
         if self.is_skipped(path) {
             return true;
@@ -707,7 +872,7 @@ impl Worker {
         }
         self.dirty |= changed;
         // 子の保存が Busy で延期された場合、ヒントからの初回保存でも新しい配下をたどる。
-        if (changed || first) && !self.fill_unlisted(index, path) {
+        if (changed || first) && !self.fill_unlisted(index, path, background) {
             return false;
         }
         true
@@ -736,7 +901,7 @@ impl Worker {
     }
 
     /// `path` の下の、まだ読んでいないフォルダ（読み直しで新しくできたもの）を深さ優先で読む。
-    fn fill_unlisted(&mut self, index: usize, path: &Path) -> bool {
+    fn fill_unlisted(&mut self, index: usize, path: &Path, background: bool) -> bool {
         let Some(drive_id) = self.roots[index].drive_id.clone() else {
             return true;
         };
@@ -766,6 +931,9 @@ impl Worker {
                     continue;
                 }
                 if !child.listed {
+                    if background {
+                        self.control.apply_priority();
+                    }
                     match self.store_reread(index, &child_path, false) {
                         StoreOutcome::Published { alive: false, .. } => return false,
                         StoreOutcome::Published { .. } => stack.push(child_path),
@@ -786,7 +954,7 @@ impl Worker {
         let Some(db) = self.db.as_mut() else {
             return true;
         };
-        let closed = AtomicBool::new(false);
+        let closed = &self.control.closed;
         let (sender, proxy, progress) = (&self.sender, &self.proxy, &self.progress);
         let mut on = |event: hash::Event| {
             let message = match event {
@@ -814,6 +982,7 @@ impl Worker {
         let step = |bytes| !closed.load(Ordering::Relaxed) && (pace.step)(bytes);
         let pace = Pace {
             background: pace.background,
+            priority: pace.priority,
             step: &step,
         };
         let result = match folder {
@@ -996,5 +1165,88 @@ mod tests {
             (true, 0, 0)
         );
         assert_eq!(stack.pop(), Some((3, folder)));
+    }
+}
+
+#[cfg(test)]
+mod boost_tests {
+    use super::*;
+
+    #[test]
+    fn ハッシュのcpu待機中に終了と中止を見直す() {
+        for close in [true, false] {
+            let control = Arc::new(Control::default());
+            let background = Background::new(control.clone());
+            *background.checked.lock().unwrap() = RestChecks {
+                sampled: Some(Instant::now()),
+                cpu: true,
+                ..Default::default()
+            };
+            let checks = std::cell::Cell::new(0);
+            assert!(!background.step(1, || {
+                let count = checks.get() + 1;
+                checks.set(count);
+                if close {
+                    control.closed.store(true, Ordering::Relaxed);
+                }
+                count == 2
+            }));
+            assert_eq!(control.rest(), Rest::Cpu);
+            assert_eq!(checks.get(), if close { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn 優先度の失敗は現在の世代に一度だけ記録する() {
+        let control = Control::default();
+        control.set_active(true);
+        let revision = control.mode.load(Ordering::Relaxed) & !MODE_FLAGS;
+        assert!(control.mark_priority_failure(revision));
+        assert!(!control.mark_priority_failure(revision));
+        control.set_boost(true);
+        assert!(!control.mark_priority_failure(revision));
+        assert_eq!(control.boost_status(), (true, true, false));
+    }
+
+    #[test]
+    fn ブーストは作業中だけ切り替えられ次の作業へ持ち越さない() {
+        let control = Control::default();
+        control.set_boost(true);
+        assert_eq!(control.boost_status(), (false, false, false));
+        control.set_active(true);
+        control.set_boost(true);
+        let mode = control.mode.load(Ordering::Relaxed) | PRIORITY_FAILED;
+        control.mode.store(mode, Ordering::Relaxed);
+        control.set_boost(true);
+        assert_eq!(control.mode.load(Ordering::Relaxed), mode);
+        control.set_boost(false);
+        assert_eq!(control.boost_status(), (true, false, false));
+        control.set_boost(true);
+        control.set_active(false);
+        control.set_active(true);
+        assert_eq!(control.boost_status(), (true, false, false));
+    }
+
+    #[test]
+    fn ブーストはキャッシュしたディスク待機を残しcpu待機だけを除外する() {
+        let control = Arc::new(Control::default());
+        control.set_active(true);
+        let background = Background::new(control.clone());
+        *background.checked.lock().unwrap() = RestChecks {
+            sampled: Some(Instant::now()),
+            cpu_revision: control.mode.load(Ordering::Relaxed) & !MODE_FLAGS,
+            cpu: true,
+            disk: true,
+            ..Default::default()
+        };
+        assert_eq!(background.rest(), Rest::Cpu);
+        control.set_boost(true);
+        assert_eq!(background.rest(), Rest::Disk);
+        control.paused.store(true, Ordering::Relaxed);
+        assert_eq!(background.rest(), Rest::Paused);
+        control.paused.store(false, Ordering::Relaxed);
+        control.set_boost(false);
+        // 最新の CPU しきい値は 100 なので、以前の CPU 待機に戻らない。
+        assert_eq!(background.rest(), Rest::Disk);
     }
 }

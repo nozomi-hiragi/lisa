@@ -14,6 +14,54 @@ use super::err;
 const PREFIX: &str = "lisa-verify-";
 const MAX_WRITE_BYTES: u64 = 4 << 30;
 
+/// Windows で使い捨ての検証ディレクトリを確認する。
+/// ドライブ直下の名前を限定し、接合点や別の場所への参照を通さない。
+#[cfg(windows)]
+pub fn isolated_directory(raw: &str) -> Result<PathBuf, String> {
+    use std::os::windows::fs::MetadataExt;
+    use std::path::Prefix;
+
+    let path = PathBuf::from(raw);
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(b'C' | b'c')))
+        || components.next() != Some(Component::RootDir)
+        || !matches!(components.next(), Some(Component::Normal(n)) if n.to_str().is_some_and(|n| n.starts_with(PREFIX)))
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'\\' | b'_' | b'-'))
+        || raw.bytes().filter(|&b| b == b':').count() != 1
+    {
+        return Err("C:\\lisa-verify- で始まる検証ディレクトリを指定してください".into());
+    }
+    for ancestor in path.ancestors() {
+        let meta = std::fs::symlink_metadata(ancestor).map_err(err)?;
+        if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {
+            return Err("リンクや接合点は通りません".into());
+        }
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+pub fn validate_isolated_tree(root: &Path) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt;
+
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(dir) = directories.pop() {
+        for entry in std::fs::read_dir(dir).map_err(err)? {
+            let entry = entry.map_err(err)?;
+            let meta = entry.metadata().map_err(err)?;
+            if meta.file_attributes() & 0x400 != 0 {
+                return Err("検証ツリーにリンクや接合点が含まれています".into());
+            }
+            if meta.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn call(data_dir: &Path, args: &Value) -> Result<Value, String> {
     if args["action"] == "processes" {
         return processes();
@@ -34,6 +82,24 @@ pub(super) fn call(data_dir: &Path, args: &Value) -> Result<Value, String> {
     }
     if args["action"] == "assoc" {
         return associations();
+    }
+    #[cfg(windows)]
+    if args["action"] == "cpu_load" {
+        if args.get("workers").is_some() {
+            return external_cpu_load(args);
+        }
+        return cpu_load(args);
+    }
+    #[cfg(windows)]
+    if args["action"] == "cpu_load_stop" {
+        let mut load = EXTERNAL_LOAD.lock().map_err(err)?;
+        if let Some(mut child) = load.take()
+            && child.try_wait().map_err(err)?.is_none()
+        {
+            child.kill().map_err(err)?;
+            child.wait().map_err(err)?;
+        }
+        return Ok(json!({"stopped": true}));
     }
     let path = allowed(args["path"].as_str().ok_or("path が要ります")?)?;
     match args["action"].as_str().unwrap_or("") {
@@ -93,6 +159,122 @@ pub(super) fn call(data_dir: &Path, args: &Value) -> Result<Value, String> {
         "probe_external" => probe_external(&path, args["delete"] == true),
         other => Err(format!("知らない action: {other}")),
     }
+}
+
+/// サイドカーのプロセス内で、計測用の一定時間だけ CPU を使う。
+#[cfg(windows)]
+fn cpu_load(args: &Value) -> Result<Value, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    let seconds = args["seconds"]
+        .as_u64()
+        .filter(|n| (1..=60).contains(n))
+        .ok_or("負荷をかける時間は 1〜60 秒です")?;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(16);
+    if RUNNING.swap(true, Ordering::Relaxed) {
+        return Err("すでに計測用の負荷をかけています".into());
+    }
+    let task = std::thread::Builder::new().spawn(move || {
+        let until = Instant::now() + Duration::from_secs(seconds);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    while Instant::now() < until {
+                        std::hint::black_box(std::hint::black_box(1_u64).wrapping_mul(17));
+                    }
+                });
+            }
+        });
+        RUNNING.store(false, Ordering::Relaxed);
+    });
+    if let Err(error) = task {
+        RUNNING.store(false, Ordering::Relaxed);
+        return Err(err(error));
+    }
+    Ok(json!({"workers": workers, "seconds": seconds}))
+}
+
+/// GUI やサイドカーの優先度に左右されない、通常優先度の別プロセスで負荷を作る。
+#[cfg(windows)]
+static EXTERNAL_LOAD: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+
+#[cfg(windows)]
+fn external_cpu_load(args: &Value) -> Result<Value, String> {
+    use std::io::{BufRead, BufReader};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
+
+    let seconds = args["seconds"]
+        .as_u64()
+        .filter(|n| (1..=60).contains(n))
+        .ok_or("負荷をかける時間は 1〜60 秒です")?;
+    let workers = args["workers"]
+        .as_u64()
+        .filter(|n| matches!(n, 4 | 8 | 16))
+        .ok_or("負荷をかけるスレッド数は 4、8、16 です")?;
+    let mut load = EXTERNAL_LOAD.lock().map_err(err)?;
+    if let Some(child) = load.as_mut()
+        && child.try_wait().map_err(err)?.is_none()
+    {
+        return Err("すでに計測用の負荷をかけています".into());
+    }
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'Normal'
+Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Threading;
+public static class LisaVerifyLoad {
+    public static void Run(int count, int seconds) {
+        long end = Stopwatch.GetTimestamp() + seconds * Stopwatch.Frequency;
+        var threads = new Thread[count];
+        for (int i = 0; i < count; i++) {
+            threads[i] = new Thread(() => {
+                while (Stopwatch.GetTimestamp() < end) {}
+            });
+            threads[i].Start();
+        }
+        Console.WriteLine(Process.GetCurrentProcess().PriorityClass);
+        foreach (Thread thread in threads) thread.Join();
+    }
+}
+'@
+[LisaVerifyLoad]::Run([int]$env:LISA_VERIFY_WORKERS, [int]$env:LISA_VERIFY_SECONDS)
+"#;
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or("SystemRoot の絶対パスが見つかりません")?;
+    let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let mut child = Command::new(powershell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("LISA_VERIFY_WORKERS", workers.to_string())
+        .env("LISA_VERIFY_SECONDS", seconds.to_string())
+        .creation_flags(0x0800_0000)
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(err)?;
+    let pid = child.id();
+    let mut priority = String::new();
+    let ready = BufReader::new(child.stdout.take().expect("標準出力")).read_line(&mut priority);
+    if ready.is_err() || priority.trim() != "Normal" {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("通常優先度の負荷プロセスを起動できませんでした".into());
+    }
+    *load = Some(child);
+    // SAFETY: 現在のプロセスの疑似ハンドルで、優先度を読むだけ。
+    let sidecar_priority = unsafe { GetPriorityClass(GetCurrentProcess()) };
+    Ok(json!({
+        "workers": workers, "seconds": seconds, "pid": pid,
+        "priority": priority.trim(), "sidecar_priority_class": sidecar_priority,
+    }))
 }
 
 /// 絶対パスで、`..` やリンクを含まず、祖先か自分が `lisa-verify-` で始まるフォルダであるものだけ通す。
