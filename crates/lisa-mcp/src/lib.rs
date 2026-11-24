@@ -11,7 +11,7 @@
 
 mod catalog;
 mod keep_relay;
-pub use keep_relay::relay_client;
+pub use keep_relay::{link_relay_client, relay_client, relocation_client};
 mod organize;
 pub use organize::NO_PLAN_FOR_REQUEST;
 mod remote_keep;
@@ -55,6 +55,8 @@ pub const DEFAULT_LINGER_SECS: u64 = 600;
 pub const DISCOVERY_PORT: u16 = 47801;
 /// HTTP で受ける本文の上限（1 MiB）。
 const MAX_BODY: usize = 1024 * 1024;
+/// 端末間の付け替えで、4 MiB の小分けを base64 で運ぶ要求（中継と、認証済みの `/mcp`）の上限。
+const MAX_TRANSFER_BODY: usize = 6 * 1024 * 1024;
 /// LAN 用の合言葉とペアリングした相手を覚えておくファイルの名前。
 pub const LAN_FILE: &str = "lan.json";
 
@@ -239,6 +241,16 @@ impl Server {
             "lisa_drives" => self.drives(),
             "lisa_list" => self.list(args),
             "lisa_info" => self.info(args),
+            "lisa_merged_resolve" => require_peer(auth).and_then(|_| {
+                let marker: lisa_core::merged::Marker =
+                    serde_json::from_value(args["marker"].clone()).map_err(err)?;
+                Ok(
+                    match lisa_core::merged::resolve_target(&self.db()?, &marker) {
+                        Ok(chain) => json!({ "chain": chain }),
+                        Err(error) => json!({ "error": error }),
+                    },
+                )
+            }),
             "lisa_search" => self.search(args),
             "lisa_duplicates" => self.duplicates(args),
             "lisa_duplicate_catalog" | "lisa_duplicate_locations" | "lisa_duplicate_groups" => {
@@ -247,6 +259,30 @@ impl Server {
             "lisa_keep_inspect" | "lisa_keep_reserve" | "lisa_keep_renew" | "lisa_keep_release" => {
                 self.signed_duplicate_keep(name, args, auth)
             }
+            "lisa_merged_link_update" | "lisa_merged_receive_transfer" => {
+                self.signed_duplicate_keep(name, args, auth)
+            }
+            "lisa_merged_link_permits" | "lisa_merged_link_revoke" => {
+                self.link_relay_permit(name, args, auth)
+            }
+            "lisa_merged_delete_choices" => self.db().and_then(|db| {
+                let target = self.target(&db, args)?;
+                let sources = lisa_core::organize::linked_delete_sources(&db, &target.path)?;
+                Ok(json!({ "sources": sources }))
+            }),
+            "lisa_merged_link_status" => require_peer(auth).and_then(|_| {
+                let id = args["link_id"].as_str().ok_or("リンク ID がありません")?;
+                let status = lisa_core::merged::links::status(&self.db()?, id)?;
+                Ok(json!({ "status": status }))
+            }),
+            "lisa_merged_link_sources" => require_peer(auth).and_then(|_| {
+                let db = self.db()?;
+                let entry = args["entry_id"]
+                    .as_i64()
+                    .ok_or("実体の項目 ID がありません")?;
+                let links = lisa_core::merged::links::sources_for_entry(&db, entry)?;
+                Ok(json!({ "sources": links, "checked_at": lisa_core::db::now_ms() }))
+            }),
             "lisa_keep_relay_issue" | "lisa_keep_relay_revoke" => {
                 self.keep_relay_grant(name, args, auth)
             }
@@ -282,14 +318,36 @@ impl Server {
             #[cfg(feature = "verify-fs")]
             "lisa_verify_fs" => require_peer(auth)
                 .and_then(|_| require_sidecar(sidecar, name))
-                .and_then(|_| verify_fs::call(args)),
+                .and_then(|_| verify_fs::call(&self.data_dir, args)),
             #[cfg(feature = "verify-fs")]
             "lisa_verify_control" => require_peer(auth)
                 .and_then(|_| require_sidecar(sidecar, name))
                 .and_then(|_| {
                     let command: Command =
                         serde_json::from_value(args["command"].clone()).map_err(err)?;
-                    serde_json::to_value(remote::send(&self.data_dir, command)?).map_err(err)
+                    let capture = match &command {
+                        Command::Capture { name } => Some(name.clone()),
+                        _ => None,
+                    };
+                    let mut reply = serde_json::to_value(remote::send(&self.data_dir, command)?)
+                        .map_err(err)?;
+                    // アプリ自身が撮った画像（描画の読み戻し）を、OS の画面取得と見比べるために返す。
+                    if let Some(name) = capture {
+                        let path = self
+                            .data_dir
+                            .join("screenshots")
+                            .join(format!("{name}.png"));
+                        for _ in 0..50 {
+                            if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 500) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        reply["png_base64"] =
+                            json!(base64_encode(&std::fs::read(&path).map_err(err)?));
+                    }
+                    Ok(reply)
                 }),
             "lisa_app_alive" => self.app_alive(),
             "lisa_catalogs" => self.catalogs(args),
@@ -1286,85 +1344,9 @@ pub fn downsample_bgra_to_rgb(
     Ok((dst_w, dst_h, out))
 }
 
-const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// `len` バイトを base64 にしたときの文字数。
-pub const fn base64_encoded_len(len: usize) -> usize {
-    len.div_ceil(3) * 4
-}
-
-/// バイト列を標準の base64 文字列にする。
-pub fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = Vec::with_capacity(base64_encoded_len(bytes.len()));
-    let (chunks, rem) = bytes.as_chunks::<3>();
-    for c in chunks {
-        let b0 = u32::from(c[0]);
-        let b1 = u32::from(c[1]);
-        let b2 = u32::from(c[2]);
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(BASE64_TABLE[((n >> 18) & 0x3f) as usize]);
-        out.push(BASE64_TABLE[((n >> 12) & 0x3f) as usize]);
-        out.push(BASE64_TABLE[((n >> 6) & 0x3f) as usize]);
-        out.push(BASE64_TABLE[(n & 0x3f) as usize]);
-    }
-    if rem.len() == 1 {
-        let n = u32::from(rem[0]) << 16;
-        out.push(BASE64_TABLE[((n >> 18) & 0x3f) as usize]);
-        out.push(BASE64_TABLE[((n >> 12) & 0x3f) as usize]);
-        out.push(b'=');
-        out.push(b'=');
-    } else if rem.len() == 2 {
-        let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
-        out.push(BASE64_TABLE[((n >> 18) & 0x3f) as usize]);
-        out.push(BASE64_TABLE[((n >> 12) & 0x3f) as usize]);
-        out.push(BASE64_TABLE[((n >> 6) & 0x3f) as usize]);
-        out.push(b'=');
-    }
-    // SAFETY: BASE64_TABLE と '=' はすべて ASCII。
-    unsafe { String::from_utf8_unchecked(out) }
-}
-
-/// 標準の base64 文字列をバイト列に戻す。
-pub fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
-    let cleaned: Vec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    if !cleaned.len().is_multiple_of(4) {
-        return Err("base64 の長さが 4 の倍数ではありません".into());
-    }
-    let val = |b: u8| -> Result<u32, String> {
-        match b {
-            b'A'..=b'Z' => Ok(u32::from(b - b'A')),
-            b'a'..=b'z' => Ok(u32::from(b - b'a') + 26),
-            b'0'..=b'9' => Ok(u32::from(b - b'0') + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(format!("base64 に使えない文字があります: {}", b as char)),
-        }
-    };
-    let mut out = Vec::with_capacity(cleaned.len() / 4 * 3);
-    let chunks = cleaned.as_chunks::<4>().0;
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let is_last = idx + 1 == cleaned.len() / 4;
-        if (chunk[0] == b'=' || chunk[1] == b'=')
-            || (!is_last && (chunk[2] == b'=' || chunk[3] == b'='))
-            || (chunk[2] == b'=' && chunk[3] != b'=')
-        {
-            return Err("base64 のパディングが不正です".into());
-        }
-        let v0 = val(chunk[0])?;
-        let v1 = val(chunk[1])?;
-        let v2 = if chunk[2] == b'=' { 0 } else { val(chunk[2])? };
-        let v3 = if chunk[3] == b'=' { 0 } else { val(chunk[3])? };
-        let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
-        out.push(((n >> 16) & 0xff) as u8);
-        if chunk[2] != b'=' {
-            out.push(((n >> 8) & 0xff) as u8);
-        }
-        if chunk[3] != b'=' {
-            out.push((n & 0xff) as u8);
-        }
-    }
-    Ok(out)
-}
+pub use lisa_core::base64::{
+    decode as base64_decode, encode as base64_encode, encoded_len as base64_encoded_len,
+};
 
 /// 1 枚の画面を撮り、縮小して 24 ビット BMP にする。
 fn capture_one_shot(window: bool, app_pid: Option<u32>, scale: u32) -> Result<RawShot, String> {
@@ -2317,7 +2299,7 @@ pub fn tools() -> Value {
         }, "required": ["request_id"]},
         "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
     });
-    json!([
+    let mut listed = json!([
         {
             "name": "lisa_drives",
             "description": "Lisa が読んだドライブの一覧（ID、名前、最後につないでいた場所、一番上のハッシュ）。",
@@ -2571,11 +2553,11 @@ pub fn tools() -> Value {
                 "properties": {
                     "ops": {
                         "type": "array",
-                        "description": "操作の配列（最大 5000 件）。各要素は {op: \"mkdir\", path}、{op: \"move\", from, to}、{op: \"trash\", path, keep?} のどれか。パスは絶対パス。",
+                        "description": "操作の配列（最大 5000 件）。各要素は {op: \"mkdir\", path}、{op: \"move\", from, to}、{op: \"trash\", path, keep?}、{op: \"trash_linked\", path, decision: {choice: {action: \"delete_actual\"} または {action: \"restore\", link_id}, links: [確認したリンク ID すべて]}} のどれか。マージ済みリンク元がある実体の trash は確認待ちとして理由とリンク ID を返す。パスは絶対パス。",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "op": {"type": "string", "enum": ["mkdir", "move", "trash"]},
+                                "op": {"type": "string", "enum": ["mkdir", "move", "trash", "trash_linked"]},
                                 "path": {"type": "string"},
                                 "from": {"type": "string"},
                                 "to": {"type": "string"},
@@ -2649,7 +2631,28 @@ pub fn tools() -> Value {
             },
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
         },
-    ])
+    ]);
+    let link_permits = [
+        json!({
+            "name": "lisa_merged_link_permits",
+            "description": "依頼元のローカル MCP でマージ済みリンクの中継許可を一覧にする。",
+            "inputSchema": {"type": "object", "properties": {}},
+            "annotations": read_only,
+        }),
+        json!({
+            "name": "lisa_merged_link_revoke",
+            "description": "依頼元のローカル MCP で指定のリンク中継許可を取り消す。",
+            "inputSchema": {"type": "object", "properties": {
+                "link_id": {"type": "string", "format": "uuid"}
+            }, "required": ["link_id"]},
+            "annotations": app_hint,
+        }),
+    ];
+    listed
+        .as_array_mut()
+        .expect("道具の一覧")
+        .extend(link_permits);
+    listed
 }
 
 /// `sidecar.json` を読む。無いか壊れていれば None。
@@ -3129,7 +3132,7 @@ fn serve_request(
             let _ = request.respond(empty(405));
             return;
         }
-        let body = match read_body(&mut request) {
+        let body = match read_body_up_to(&mut request, MAX_TRANSFER_BODY) {
             Ok(body) => body,
             Err(code) => {
                 let _ = request.respond(empty(code));
@@ -3169,7 +3172,15 @@ fn serve_request(
         return;
     }
 
-    let body = match read_body(&mut request) {
+    let body = match read_body_up_to(
+        &mut request,
+        // 大きな本文はペアリング済みの端末（付け替えの小分け）にだけ認める。
+        if matches!(auth, Auth::Peer { .. }) {
+            MAX_TRANSFER_BODY
+        } else {
+            MAX_BODY
+        },
+    ) {
         Ok(b) => b,
         Err(code) => {
             let _ = request.respond(empty(code));
@@ -3283,19 +3294,24 @@ fn is_allowed_host(host: &str) -> bool {
 
 /// 本文を `MAX_BODY`（1 MiB）まで読む。超えれば `Err(413)`、読めなければ `Err(400)`。
 fn read_body(request: &mut Request) -> Result<Vec<u8>, u16> {
-    if request.body_length().is_some_and(|len| len > MAX_BODY) {
+    read_body_up_to(request, MAX_BODY)
+}
+
+/// 本文を `limit` バイトまで読む。超えれば `Err(413)`、読めなければ `Err(400)`。
+fn read_body_up_to(request: &mut Request, limit: usize) -> Result<Vec<u8>, u16> {
+    if request.body_length().is_some_and(|len| len > limit) {
         return Err(413);
     }
     let mut body = Vec::new();
     if request
         .as_reader()
-        .take((MAX_BODY + 1) as u64)
+        .take((limit + 1) as u64)
         .read_to_end(&mut body)
         .is_err()
     {
         return Err(400);
     }
-    if body.len() > MAX_BODY {
+    if body.len() > limit {
         return Err(413);
     }
     Ok(body)
