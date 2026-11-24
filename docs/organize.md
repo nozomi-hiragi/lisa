@@ -223,7 +223,8 @@ macOS などで外部プロセスの書き込みを防げない場合は、理�
 残すコピーを指定した隔離では、元の親に目印（ファイルは `元の名前.lmf`、フォルダは `元の名前.lmd`）を置きます。中身は形式 `lisa-merged` の JSON で、元とマージ先の端末・ボリューム・パス、種類、大きさ、完全ハッシュ、実行日時、計画と項目を記録します。取り消しで、その計画が作って内容が変わっていない目印だけを消します。
 Lisa は目印を元の名前に ↗ を付けて表示し、親のハッシュには元の項目として数え、重複の候補からは外します。端末をまたぐ目印は両端の DB にリンクとして記録し、ペアリング済みの Mac の中継で同期します。
 実体を削除するときにリンク元があれば、戻し先（元の場所）か実体の削除を選びます。別の端末へ戻すときは、戻し先に隔離物が残っていれば照合して使い、無ければ Mac の中継で 4 MiB ずつ 3 本並行に送ります（中継はディスクに溜めず、戻し先の一時領域で完全ハッシュを照合してから公開。中断しても続きから再開）。
-Finder・エクスプローラーで目印を開くと Lisa が起動（起動中なら前面に）し、.lmf は詳細、.lmd は中身の展開を表示します。macOS の配布用の `Lisa.app` は `scripts/make-mac-app.sh` で作ります。
+Finder・エクスプローラーで目印を開くと Lisa が起動（起動中なら前面に）し、.lmf は詳細、.lmd は中身の展開を表示します。macOS の配布用の `Lisa.app` は `scripts/make-mac-app.sh` で作ります。`.app` として起動すると macOS の「ローカルネットワーク」の許可が要り、許可するまで LAN の他の PC につながりません（システム設定 › プライバシーとセキュリティ › ローカルネットワーク）。
+`make-mac-app.sh` は、利用者のキーチェーンに置いたローカルの自己署名のコード署名証明書で、`Lisa.app`（識別子 `local.lisa.Lisa`）と中の `lisa-mcp`（`local.lisa.Lisa.mcp`）を常に署名します。初回に証明書「Lisa Local Signing」を作り、Lisa 専用のキーチェーン `~/Library/Keychains/lisa-codesign.keychain-db` に入れます（その鍵束のパスワードは乱数で作り、ログインキーチェーンの `lisa-codesign-keychain` に保管）。macOS は「識別子＋証明書」で同じアプリと見なすので、作り直してもローカルネットワークやファイアウォールの許可が続きます。秘密鍵はリポに置きません。別の証明書を使うときは `LISA_SIGN_IDENTITY` にその名前を渡します。作り直しをやめて元に戻すときは、`security delete-keychain ~/Library/Keychains/lisa-codesign.keychain-db` と `security delete-generic-password -s lisa-codesign-keychain` で消せます（次に作るとき新しい証明書になり、許可は一度やり直しになります）。
 
 ペアリング済みの端末は保持側に `lisa_keep_inspect`、`lisa_keep_reserve`、
 `lisa_keep_renew`、`lisa_keep_release` を呼べます。予約は30秒で、再検証と延長には依頼元の認証が要ります。
