@@ -487,6 +487,16 @@ impl Db {
         rows.collect()
     }
 
+    /// 親とディスク上の名前から子を 1 件取得する。
+    pub fn child_named(&self, parent: i64, name: &[u8]) -> Result<Option<Stored>> {
+        self.conn
+            .prepare_cached(&format!(
+                "SELECT {COLUMNS} FROM entry WHERE parent_id = ?1 AND name = ?2"
+            ))?
+            .query_row(params![parent, name], row_to_stored)
+            .optional()
+    }
+
     /// ファイルかフォルダのハッシュを書く（`size` と `mtime` はハッシュしたときの値）。
     pub fn set_hash(
         &mut self,
@@ -508,6 +518,84 @@ impl Db {
                 mtime
             ])?;
         Ok(())
+    }
+
+    /// 別の接続が一覧を変えていなければ、読み直したハッシュと祖先の無効化を一緒に確定する。
+    pub fn save_refreshed_hash(
+        &mut self,
+        entry: &Stored,
+        version: i64,
+        result: std::result::Result<&crate::hash::Hash, &str>,
+    ) -> Result<bool> {
+        let (hash, error) = match result {
+            Ok(hash) => (Some(hash), None),
+            Err(error) => (None, Some(error)),
+        };
+        let tx = self.conn.savepoint()?;
+        if listing_version(&tx)? != version {
+            return Ok(false);
+        }
+        if entry.hash.as_ref() != hash {
+            clear_hash_up(&tx, entry.id)?;
+        }
+        tx.execute(
+            "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = size, hashed_mtime = mtime,
+                error = ?4 WHERE id = ?1",
+            params![
+                entry.id,
+                hash.map(|hash| &hash[..]),
+                crate::hash::ALGO,
+                error
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 保存済みの子だけでフォルダを集約する。別の接続の書き込みと競合した場合は再試行できる。
+    pub fn aggregate_refreshed_folder(&mut self, id: i64) -> Result<bool> {
+        let tx = self.conn.savepoint()?;
+        let Some(folder) = tx
+            .prepare_cached(&format!("SELECT {COLUMNS} FROM entry WHERE id = ?1"))?
+            .query_row([id], row_to_stored)
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        if !folder.listed || folder.error.is_some() {
+            return Ok(false);
+        }
+        let children = {
+            let mut statement = tx.prepare_cached(&format!(
+                "SELECT {COLUMNS} FROM entry WHERE parent_id = ?1 ORDER BY pos"
+            ))?;
+            statement
+                .query_map([id], row_to_stored)?
+                .collect::<Result<Vec<_>>>()?
+        };
+        let Some(entries) = crate::hash::ready_tree_bytes(&children) else {
+            return Ok(false);
+        };
+        let hash = blake3::hash(&entries);
+        if folder.hash.as_ref() != Some(hash.as_bytes()) {
+            clear_hash_up(&tx, id)?;
+        }
+        tx.execute(
+            "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = 0, hashed_mtime = mtime
+             WHERE id = ?1",
+            params![id, &hash.as_bytes()[..], crate::hash::ALGO],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tree (hash, algo, entries) VALUES (?1, ?2, ?3)",
+            params![&hash.as_bytes()[..], crate::hash::ALGO, entries],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 手動更新では長いビジー待ちを避け、短い仕事の切れ目で再試行する。
+    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        self.conn.busy_timeout(timeout)
     }
 
     /// フォルダの中身（`hash::tree_bytes`）を、そのハッシュをキーにして残す（同じ中身は 1 回だけ）。

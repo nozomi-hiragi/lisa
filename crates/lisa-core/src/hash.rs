@@ -34,7 +34,47 @@ pub fn hash_file(path: &Path) -> io::Result<Hash> {
 /// 返したら、途中でやめて `ErrorKind::Interrupted` を返す（途中経過は捨てる）。速さの上限は `step` の
 /// 中で待って守る。
 pub fn hash_file_paced(path: &Path, step: &(dyn Fn(u64) -> bool + Sync)) -> io::Result<Hash> {
-    let mut file = File::open(path)?;
+    hash_reader(&mut File::open(path)?, step)
+}
+
+/// 手動更新で、リンクに置き換わったファイルを開かない。
+pub fn hash_regular_file_paced(
+    path: &Path,
+    current: impl Fn(&std::fs::Metadata) -> bool,
+    step: &(dyn Fn(u64) -> bool + Sync),
+) -> io::Result<Hash> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || crate::listing::cloud_only(&meta) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "実ファイルを開けませんでした",
+        ));
+    }
+    if !current(&meta) {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+    let hash = hash_reader(&mut file, step)?;
+    if !current(&file.metadata()?) {
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+    Ok(hash)
+}
+
+fn hash_reader(file: &mut File, step: &(dyn Fn(u64) -> bool + Sync)) -> io::Result<Hash> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0; BUFFER];
     loop {
@@ -218,6 +258,54 @@ pub fn hash_folder(
     walk(db, threads, on, pace, &folder, path.to_path_buf())
 }
 
+/// 子の保存済みハッシュがそろっていれば、ファイルを開かずにフォルダの中身を作る。
+pub(crate) fn ready_tree_bytes(children: &[Stored]) -> Option<Vec<u8>> {
+    if children.iter().any(|child| {
+        child.hash.is_none()
+            && child.error.is_none()
+            && !child.cloud_only
+            && !child.other_volume
+            && !child.merged_verified
+            && matches!(child.kind, Kind::File | Kind::Dir)
+    }) {
+        return None;
+    }
+    Some(stored_tree_bytes(children))
+}
+
+fn stored_tree_bytes(children: &[Stored]) -> Vec<u8> {
+    if children.iter().any(|child| child.merged_verified) {
+        let real = children
+            .iter()
+            .filter(|child| !child.merged_verified)
+            .map(|child| NamedChild {
+                name: child.name_nfc.clone(),
+                raw_name: child.name_raw.clone(),
+                kind: child.kind,
+                hash: child.hash,
+                size: child.size,
+            })
+            .collect();
+        let markers = children
+            .iter()
+            .filter(|child| child.merged_verified)
+            .filter_map(|child| child.merged.as_ref())
+            .collect();
+        tree_bytes_with_markers(real, markers)
+    } else {
+        let parts: Vec<_> = children
+            .iter()
+            .map(|child| Child {
+                kind: child.kind,
+                name_nfc: &child.name_nfc,
+                hash: child.hash.as_ref(),
+                size: child.size,
+            })
+            .collect();
+        tree_bytes(&parts)
+    }
+}
+
 fn walk(
     db: &mut Db,
     threads: usize,
@@ -320,36 +408,7 @@ impl Walker<'_> {
             self.maybe_commit()?;
             return Ok(None);
         }
-        let entries = if children.iter().any(|child| child.merged_verified) {
-            let real = children
-                .iter()
-                .filter(|child| !child.merged_verified)
-                .map(|child| NamedChild {
-                    name: child.name_nfc.clone(),
-                    raw_name: child.name_raw.clone(),
-                    kind: child.kind,
-                    hash: child.hash,
-                    size: child.size,
-                })
-                .collect();
-            let markers = children
-                .iter()
-                .filter(|child| child.merged_verified)
-                .filter_map(|child| child.merged.as_ref())
-                .collect();
-            tree_bytes_with_markers(real, markers)
-        } else {
-            let parts: Vec<_> = children
-                .iter()
-                .map(|child| Child {
-                    kind: child.kind,
-                    name_nfc: &child.name_nfc,
-                    hash: child.hash.as_ref(),
-                    size: child.size,
-                })
-                .collect();
-            tree_bytes(&parts)
-        };
+        let entries = stored_tree_bytes(&children);
         let hash = *blake3::hash(&entries).as_bytes();
         self.db.begin()?;
         self.db.set_hash(folder.id, &hash, 0, folder.mtime)?;

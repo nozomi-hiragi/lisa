@@ -198,7 +198,7 @@ fn kind_of(meta: &Metadata) -> Kind {
     }
 }
 
-pub(crate) fn mtime_ms(meta: &Metadata) -> Option<i64> {
+pub fn mtime_ms(meta: &Metadata) -> Option<i64> {
     let time = meta.modified().ok()?;
     Some(match time.duration_since(UNIX_EPOCH) {
         Ok(after) => after.as_millis() as i64,
@@ -245,7 +245,7 @@ fn other_volume(_dir: &Metadata, _child: &Metadata) -> bool {
 
 /// Mac: ダウンロードしていないファイル（とフォルダ）に付く印。
 #[cfg(target_os = "macos")]
-pub(crate) fn cloud_only(meta: &Metadata) -> bool {
+pub fn cloud_only(meta: &Metadata) -> bool {
     use std::os::macos::fs::MetadataExt;
     const SF_DATALESS: u32 = 0x4000_0000;
     meta.st_flags() & SF_DATALESS != 0
@@ -253,7 +253,7 @@ pub(crate) fn cloud_only(meta: &Metadata) -> bool {
 
 /// Windows: クラウドのプレースホルダの属性。
 #[cfg(windows)]
-pub(crate) fn cloud_only(meta: &Metadata) -> bool {
+pub fn cloud_only(meta: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
     const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
@@ -266,7 +266,7 @@ pub(crate) fn cloud_only(meta: &Metadata) -> bool {
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-pub(crate) fn cloud_only(_meta: &Metadata) -> bool {
+pub fn cloud_only(_meta: &Metadata) -> bool {
     false
 }
 

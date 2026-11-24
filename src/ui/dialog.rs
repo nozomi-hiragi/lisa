@@ -34,7 +34,12 @@ impl Plugin for DialogPlugin {
             })
             .add_systems(
                 Update,
-                (update_dialog, open_dialog, open_link_delete_dialog)
+                (
+                    update_dialog,
+                    open_dialog,
+                    open_link_delete_dialog,
+                    show_refresh_error,
+                )
                     .chain()
                     .in_set(MenuSystems),
             );
@@ -46,6 +51,7 @@ pub(crate) struct DialogState {
     open: Option<OpenDialog>,
     just_closed: bool,
     link_cache: HashMap<LinkQuery, LinkReply>,
+    reported_refresh: u64,
 }
 
 impl DialogState {
@@ -65,10 +71,11 @@ enum Content {
         scroll_area: Entity,
     },
     Rename {
-        from: PathBuf,
+        operation: NameEdit,
         input: Entity,
         error: Entity,
     },
+    Notice,
     Details {
         path: Option<String>,
         scroll_area: Entity,
@@ -76,6 +83,15 @@ enum Content {
         pending: Option<PendingTotal>,
         marker: Option<Box<MarkerAction>>,
         lookup: Option<LinkLookup>,
+    },
+}
+
+enum NameEdit {
+    Rename(PathBuf),
+    Create {
+        target: super::context_menu::LocalTarget,
+        created: Option<PathBuf>,
+        reply: Option<Mutex<mpsc::Receiver<Option<String>>>>,
     },
 }
 
@@ -158,6 +174,7 @@ fn open_dialog(
         }
         let (title, width) = match command.action {
             ContextAction::Rename => ("名前の変更", 440.),
+            ContextAction::NewFolder => ("新規フォルダ", 440.),
             ContextAction::Details => ("詳細", 520.),
             _ => continue,
         };
@@ -172,12 +189,29 @@ fn open_dialog(
             continue;
         }
         let (backdrop, panel) = frame(&mut commands, &font, title, width);
-        let content = if command.action == ContextAction::Rename {
-            let from = target
-                .local_path
-                .as_ref()
-                .expect("available rename has a path");
-            let name = from.file_name().unwrap_or_default().to_string_lossy();
+        let content = if matches!(
+            command.action,
+            ContextAction::Rename | ContextAction::NewFolder
+        ) {
+            let (operation, name, confirm) = if command.action == ContextAction::NewFolder {
+                (
+                    NameEdit::Create {
+                        target: target.refresh.clone().expect("作成先"),
+                        created: None,
+                        reply: None,
+                    },
+                    String::new(),
+                    "作成",
+                )
+            } else {
+                let from = target.local_path.clone().expect("名前変更のパス");
+                let name = from
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                (NameEdit::Rename(from), name, "変更")
+            };
             let input = commands
                 .spawn((
                     Node {
@@ -219,12 +253,12 @@ fn open_dialog(
                 &mut commands,
                 buttons,
                 &font,
-                "変更",
+                confirm,
                 DialogAction::Rename,
                 true,
             );
             Content::Rename {
-                from: from.clone(),
+                operation,
                 input,
                 error,
             }
@@ -461,6 +495,7 @@ fn update_dialog(
     font: Res<LabelFont>,
     lan: Option<Res<crate::lan::LanState>>,
     proxy: Option<Res<EventLoopProxyWrapper>>,
+    scan: Option<Res<crate::scan::ScanControl>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     let mut action = actions.read().last().copied();
@@ -482,11 +517,51 @@ fn update_dialog(
     let Some(dialog) = open.as_mut() else {
         return;
     };
-    let close = if let Content::Rename { from, input, error } = &dialog.content {
+    let close = if let Content::Rename {
+        operation,
+        input,
+        error,
+    } = &mut dialog.content
+    {
+        let completed = if let NameEdit::Create {
+            reply: Some(reply), ..
+        } = operation
+        {
+            if action == Some(DialogAction::Close) || keys.just_pressed(KeyCode::Escape) {
+                Some(None)
+            } else {
+                match reply.get_mut().expect("一覧の結果").try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Some("一覧更新が中断されました".into()))
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return,
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(reason) = &completed {
+            if let NameEdit::Create { reply, .. } = operation {
+                *reply = None;
+            }
+            match reason {
+                None => action = Some(DialogAction::Close),
+                Some(reason) => {
+                    if let Ok(mut text) = texts.get_mut(*error) {
+                        **text = format!(
+                            "フォルダは作成済みです。作成を押すと一覧だけ再試行します。\n{reason}"
+                        );
+                    }
+                    redraw.write(RequestRedraw);
+                    return;
+                }
+            }
+        }
         let Ok(edit) = edits.get(*input) else {
             return;
         };
-        if !edit.is_composing() {
+        if completed.is_none() && !edit.is_composing() {
             if keys.just_pressed(KeyCode::Escape) {
                 action = Some(DialogAction::Close);
             } else if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter) {
@@ -497,15 +572,40 @@ fn update_dialog(
             Some(DialogAction::Close) => true,
             Some(DialogAction::Rename) => {
                 let name = edit.value().to_string();
-                let result = validate_rename(from, &name).and_then(|changed| {
-                    if changed {
-                        let organize = organize.as_mut().ok_or("今は名前を変更できません")?;
-                        organize.user_rename(from.clone(), name)?;
-                    }
-                    Ok(())
-                });
+                let result = match operation {
+                    NameEdit::Rename(from) => validate_rename(from, &name).and_then(|changed| {
+                        if changed {
+                            let organize = organize.as_mut().ok_or("今は名前を変更できません")?;
+                            organize.user_rename(from.clone(), name)?;
+                        }
+                        Ok(true)
+                    }),
+                    NameEdit::Create {
+                        target,
+                        created,
+                        reply,
+                    } => (|| {
+                        if created.is_none() {
+                            target.validate()?;
+                            *created = Some(create_folder(&target.request.path, &name)?);
+                        }
+                        let path = created.as_ref().expect("作成済み");
+                        let pending = scan
+                            .as_ref()
+                            .and_then(|scan| {
+                                scan.list_created(target.request.clone(), path.clone())
+                            })
+                            .ok_or("フォルダは作成済みです。作成を押すと一覧だけ再試行します。")?;
+                        *reply = Some(Mutex::new(pending));
+                        if let Ok(mut text) = texts.get_mut(*error) {
+                            **text = "フォルダを作成しました。一覧を確認しています…".into();
+                        }
+                        redraw.write(RequestRedraw);
+                        Ok(false)
+                    })(),
+                };
                 match result {
-                    Ok(()) => true,
+                    Ok(close) => close,
                     Err(message) => {
                         if let Ok(mut text) = texts.get_mut(*error) {
                             **text = message;
@@ -662,7 +762,7 @@ fn update_dialog(
         });
         keys.just_pressed(KeyCode::Escape) || action == Some(DialogAction::Close) || opened
     } else {
-        false
+        keys.just_pressed(KeyCode::Escape) || action == Some(DialogAction::Close)
     };
     if close {
         commands.entity(dialog.backdrop).despawn();
@@ -671,6 +771,61 @@ fn update_dialog(
         focus.clear();
         redraw.write(RequestRedraw);
     }
+}
+
+fn show_refresh_error(
+    mut commands: Commands,
+    mut state: ResMut<DialogState>,
+    mut notice: Option<ResMut<super::context_menu::RefreshNotice>>,
+    status: Option<Res<crate::scan::RefreshStatus>>,
+    font: Res<LabelFont>,
+    mut redraw: MessageWriter<RequestRedraw>,
+) {
+    if state.busy() {
+        return;
+    }
+    let mut error = notice.as_mut().and_then(|notice| notice.error.take());
+    if error.is_none()
+        && let Some(completion) = status.as_ref().and_then(|status| status.last.as_ref())
+        && state.reported_refresh < completion.generation
+    {
+        state.reported_refresh = completion.generation;
+        error = completion
+            .error
+            .as_ref()
+            .map(|error| format!("{}\n{error}", completion.target.path.display()));
+    }
+    let Some(error) = error else { return };
+    let (backdrop, panel) = frame(&mut commands, &font, "更新できませんでした", 440.);
+    label(
+        &mut commands,
+        panel,
+        &font,
+        &error,
+        12.,
+        palette::BASE_CONTENT,
+    );
+    let row = button_row(&mut commands, panel);
+    button(
+        &mut commands,
+        row,
+        &font,
+        "閉じる",
+        DialogAction::Close,
+        true,
+    );
+    state.open = Some(OpenDialog {
+        backdrop,
+        content: Content::Notice,
+    });
+    redraw.write(RequestRedraw);
+}
+
+fn create_folder(parent: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    lisa_core::organize::validate_entry_name(name)?;
+    let path = parent.join(name);
+    std::fs::create_dir(&path).map_err(|error| format!("フォルダを作成できません: {error}"))?;
+    Ok(path)
 }
 
 fn detail_section(commands: &mut Commands, parent: Entity) -> Entity {
@@ -1141,6 +1296,26 @@ mod tests {
     use crate::ui::context_menu::Target;
 
     #[test]
+    fn 作成は単一成分で同名のファイルや同時作成を上書きしない() {
+        let parent = std::env::temp_dir().join(format!("lisa-new-folder-{}", std::process::id()));
+        std::fs::create_dir(&parent).unwrap();
+        for invalid in ["", "  ", ".", "..", "/absolute", "a/b", "a\\b"] {
+            assert!(create_folder(&parent, invalid).is_err(), "{invalid:?}");
+        }
+        std::fs::write(parent.join("taken"), b"file").unwrap();
+        assert!(create_folder(&parent, "taken").is_err());
+        assert_eq!(std::fs::read(parent.join("taken")).unwrap(), b"file");
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| create_folder(&parent, "new"));
+            let second = scope.spawn(|| create_folder(&parent, "new"));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(first.is_ok(), second.is_ok());
+        assert!(parent.join("new").is_dir());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn rename_prefills_and_keeps_the_modal_open_on_validation_errors() {
         let mut app = App::new();
         app.insert_resource(FileTree::dummy())
@@ -1161,6 +1336,8 @@ mod tests {
             local_movable: true,
             cut_source: None,
             path_text: None,
+            refresh: None,
+            blank: false,
         };
         let open = ContextCommand {
             action: ContextAction::Rename,

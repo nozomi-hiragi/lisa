@@ -42,6 +42,10 @@ use crate::view::{
     WindowOccludedState, fit, is_attached, scene_path,
 };
 
+/// 検証入力の位置。OS のポインターを動かさず、次のフレームだけ使う。
+#[derive(Resource)]
+pub(crate) struct DebugClick(pub Vec2);
+
 pub struct RemotePlugin;
 
 impl Plugin for RemotePlugin {
@@ -49,7 +53,14 @@ impl Plugin for RemotePlugin {
         app.add_systems(Startup, start)
             .add_systems(First, request_exit)
             .add_systems(Update, (handle, select_pending).chain().after(ViewSystems))
+            .add_systems(Update, clear_debug_click.after(ViewSystems).before(handle))
             .add_systems(Last, remove_on_exit);
+    }
+}
+
+fn clear_debug_click(mut commands: Commands, click: Option<Res<DebugClick>>) {
+    if click.is_some() {
+        commands.remove_resource::<DebugClick>();
     }
 }
 
@@ -94,6 +105,8 @@ struct DebugContext<'w, 's> {
     jump_to: Option<Res<'w, JumpTo>>,
     sync_request: Res<'w, SyncRequest>,
     pinch_writer: MessageWriter<'w, PinchGesture>,
+    mouse_writer: MessageWriter<'w, bevy::input::mouse::MouseButtonInput>,
+    key_writer: MessageWriter<'w, bevy::input::keyboard::KeyboardInput>,
     wheel_writer: MessageWriter<'w, MouseWheel>,
     ui_text: Query<
         'w,
@@ -410,6 +423,59 @@ fn handle(
                     match action.as_str() {
                         "up" => {
                             commands.insert_resource(NavRequest::Up);
+                            Ok(())
+                        }
+                        "test_right" | "test_left" if cfg!(debug_assertions) => {
+                            if let Some([x, y]) = screen_pos {
+                                use bevy::input::{ButtonState, mouse::MouseButtonInput};
+                                let pos = Vec2::new(x, y);
+                                commands.insert_resource(DebugClick(pos));
+                                let button = if action == "test_right" {
+                                    MouseButton::Right
+                                } else {
+                                    MouseButton::Left
+                                };
+                                for state in [ButtonState::Pressed, ButtonState::Released] {
+                                    dbg.mouse_writer.write(MouseButtonInput {
+                                        button,
+                                        state,
+                                        window: *dbg.window_entity,
+                                    });
+                                }
+                                Ok(())
+                            } else {
+                                Err("screen_pos が必要です".into())
+                            }
+                        }
+                        action
+                            if cfg!(debug_assertions)
+                                && (action == "test_enter"
+                                    || action == "test_escape"
+                                    || action.starts_with("test_text:")) =>
+                        {
+                            use bevy::input::{
+                                ButtonState,
+                                keyboard::{Key, KeyboardInput, NativeKey, NativeKeyCode},
+                            };
+                            let (key_code, logical_key, text) = match action {
+                                "test_enter" => (KeyCode::Enter, Key::Enter, None),
+                                "test_escape" => (KeyCode::Escape, Key::Escape, None),
+                                _ => (
+                                    KeyCode::Unidentified(NativeKeyCode::Unidentified),
+                                    Key::Unidentified(NativeKey::Unidentified),
+                                    Some(action["test_text:".len()..].into()),
+                                ),
+                            };
+                            for state in [ButtonState::Pressed, ButtonState::Released] {
+                                dbg.key_writer.write(KeyboardInput {
+                                    key_code,
+                                    logical_key: logical_key.clone(),
+                                    state,
+                                    text: text.clone(),
+                                    repeat: false,
+                                    window: *dbg.window_entity,
+                                });
+                            }
                             Ok(())
                         }
                         "ui_move" | "ui_click" | "ui_press" | "ui_release" => {

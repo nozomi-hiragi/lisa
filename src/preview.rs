@@ -2,7 +2,7 @@
 
 pub mod cartridges;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -316,7 +316,7 @@ pub fn update_previews(
     mut sync: ResMut<crate::view::SyncRequest>,
     tree: Res<crate::model::tree::FileTree>,
     nav: Res<crate::view::Nav>,
-    mut last: Local<Option<(usize, u64)>>,
+    mut last: Local<Option<(usize, u64, u64)>>,
 ) {
     if registry.images.receive(&mut assets) {
         sync.request_redraw();
@@ -325,31 +325,60 @@ pub fn update_previews(
         .last()
         .map(|l| l.node)
         .unwrap_or(crate::model::tree::FileTree::ROOT);
-    if last.is_some_and(|(f, _)| f == folder) && !tree.is_changed() {
+    if last.is_some_and(|(f, _, revision)| f == folder && revision == registry.images.revision)
+        && !tree.is_changed()
+    {
         return;
     }
-    let sig = (folder, files_signature(&tree, folder));
+    let sig = (
+        folder,
+        files_signature(&tree, folder),
+        registry.images.revision,
+    );
     if *last == Some(sig) {
         return;
     }
     *last = Some(sig);
-    let files: Vec<(PathBuf, String)> = tree.nodes[folder]
-        .children
-        .iter()
-        .filter(|&&c| !tree.nodes[c].is_dir)
-        .filter_map(|&c| {
-            let path = crate::ui::tooltip::local_path(&tree, c)?;
-            Some((path, tree.nodes[c].name.clone()))
-        })
-        .collect();
-    let picked: Vec<(PathBuf, Arc<dyn Cartridge>)> = files
-        .into_iter()
-        .filter_map(|(path, name)| {
-            let c = registry.pick_arc(&name).filter(|c| c.can_load(&name))?;
-            Some((path, c.clone()))
-        })
-        .collect();
-    registry.images.request(picked);
+    let files = registry.folder_files(&tree, folder);
+    registry.images.request(files);
+}
+
+impl PreviewRegistry {
+    fn folder_files(
+        &self,
+        tree: &crate::model::tree::FileTree,
+        folder: usize,
+    ) -> Vec<(PathBuf, Arc<dyn Cartridge>)> {
+        tree.nodes[folder]
+            .children
+            .iter()
+            .filter_map(|&child| {
+                let node = &tree.nodes[child];
+                if node.is_dir {
+                    return None;
+                }
+                let cartridge = self
+                    .pick_arc(&node.name)
+                    .filter(|c| c.can_load(&node.name))?;
+                let path = crate::ui::tooltip::local_path(tree, child)?;
+                Some((path, cartridge.clone()))
+            })
+            .collect()
+    }
+
+    /// 別のタイルから描くフォルダにも、その直下のファイル画像を用意する。
+    pub(crate) fn request_capture(&mut self, tree: &crate::model::tree::FileTree, folder: usize) {
+        let mut files = self.folder_files(tree, folder);
+        files.truncate(MAX_IMAGES);
+        self.images.capture = self.images.request_files(files);
+    }
+
+    pub(crate) fn capture_pending(&self) -> bool {
+        self.images
+            .capture
+            .values()
+            .any(|key| self.images.requested.contains_key(key) && !self.images.order.contains(key))
+    }
 }
 
 /// フォルダの直接の子のファイル（ノード・名前・大きさ）をまとめた値。読みを頼み直すかを決める。
@@ -393,21 +422,25 @@ pub struct PreviewKey {
 }
 
 struct Job {
+    ticket: u64,
     key: PreviewKey,
     cartridge: Arc<dyn Cartridge>,
 }
 
-type Done = (PreviewKey, Option<LoadedPreview>);
+type Done = (u64, PreviewKey, Option<LoadedPreview>);
 
 /// カートリッジが裏で読んだ絵の置き場（メモリだけ）。開いたフォルダの子だけ `request` で読みを頼む。
 pub struct PreviewImages {
     /// パス → 今のファイルの鍵（フォルダを開き直すたびに作り直す）。
     current: HashMap<PathBuf, PreviewKey>,
+    capture: HashMap<PathBuf, PreviewKey>,
     images: HashMap<PreviewKey, Preview>,
     /// 入れた順（上限を超えたら先頭から捨てる）。
     order: VecDeque<PreviewKey>,
     /// 読みを頼んだ鍵（読み中・読めなかったものも含む。捨てるまで頼み直さない）。
-    requested: HashSet<PreviewKey>,
+    requested: HashMap<PreviewKey, u64>,
+    ticket: u64,
+    revision: u64,
     jobs: Sender<Job>,
     done: Mutex<Receiver<Done>>,
 }
@@ -435,7 +468,7 @@ impl Default for PreviewImages {
                     if loaded.is_none() {
                         warn!("プレビューを読めませんでした: {}", job.key.path.display());
                     }
-                    if done_tx.send((job.key, loaded)).is_err() {
+                    if done_tx.send((job.ticket, job.key, loaded)).is_err() {
                         return;
                     }
                 }
@@ -443,9 +476,12 @@ impl Default for PreviewImages {
         }
         Self {
             current: HashMap::new(),
+            capture: HashMap::new(),
             images: HashMap::new(),
             order: VecDeque::new(),
-            requested: HashSet::new(),
+            requested: HashMap::new(),
+            ticket: 0,
+            revision: 0,
             jobs,
             done: Mutex::new(done),
         }
@@ -455,7 +491,9 @@ impl Default for PreviewImages {
 impl PreviewImages {
     /// 描くときに引く。読めていれば、絵と縦横。
     pub fn get(&self, path: &Path) -> Option<Preview> {
-        self.images.get(self.current.get(path)?).cloned()
+        self.images
+            .get(self.current.get(path).or_else(|| self.capture.get(path))?)
+            .cloned()
     }
 
     /// `from` が `to` へ動いた（名前の変更・移動・取り消し）。読めた絵の鍵を付け替えて、読み直さずに
@@ -484,8 +522,9 @@ impl PreviewImages {
             if let Some(preview) = self.images.remove(&old) {
                 self.images.insert(new.clone(), preview);
             }
-            self.requested.remove(&old);
-            self.requested.insert(new.clone());
+            if let Some(ticket) = self.requested.remove(&old) {
+                self.requested.insert(new.clone(), ticket);
+            }
             if let Some(slot) = self.order.iter_mut().find(|k| **k == old) {
                 *slot = new.clone();
             }
@@ -496,15 +535,31 @@ impl PreviewImages {
         }
     }
 
+    pub(crate) fn invalidate(&mut self, target: &crate::scan::RefreshTarget) {
+        self.revision = self.revision.wrapping_add(1);
+        self.current.retain(|path, _| !target.contains(path));
+        self.capture.retain(|path, _| !target.contains(path));
+        self.images.retain(|key, _| !target.contains(&key.path));
+        self.order.retain(|key| !target.contains(&key.path));
+        self.requested.retain(|key, _| !target.contains(&key.path));
+    }
+
     /// 開いたフォルダの直接の子を渡す。鍵を作り直し、まだ無いものは読みを頼む。
     fn request(&mut self, files: Vec<(PathBuf, Arc<dyn Cartridge>)>) {
-        self.current.clear();
+        self.current = self.request_files(files);
+    }
+
+    fn request_files(
+        &mut self,
+        files: Vec<(PathBuf, Arc<dyn Cartridge>)>,
+    ) -> HashMap<PathBuf, PreviewKey> {
+        let mut keys = HashMap::new();
         for (path, cartridge) in files {
-            let Ok(meta) = std::fs::metadata(&path) else {
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
             // クラウドにだけあるファイルは読まない（読むとダウンロードが始まる）。
-            if cloud_only(&meta) {
+            if !meta.is_file() || cloud_only(&meta) {
                 continue;
             }
             let key = PreviewKey {
@@ -512,11 +567,18 @@ impl PreviewImages {
                 len: meta.len(),
                 mtime: meta.modified().ok(),
             };
-            self.current.insert(path.clone(), key.clone());
-            if self.requested.insert(key.clone()) {
-                let _ = self.jobs.send(Job { key, cartridge });
+            keys.insert(path, key.clone());
+            if !self.requested.contains_key(&key) {
+                self.ticket = self.ticket.wrapping_add(1);
+                self.requested.insert(key.clone(), self.ticket);
+                let _ = self.jobs.send(Job {
+                    ticket: self.ticket,
+                    key,
+                    cartridge,
+                });
             }
         }
+        keys
     }
 
     /// 読めた絵を受け取って `Image` にする。1 枚でも入れたら true（再描画を 1 回頼む）。
@@ -526,7 +588,11 @@ impl PreviewImages {
             done.extend(rx.try_iter());
         }
         let mut changed = false;
-        for (key, loaded) in done {
+        for (ticket, key, loaded) in done {
+            if self.requested.get(&key) != Some(&ticket) {
+                continue;
+            }
+            self.order.push_back(key.clone());
             let preview = match loaded {
                 None => continue,
                 Some(LoadedPreview::Text { lines }) => Preview::Text(Arc::new(lines)),
@@ -554,7 +620,6 @@ impl PreviewImages {
                 }
             };
             self.images.insert(key.clone(), preview);
-            self.order.push_back(key);
             changed = true;
         }
         while self.order.len() > MAX_IMAGES {
@@ -707,6 +772,74 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn 更新後に届いた同じ属性の旧プレビューを採用しない() {
+        let (jobs, _) = channel();
+        let (sender, done) = channel();
+        let path = PathBuf::from("branch/file.txt");
+        let sibling = PathBuf::from("other/file.txt");
+        let key = PreviewKey {
+            path: path.clone(),
+            len: 3,
+            mtime: None,
+        };
+        let sibling_key = PreviewKey {
+            path: sibling.clone(),
+            ..key.clone()
+        };
+        let mut images = PreviewImages {
+            jobs,
+            done: Mutex::new(done),
+            capture: HashMap::new(),
+            current: HashMap::from([
+                (path.clone(), key.clone()),
+                (sibling.clone(), sibling_key.clone()),
+            ]),
+            images: HashMap::from([(
+                sibling_key.clone(),
+                Preview::Text(Arc::new(vec!["same".into()])),
+            )]),
+            order: VecDeque::from([sibling_key.clone()]),
+            requested: HashMap::from([(key.clone(), 1), (sibling_key, 2)]),
+            ticket: 2,
+            revision: 0,
+        };
+        images.invalidate(&crate::scan::RefreshTarget {
+            drive_id: "test".into(),
+            path: path.clone(),
+            subtree: false,
+        });
+        images.current.insert(path.clone(), key.clone());
+        images.requested.insert(key.clone(), 3);
+        sender
+            .send((
+                1,
+                key.clone(),
+                Some(LoadedPreview::Text {
+                    lines: vec!["old".into()],
+                }),
+            ))
+            .unwrap();
+        let mut assets = Assets::default();
+        assert!(!images.receive(&mut assets));
+        assert!(images.get(&path).is_none());
+        assert!(images.get(&sibling).is_some());
+
+        sender
+            .send((
+                3,
+                key,
+                Some(LoadedPreview::Text {
+                    lines: vec!["new".into()],
+                }),
+            ))
+            .unwrap();
+        assert!(images.receive(&mut assets));
+        assert!(
+            matches!(images.get(&path), Some(Preview::Text(lines)) if lines.as_slice() == ["new"])
+        );
     }
 
     #[test]

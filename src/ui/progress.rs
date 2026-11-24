@@ -33,6 +33,33 @@ impl Plugin for ProgressPlugin {
 #[derive(Component)]
 struct Panel;
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct PanelPointer<'w, 's> {
+    panel: Query<
+        'w,
+        's,
+        (
+            &'static ComputedNode,
+            &'static bevy::ui::UiGlobalTransform,
+            &'static Visibility,
+        ),
+        With<Panel>,
+    >,
+}
+
+impl PanelPointer<'_, '_> {
+    pub(crate) fn contains(&self, window: &Window, cursor: Option<Vec2>) -> bool {
+        let Some(point) = cursor.map(|point| point * window.scale_factor()) else {
+            return false;
+        };
+        self.panel.iter().any(|(node, transform, visibility)| {
+            *visibility != Visibility::Hidden
+                && node.size().min_element() > 0.0
+                && node.contains_point(*transform, point)
+        })
+    }
+}
+
 #[derive(Component)]
 enum ProgressLine {
     Summary,
@@ -64,7 +91,7 @@ fn spawn_panel(mut commands: Commands, font: Res<LabelFont>, progress: Option<Re
             },
             BackgroundColor(PANEL_COLOR),
             GlobalZIndex(5),
-            Pickable::IGNORE,
+            Pickable::default(),
         ))
         .with_children(|panel| {
             panel
@@ -309,5 +336,50 @@ pub(crate) fn bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::math::DVec2;
+    use bevy::ui::UiGlobalTransform;
+
+    #[test]
+    fn パネルの実寸と非表示に追従する() {
+        let mut world = World::new();
+        let window_id = world.spawn(Window::default()).id();
+        let panel = world
+            .spawn((
+                Panel,
+                Visibility::Inherited,
+                ComputedNode::default(),
+                UiGlobalTransform::from_xy(160., 400.),
+            ))
+            .id();
+        for (size, point, visible, expected) in [
+            (Vec2::new(200., 40.), DVec2::new(160., 410.), true, true),
+            (Vec2::new(200., 40.), DVec2::new(160., 430.), true, false),
+            (Vec2::new(400., 100.), DVec2::new(160., 430.), true, true),
+            (Vec2::new(400., 100.), DVec2::new(160., 430.), false, false),
+        ] {
+            world.get_mut::<ComputedNode>(panel).unwrap().size = size;
+            *world.get_mut::<Visibility>(panel).unwrap() = if visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            world
+                .get_mut::<Window>(window_id)
+                .unwrap()
+                .set_physical_cursor_position(Some(point));
+            let hit = world
+                .run_system_once(|panel: PanelPointer, window: Single<&Window>| {
+                    panel.contains(&window, window.cursor_position())
+                })
+                .unwrap();
+            assert_eq!(hit, expected);
+        }
     }
 }

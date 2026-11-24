@@ -36,7 +36,10 @@ const RELAYOUT_EVERY: Duration = Duration::from_millis(300);
 /// 1 フレームで DB から子を出すフォルダの数の上限。
 const LOAD_PER_FRAME: usize = 256;
 
+mod refresh;
 mod worker;
+use refresh::RefreshRequest;
+pub(crate) use refresh::RefreshTarget;
 
 pub use worker::Rest;
 
@@ -120,6 +123,10 @@ impl Plugin for ScanPlugin {
                 node,
                 // DB が無ければ、どのドライブも残さない。
                 drive_id: volume.id.clone().filter(|_| db.is_some()),
+                mount_identity: std::fs::symlink_metadata(&volume.mount_path)
+                    .ok()
+                    .as_ref()
+                    .and_then(worker::directory_identity),
                 mount: volume.mount_path.clone(),
                 listed: tree.nodes[node].listed,
             })
@@ -134,6 +141,7 @@ impl Plugin for ScanPlugin {
             })
             .insert_resource(Setup(Mutex::new(Some((db, roots)))))
             .init_resource::<TreeChanged>()
+            .init_resource::<RefreshStatus>()
             .init_resource::<crate::model::display_path::DisplayNames>()
             .add_systems(Startup, start_workers)
             .add_systems(
@@ -203,6 +211,7 @@ struct Root {
     node: NodeId,
     drive_id: Option<String>,
     mount: PathBuf,
+    mount_identity: Option<(u64, u64)>,
     /// DB で、一番上を読み終えている（続きから読む）。
     listed: bool,
 }
@@ -274,7 +283,7 @@ impl Store {
     }
 }
 
-fn scan_volumes() -> Vec<lisa_core::volumes::Volume> {
+pub(crate) fn scan_volumes() -> Vec<lisa_core::volumes::Volume> {
     #[cfg(all(windows, feature = "verify-fs"))]
     if let Some(root) = std::env::var_os("LISA_VERIFY_SCAN_ROOT") {
         let Some(path) = root
@@ -469,15 +478,27 @@ fn is_under_any(path: &std::path::Path, dirs: &[String]) -> bool {
 impl ScanControl {
     /// 見ているフォルダを、裏の分より先に読んで（読み終えていなければ）ハッシュしてもらう。
     pub(crate) fn visible(&self, path: PathBuf) {
-        let sent = self
-            .requests
-            .lock()
-            .is_ok_and(|s| s.send(worker::Request::Visible(path)).is_ok());
-        if sent {
-            self.control
-                .urgent
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.send_urgent(worker::Request::Visible(path));
+    }
+
+    /// 対象を手動更新の列に積み、ワーカーを起こす。
+    pub(crate) fn refresh(&self, target: RefreshTarget) -> Option<u64> {
+        let sender = self.requests.lock().ok()?;
+        let generation = self.control.queue_refresh(target, None)?;
+        sender.send(worker::Request::ManualWake).ok()?;
+        Some(generation)
+    }
+
+    pub(crate) fn list_created(
+        &self,
+        parent: RefreshTarget,
+        created: PathBuf,
+    ) -> Option<Receiver<Option<String>>> {
+        let (tx, rx) = channel();
+        let sender = self.requests.lock().ok()?;
+        self.control.queue_refresh(parent, Some((created, tx)))?;
+        sender.send(worker::Request::ManualWake).ok()?;
+        Some(rx)
     }
 
     /// 整理で触ったフォルダなどを、裏の分として読み直してもらう（`Request::Hint`）。
@@ -489,14 +510,18 @@ impl ScanControl {
 
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: フォルダを「変わっていた」扱いにして読み直す。
     pub(crate) fn debug_force_changed(&self, path: PathBuf) {
-        let sent = self
-            .requests
-            .lock()
-            .is_ok_and(|s| s.send(worker::Request::DebugForceChanged(path)).is_ok());
-        if sent {
-            self.control
-                .urgent
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.send_urgent(worker::Request::DebugForceChanged(path));
+    }
+
+    fn send_urgent(&self, request: worker::Request) {
+        let Ok(sender) = self.requests.lock() else {
+            return;
+        };
+        let order = std::sync::atomic::Ordering::Relaxed;
+        // 受信側がすぐに処理しても、減算が加算を追い越さないようにする。
+        self.control.urgent.fetch_add(1, order);
+        if sender.send(request).is_err() {
+            self.control.urgent.fetch_sub(1, order);
         }
     }
 }
@@ -579,6 +604,18 @@ fn quarantine_skip_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// 直近の手動更新の結果。メニューや通知から世代で照合できる。
+#[derive(Resource, Default)]
+pub(crate) struct RefreshStatus {
+    pub last: Option<RefreshCompletion>,
+}
+
+pub(crate) struct RefreshCompletion {
+    pub generation: u64,
+    pub target: RefreshTarget,
+    pub error: Option<String>,
+}
+
 /// 読む係の進み具合を UI から覗く。
 #[derive(Resource, Clone)]
 pub struct ScanProgress(pub Arc<Mutex<Progress>>);
@@ -616,9 +653,19 @@ enum Message {
         stored: bool,
     },
     /// フォルダのハッシュができた（中のファイルもハッシュした）。
-    Hashed { path: PathBuf },
+    Hashed {
+        path: PathBuf,
+    },
+    RefreshStarted(RefreshRequest),
+    RefreshFolder(PathBuf),
+    RefreshFinished {
+        request: RefreshRequest,
+        error: Option<String>,
+    },
     /// 読み直したら DB と違っていた（このあと `Listed` が来る）。
-    Changed { path: PathBuf },
+    Changed {
+        path: PathBuf,
+    },
     /// ここまでに書いたものを確定した。
     Committed,
 }
@@ -652,7 +699,7 @@ fn start_workers(
         roots,
         sender,
         requests: request_receiver,
-        proxy: (**proxy).clone(),
+        proxy: Some((**proxy).clone()),
         progress: progress.0.clone(),
         control: control.clone(),
         dirty: false,
@@ -718,12 +765,13 @@ impl Scanner {
     }
 
     /// `reset_children(id)` で木から外れる子孫を `folders`・`pending` から除く。
-    fn remove_descendants(&mut self, tree: &FileTree, id: NodeId) {
+    fn remove_descendants(&mut self, tree: &mut FileTree, id: NodeId) {
         let mut stack = tree.nodes[id].children.clone();
         while let Some(child) = stack.pop() {
             if let Some(p) = &tree.nodes[child].path {
                 if self.folders.get(p) == Some(&child) {
                     self.folders.remove(p);
+                    tree.preview_generations.remove(p);
                 }
                 if self.pending.get(p) == Some(&child) {
                     self.pending.remove(p);
@@ -756,7 +804,14 @@ fn receive(
         Res<crate::render::cache::ImageCache>,
     ),
     layouts: Res<Layouts>,
-    (mut sync, mut dups): (ResMut<crate::view::SyncRequest>, ResMut<crate::dups::Dups>),
+    (mut sync, mut dups, mut previews, mut images, mut capture, mut refresh_status): (
+        ResMut<crate::view::SyncRequest>,
+        ResMut<crate::dups::Dups>,
+        ResMut<crate::preview::PreviewRegistry>,
+        ResMut<crate::render::cache::FolderImages>,
+        ResMut<crate::render::cache::ThumbnailCapture>,
+        ResMut<RefreshStatus>,
+    ),
     animating: Option<Res<crate::view::Animating>>,
     fades: Query<(), With<crate::view::Fade>>,
     gesture: Res<crate::input::gesture::Gesture>,
@@ -780,6 +835,56 @@ fn receive(
     let mut invalidated = HashSet::new();
     for message in messages {
         match message {
+            Message::RefreshStarted(request) => {
+                let target = request.target;
+                if let Some((created, _)) = &request.created {
+                    invalidated.insert(created.clone());
+                } else {
+                    previews.images.invalidate(&target);
+                }
+                if let Some(mount) = store.roots.values().find_map(|(id, mount)| {
+                    (id.as_ref() == Some(&target.drive_id)).then_some(mount)
+                }) {
+                    let first = if target.subtree {
+                        Some(target.path.as_path())
+                    } else {
+                        target.path.parent()
+                    };
+                    if let Some(first) = first {
+                        invalidated.extend(preview_ancestors(first, mount).map(Path::to_path_buf));
+                    }
+                    invalidated.extend(
+                        scanner
+                            .folders
+                            .keys()
+                            .filter(|path| request.created.is_none() && target.contains(path))
+                            .cloned(),
+                    );
+                }
+                sync.request_redraw();
+            }
+            Message::RefreshFolder(path) => {
+                invalidated.insert(path);
+            }
+            Message::RefreshFinished { request, error } => {
+                if let Some(error) = &error {
+                    warn!(
+                        "手動更新が未完了（{}、世代 {}）: {error}",
+                        request.target.path.display(),
+                        request.generation
+                    );
+                }
+                if request.created.is_none() {
+                    refresh_status.last = Some(RefreshCompletion {
+                        generation: request.generation,
+                        target: request.target,
+                        error,
+                    });
+                }
+                if dups.scope == crate::dups::remote::Scope::default() {
+                    dups.invalidate();
+                }
+            }
             Message::Committed => {
                 scanner.recent.clear();
                 scanner.hashed.clear();
@@ -820,7 +925,7 @@ fn receive(
                 if let Some(&id) = scanner.folders.get(&path)
                     && tree.is_attached(id)
                 {
-                    scanner.remove_descendants(&tree, id);
+                    scanner.remove_descendants(&mut tree, id);
                     tree.reset_children(id);
                     tree.mark_stale(id);
                     any = true;
@@ -865,7 +970,11 @@ fn receive(
         let generation = tree.preview_revision;
         for path in invalidated {
             cache.invalidate_local(&path);
-            tree.preview_generations.insert(path, generation);
+            images.invalidate_local(&path);
+            capture.invalidate_local(&path);
+            if scanner.folders.contains_key(&path) {
+                tree.preview_generations.insert(path, generation);
+            }
         }
     }
     if structure_reset {
@@ -1133,7 +1242,7 @@ pub(crate) fn resolve_location(
 }
 
 /// ノード `id` があるドライブの（DB の ID、つないでいる場所）。DB に残さないドライブなら None。
-fn drive_of(tree: &FileTree, store: &Store, id: NodeId) -> Option<(String, PathBuf)> {
+pub(crate) fn drive_of(tree: &FileTree, store: &Store, id: NodeId) -> Option<(String, PathBuf)> {
     let mut cur = Some(id);
     while let Some(i) = cur {
         if let Some((drive_id, mount)) = store.roots.get(&i) {

@@ -23,7 +23,7 @@ use crate::render::palette;
 use crate::render::scene::LabelFont;
 use crate::ui::menu::MenuSystems;
 use crate::ui::tooltip::{
-    ClampPopover, PointerBlocked, local_item_path, node_under_cursor, remote_path_text,
+    ClampPopover, PointerBlocked, local_item_path, node_at_viewport_pos, remote_path_text,
 };
 use crate::view::{MainCamera, Nav};
 
@@ -38,6 +38,7 @@ pub struct ContextMenuPlugin;
 impl Plugin for ContextMenuPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ContextMenu>()
+            .init_resource::<RefreshNotice>()
             .add_message::<ContextCommand>()
             .add_plugins(super::dialog::DialogPlugin)
             .add_systems(First, |mut menu: ResMut<ContextMenu>| {
@@ -52,6 +53,11 @@ impl Plugin for ContextMenuPlugin {
                     .in_set(MenuSystems),
             );
     }
+}
+
+#[derive(Resource, Default)]
+pub(super) struct RefreshNotice {
+    pub error: Option<String>,
 }
 
 /// メニューが開いているか（開いている間と閉じたフレームは、下の画面のクリックや Esc を受けない）。
@@ -78,6 +84,8 @@ pub enum ContextAction {
     CopyPath,
     Reveal,
     Rename,
+    NewFolder,
+    Refresh,
     Cut,
     Paste,
     Delete,
@@ -91,6 +99,9 @@ const ITEMS: &[Option<ContextAction>] = &[
     None,
     Some(ContextAction::CopyPath),
     Some(ContextAction::Reveal),
+    None,
+    Some(ContextAction::NewFolder),
+    Some(ContextAction::Refresh),
     None,
     Some(ContextAction::Rename),
     Some(ContextAction::Cut),
@@ -112,6 +123,8 @@ impl ContextAction {
                     "Finder で表示"
                 }
             }
+            Self::NewFolder => "新規フォルダ",
+            Self::Refresh => "更新",
             Self::Rename => "名前の変更…",
             Self::Cut => "切り取り",
             Self::Paste => "ここに貼り付け",
@@ -139,6 +152,43 @@ pub struct Target {
     pub cut_source: Option<PathBuf>,
     /// コピーするパス（手元なら絶対パス、LAN の相手なら「端末名: パス」）。
     pub path_text: Option<String>,
+    pub(crate) refresh: Option<LocalTarget>,
+    pub(super) blank: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LocalTarget {
+    pub(crate) request: crate::scan::RefreshTarget,
+    mount: PathBuf,
+}
+
+impl LocalTarget {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !crate::scan::scan_volumes().iter().any(|volume| {
+            volume.id.as_ref() == Some(&self.request.drive_id) && volume.mount_path == self.mount
+        }) {
+            return Err("ドライブが接続されていません".into());
+        }
+        let path = &self.request.path;
+        for parent in path
+            .ancestors()
+            .skip(1)
+            .take_while(|parent| parent.starts_with(&self.mount))
+        {
+            if !std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err("親フォルダを確認できません".into());
+            }
+        }
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("対象を確認できません: {error}"))?;
+        if (self.request.subtree && meta.is_dir() || !self.request.subtree && meta.is_file())
+            && !lisa_core::listing::cloud_only(&meta)
+        {
+            Ok(())
+        } else {
+            Err("対象の種類が変わりました".into())
+        }
+    }
 }
 
 /// ノード `node` を右クリックしたときと同じ対象（目印を開いたときの詳細にも使う）。
@@ -160,6 +210,24 @@ pub(crate) fn target_of(
         .as_ref()
         .map(|p| p.display().to_string())
         .or_else(|| remote_path_text(tree, node));
+    let refresh = (|| {
+        let item = &tree.nodes[node];
+        if !is_refreshable(tree, node) {
+            return None;
+        }
+        let (drive_id, mount) = crate::scan::drive_of(tree, store?, node)?;
+        let path = local.clone().filter(|path| path.starts_with(&mount))?;
+        let candidate = LocalTarget {
+            request: crate::scan::RefreshTarget {
+                drive_id,
+                path,
+                subtree: item.is_dir,
+            },
+            mount,
+        };
+        candidate.validate().ok()?;
+        Some(candidate)
+    })();
     Target {
         node,
         is_open: nav.top().node == node,
@@ -169,12 +237,25 @@ pub(crate) fn target_of(
         local_movable,
         cut_source: organize.and_then(|o| o.cut_source.clone()),
         path_text,
+        refresh,
+        blank: false,
     }
+}
+
+fn is_refreshable(tree: &FileTree, node: NodeId) -> bool {
+    let item = &tree.nodes[node];
+    item.remote.is_none()
+        && item.merged.is_none()
+        && !tree.in_marker_view(node)
+        && !tree.marker_view_read_only(node)
+        && (!item.is_dir || item.path.is_some())
 }
 
 /// 項目を押せるか。
 pub fn availability(action: ContextAction, target: &Target) -> bool {
     match action {
+        ContextAction::NewFolder => target.is_dir && target.refresh.is_some(),
+        ContextAction::Refresh => target.refresh.is_some(),
         ContextAction::Open => !target.is_open,
         ContextAction::Up => !target.at_root,
         ContextAction::CopyPath => target.path_text.is_some(),
@@ -183,12 +264,22 @@ pub fn availability(action: ContextAction, target: &Target) -> bool {
             target.local_movable && target.local_path.as_ref().is_some_and(|p| p.exists())
         }
         ContextAction::Paste => {
-            let Some(from) = target.cut_source.as_ref().filter(|p| p.exists()) else { return false };
-            let dest_dir = if target.is_dir { target.local_path.clone() } else {
-                target.local_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
+            let Some(from) = target.cut_source.as_ref().filter(|p| p.exists()) else {
+                return false;
             };
-            let Some(dest_dir) = dest_dir else { return false };
-            dest_dir.is_dir() && from.parent() != Some(dest_dir.as_path())
+            let dest_dir = if target.is_dir {
+                target.local_path.clone()
+            } else {
+                target
+                    .local_path
+                    .as_ref()
+                    .and_then(|p| p.parent().map(Path::to_path_buf))
+            };
+            let Some(dest_dir) = dest_dir else {
+                return false;
+            };
+            dest_dir.is_dir()
+                && from.parent() != Some(dest_dir.as_path())
                 && !(from.is_dir() && dest_dir.starts_with(from))
         }
         ContextAction::Details => true,
@@ -248,14 +339,20 @@ fn open_menu(
         return;
     }
     let (cam, global, projection) = camera.into_inner();
-    let Some((node, world)) = node_under_cursor(window, (cam, global, projection), &tree, &layouts)
-    else {
+    let Some(cursor) = blocked.cursor(window) else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
+    let Some(world) = cam.viewport_to_world_2d(global, cursor).ok() else {
         return;
     };
-    let target = target_of(node, &tree, store.as_deref(), &nav, organize.as_deref());
+    let hit = node_at_viewport_pos(cursor, (cam, global, projection), &tree, &layouts);
+    let scene = crate::view::scene_path(&nav, &tree)
+        .last()
+        .expect("現在地")
+        .node;
+    let node = hit.map_or(scene, |(node, _)| node);
+    let mut target = target_of(node, &tree, store.as_deref(), &nav, organize.as_deref());
+    target.blank = hit.is_none();
     let window_size = Vec2::new(window.width(), window.height());
     menu.open = Some(spawn_menu(
         &mut commands,
@@ -311,6 +408,8 @@ fn run_command(
     mut clipboard: Option<ResMut<Clipboard>>,
     mut organize: Option<ResMut<crate::organize::OrganizeState>>,
     tree: Res<FileTree>,
+    scan: Option<Res<crate::scan::ScanControl>>,
+    mut refresh: ResMut<RefreshNotice>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     for command in reader.read() {
@@ -354,8 +453,13 @@ fn run_command(
             ContextAction::Paste => {
                 let from = organize.as_mut().and_then(|o| o.cut_source.take());
                 if let (Some(organize), Some(from)) = (organize.as_mut(), from) {
-                    let dest_dir = if target.is_dir { target.local_path.clone() } else {
-                        target.local_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
+                    let dest_dir = if target.is_dir {
+                        target.local_path.clone()
+                    } else {
+                        target
+                            .local_path
+                            .as_ref()
+                            .and_then(|p| p.parent().map(Path::to_path_buf))
                     };
                     if let Some(dest_dir) = dest_dir {
                         organize.user_move(from, dest_dir);
@@ -368,7 +472,24 @@ fn run_command(
                 }
             }
             // ダイアログ側が ContextCommand を受け取る。
-            ContextAction::Rename | ContextAction::Details => {}
+            ContextAction::Rename | ContextAction::NewFolder | ContextAction::Details => {}
+            ContextAction::Refresh => {
+                let Some(target) = &target.refresh else {
+                    continue;
+                };
+                if let Err(error) = target.validate().and_then(|_| {
+                    scan.as_ref()
+                        .and_then(|scan| scan.refresh(target.request.clone()))
+                        .map(|_| ())
+                        .ok_or_else(|| "更新要求を受け付けられませんでした".into())
+                }) {
+                    warn!(
+                        "更新できませんでした（{}）: {error}",
+                        target.request.path.display()
+                    );
+                    refresh.error = Some(error);
+                }
+            }
         }
         redraw.write(RequestRedraw);
     }
@@ -484,7 +605,8 @@ fn spawn_menu(
             ChildOf(root),
         ))
         .id();
-    for item in ITEMS {
+    let blank_items = [Some(ContextAction::NewFolder), Some(ContextAction::Refresh)];
+    for item in if target.blank { &blank_items } else { ITEMS } {
         let Some(action) = *item else {
             commands.spawn((
                 Node {
@@ -556,7 +678,45 @@ mod tests {
             local_movable: false,
             cut_source: None,
             path_text: None,
+            refresh: None,
+            blank: false,
         }
+    }
+
+    #[test]
+    fn 統合表示配下は中間フォルダにパスがあっても更新対象にしない() {
+        let mut tree = FileTree::dummy();
+        let (child, parent) = tree
+            .nodes
+            .iter()
+            .enumerate()
+            .find_map(|(id, node)| {
+                (node.is_dir && node.depth >= 3).then(|| (id, node.parent.unwrap()))
+            })
+            .unwrap();
+        tree.nodes[child].path = Some(std::env::temp_dir().join("intermediate"));
+        assert!(is_refreshable(&tree, child));
+        let location = serde_json::json!({
+            "device_id": "fixture", "device_name": "fixture",
+            "volume_id": "test", "volume_name": "test",
+            "relative_path": ["parent"], "display_path": "parent"
+        });
+        tree.nodes[parent].merged = Some(
+            serde_json::from_value(serde_json::json!({
+                "format": "fixture", "version": 1, "link_id": "fixture",
+                "source": location, "target": location, "kind": lisa_core::listing::Kind::Dir, "size": 0,
+                "hash": {"algorithm": "blake3", "version": 1, "value": "0".repeat(64)},
+                "executed_at": {"unix_ms": 0, "timezone": "UTC"}, "plan_id": 1, "item_id": 1
+            }))
+            .unwrap(),
+        );
+        assert!(!is_refreshable(&tree, child));
+        let nav = Nav {
+            stack: vec![crate::view::Level { node: child }],
+        };
+        let target = target_of(child, &tree, None, &nav, None);
+        assert!(!availability(ContextAction::NewFolder, &target));
+        assert!(!availability(ContextAction::Refresh, &target));
     }
 
     #[test]
