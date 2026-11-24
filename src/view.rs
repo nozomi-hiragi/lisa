@@ -1083,7 +1083,11 @@ fn navigate(
     mut maker: SceneMaker,
     animating: Option<Res<Animating>>,
     fades: Query<(), With<Fade>>,
-    popup: Res<Popup>,
+    (progress_panel, popup, debug_click): (
+        crate::ui::progress::PanelPointer,
+        Res<Popup>,
+        Option<Res<crate::remote::DebugClick>>,
+    ),
     banners: Query<&bevy::picking::hover::Hovered, With<crate::lan::PairBanner>>,
     mut gesture: ResMut<crate::input::gesture::Gesture>,
     context_menu: Res<crate::ui::context_menu::ContextMenu>,
@@ -1114,12 +1118,18 @@ fn navigate(
     };
 
     let old = nav.stack.clone();
+    let cursor = debug_click
+        .as_ref()
+        .map(|click| click.0)
+        .or_else(|| window.cursor_position());
     let click_at = match request {
         Some(NavRequest::ClickAt(world)) => Some(world),
         Some(NavRequest::Up) => None,
-        None if mouse.just_pressed(MouseButton::Left) => window
-            .cursor_position()
-            .and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok()),
+        None if mouse.just_pressed(MouseButton::Left)
+            && !progress_panel.contains(&window, cursor) =>
+        {
+            cursor.and_then(|p| camera.viewport_to_world_2d(camera_global, p).ok())
+        }
         None => None,
     };
     let go_up = matches!(request, Some(NavRequest::Up))

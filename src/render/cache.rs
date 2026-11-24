@@ -14,8 +14,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use bevy::asset::RenderAssetUsages;
@@ -42,6 +42,7 @@ use crate::view::{
 const IMAGE_WIDTH: u32 = 1024;
 /// メモリに保持するサムネの上限枚数。
 const MAX_CACHED_IMAGES: usize = 300;
+const MAX_DISK_CHECKS: usize = MAX_CACHED_IMAGES * 4;
 /// 撮影カメラを何フレーム動かしてから読み戻すか（描き終わるまでの余裕）。
 const CAPTURE_FRAMES: u32 = 2;
 /// 描き方・色空間の版。本体の中身を透明背景で撮影する。
@@ -146,6 +147,13 @@ pub struct FolderImages {
 }
 
 impl FolderImages {
+    pub(crate) fn invalidate_local(&mut self, path: &Path) {
+        let key = local_disk_key(path);
+        self.images.remove(&key);
+        self.order.retain(|cached| *cached != key);
+        self.disk_checked.remove(&key);
+    }
+
     pub(crate) fn counts(&self) -> (usize, usize) {
         (self.images.len(), self.images.len())
     }
@@ -207,23 +215,27 @@ fn loaded_image(rgba: Vec<u8>) -> Image {
 
 enum DiskWrite {
     Save(Key, Vec<u8>),
-    Invalidate(Key),
+    Invalidate(Key, u64),
 }
 
 /// ディスクの画像の置き場と、書く係・読む係・読み戻し結果のやりとり。
 #[derive(Resource)]
 pub struct ImageCache {
     dir: Option<PathBuf>,
+    invalidating: Arc<Mutex<(u64, HashMap<Key, u64>)>>,
     save: Mutex<Sender<DiskWrite>>,
-    read_req: Mutex<Sender<(Key, PathBuf)>>,
-    read_res: Mutex<Receiver<(Key, Option<Vec<u8>>)>>,
+    read_req: Mutex<Sender<(u64, NodeId, Key, PathBuf)>>,
+    read_res: Mutex<Receiver<(u64, NodeId, Key, Option<Vec<u8>>)>>,
     capture_tx: Mutex<Sender<CapturedImage>>,
     capture_rx: Mutex<Receiver<CapturedImage>>,
 }
 
 impl ImageCache {
     pub fn new() -> Self {
-        let dir = crate::scan::cache_dir().map(|dir| dir.join("folder-images"));
+        Self::with_dir(crate::scan::cache_dir().map(|dir| dir.join("folder-images")))
+    }
+
+    fn with_dir(dir: Option<PathBuf>) -> Self {
         if let Some(dir) = &dir {
             let _ = std::fs::create_dir_all(dir);
             // 使われなくなった画像を、裏で消す。
@@ -242,6 +254,8 @@ impl ImageCache {
         }
         let (save, save_rx) = channel::<DiskWrite>();
         let writer_dir = dir.clone();
+        let invalidating = Arc::new(Mutex::new((0, HashMap::new())));
+        let writer_invalidating = invalidating.clone();
         std::thread::Builder::new()
             .name("lisa-image-writer".into())
             .spawn(move || {
@@ -249,8 +263,12 @@ impl ImageCache {
                     if let Some(dir) = &writer_dir {
                         match request {
                             DiskWrite::Save(key, rgba) => write_webp(dir, &key, &rgba),
-                            DiskWrite::Invalidate(key) => {
+                            DiskWrite::Invalidate(key, ticket) => {
                                 let _ = std::fs::remove_file(dir.join(file_name(&key)));
+                                let mut pending = writer_invalidating.lock().expect("画像の無効化");
+                                if pending.1.get(&key) == Some(&ticket) {
+                                    pending.1.remove(&key);
+                                }
                             }
                         }
                     }
@@ -258,13 +276,16 @@ impl ImageCache {
             })
             .expect("画像を書く係を作る");
 
-        let (read_req, read_req_rx) = channel::<(Key, PathBuf)>();
-        let (read_res_tx, read_res) = channel::<(Key, Option<Vec<u8>>)>();
+        let (read_req, read_req_rx) = channel::<(u64, NodeId, Key, PathBuf)>();
+        let (read_res_tx, read_res) = channel::<(u64, NodeId, Key, Option<Vec<u8>>)>();
         std::thread::Builder::new()
             .name("lisa-image-reader".into())
             .spawn(move || {
-                for (key, path) in read_req_rx {
-                    if read_res_tx.send((key, read_webp(&path))).is_err() {
+                for (ticket, folder, key, path) in read_req_rx {
+                    if read_res_tx
+                        .send((ticket, folder, key, read_webp(&path)))
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -274,6 +295,7 @@ impl ImageCache {
         let (capture_tx, capture_rx) = channel::<CapturedImage>();
         Self {
             dir,
+            invalidating,
             save: Mutex::new(save),
             read_req: Mutex::new(read_req),
             read_res: Mutex::new(read_res),
@@ -283,12 +305,31 @@ impl ImageCache {
     }
 
     pub(crate) fn invalidate_local(&self, path: &Path) {
+        if self.dir.is_none() {
+            return;
+        }
         if let Ok(tx) = self.save.lock() {
-            let _ = tx.send(DiskWrite::Invalidate(local_disk_key(path)));
+            let key = local_disk_key(path);
+            let mut pending = self.invalidating.lock().expect("画像の無効化");
+            pending.0 = pending.0.wrapping_add(1);
+            let ticket = pending.0;
+            pending.1.insert(key, ticket);
+            if tx.send(DiskWrite::Invalidate(key, ticket)).is_err() {
+                pending.1.remove(&key);
+            }
         }
     }
 
     fn path(&self, key: &Key) -> Option<PathBuf> {
+        if self
+            .invalidating
+            .lock()
+            .expect("画像の無効化")
+            .1
+            .contains_key(key)
+        {
+            return None;
+        }
         self.dir.as_ref().map(|dir| dir.join(file_name(key)))
     }
 }
@@ -415,11 +456,15 @@ pub struct ThumbnailCapture {
     /// 撮影中のカメラ。
     active: Option<ActiveCapture>,
     /// ディスクから読み込み中の枚数。
-    in_flight_reads: HashSet<Key>,
-    in_flight_captures: HashSet<Key>,
+    in_flight_reads: HashMap<Key, u64>,
+    read_ticket: u64,
+    capture_ticket: u64,
+    in_flight_captures: HashMap<Key, u64>,
+    preview_request: Option<(Key, std::time::Instant)>,
 }
 
 struct CapturedImage {
+    ticket: u64,
     folder: NodeId,
     key: Key,
     rgba: Vec<u8>,
@@ -429,6 +474,8 @@ struct ActiveCapture {
     visit: Option<u64>,
     folder: NodeId,
     key: Key,
+    disk_key: Option<Key>,
+    invalidated: bool,
     camera: Entity,
     scene: Entity,
     target: Handle<Image>,
@@ -438,10 +485,31 @@ struct ActiveCapture {
 }
 
 impl ThumbnailCapture {
+    pub(crate) fn invalidate_local(&mut self, path: &Path) {
+        let key = local_disk_key(path);
+        self.in_flight_reads.remove(&key);
+        self.refreshed.remove(&key);
+        self.in_flight_captures.remove(&key);
+        if let Some(active) = &mut self.active
+            && active.disk_key == Some(key)
+        {
+            active.invalidated = true;
+            self.in_flight_captures.remove(&active.key);
+        }
+    }
+
+    fn take_disk_read(&mut self, key: &Key, ticket: u64) -> bool {
+        if self.in_flight_reads.get(key) != Some(&ticket) {
+            return false;
+        }
+        self.in_flight_reads.remove(key);
+        true
+    }
+
     pub(crate) fn is_pending(&self, tree: &FileTree, id: NodeId) -> bool {
         folder_key(tree, id).is_some_and(|key| {
-            self.in_flight_reads.contains(&key)
-                || self.in_flight_captures.contains(&key)
+            self.in_flight_reads.contains_key(&key)
+                || self.in_flight_captures.contains_key(&key)
                 || self.active.as_ref().is_some_and(|active| active.key == key)
         })
     }
@@ -469,7 +537,7 @@ pub(crate) struct ThumbContext<'w, 's> {
     layouts: Res<'w, Layouts>,
     settings: Res<'w, Settings>,
     theme: Res<'w, UiThemeAssets>,
-    previews: Res<'w, PreviewRegistry>,
+    previews: ResMut<'w, PreviewRegistry>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<bevy::sprite_render::ColorMaterial>>,
     nav: Res<'w, Nav>,
@@ -505,7 +573,16 @@ pub(crate) fn update_thumbnails(
     // 1a. 撮影の読み戻し結果を反映する。
     let mut updated_keys: Vec<Key> = Vec::new();
     if let Ok(rx) = cache.capture_rx.lock() {
-        for CapturedImage { folder, key, rgba } in rx.try_iter() {
+        for CapturedImage {
+            ticket,
+            folder,
+            key,
+            rgba,
+        } in rx.try_iter()
+        {
+            if capture.in_flight_captures.get(&key) != Some(&ticket) {
+                continue;
+            }
             capture.in_flight_captures.remove(&key);
             if !ctx.tree.is_attached(folder) || folder_key(&ctx.tree, folder) != Some(key) {
                 continue;
@@ -514,6 +591,9 @@ pub(crate) fn update_thumbnails(
             if rgba.len() == expected {
                 if let Some(disk_key) = disk_key(&ctx.tree, folder) {
                     if let Some(generation) = preview_generation(&ctx.tree, folder) {
+                        if capture.refreshed.len() >= MAX_DISK_CHECKS {
+                            capture.refreshed.clear();
+                        }
                         capture.refreshed.insert(disk_key, generation);
                         debug!("サムネを更新: {}", ctx.tree.nodes[folder].name);
                     }
@@ -530,8 +610,15 @@ pub(crate) fn update_thumbnails(
 
     // 1b. ディスクから読めた WebP を反映する。
     if let Ok(rx) = cache.read_res.lock() {
-        for (key, opt_rgba) in rx.try_iter() {
-            capture.in_flight_reads.remove(&key);
+        for (ticket, folder, key, opt_rgba) in rx.try_iter() {
+            if !capture.take_disk_read(&key, ticket) {
+                continue;
+            }
+            if !ctx.tree.is_attached(folder) || folder_key(&ctx.tree, folder) != Some(key) {
+                images.disk_checked.remove(&key);
+                capture.last_disk_scan = None;
+                continue;
+            }
             if let Some(rgba) = opt_rgba
                 && !images.images.contains_key(&key)
             {
@@ -585,6 +672,11 @@ pub(crate) fn update_thumbnails(
         {
             sync.request_redraw();
         }
+        if images.disk_checked.len() >= MAX_DISK_CHECKS {
+            images
+                .disk_checked
+                .retain(|key| capture.in_flight_reads.contains_key(key));
+        }
         for &dir_id in &visible_dirs {
             let Some(disk_key) = disk_key(&ctx.tree, dir_id) else {
                 continue;
@@ -597,14 +689,19 @@ pub(crate) fn update_thumbnails(
             let Some(key) = folder_key(&ctx.tree, dir_id) else {
                 continue;
             };
-            if images.images.contains_key(&key) || !images.disk_checked.insert(key) {
+            if images.images.contains_key(&key)
+                || capture.in_flight_reads.contains_key(&key)
+                || !images.disk_checked.insert(key)
+            {
                 continue;
             }
             if let Some(path) = cache.path(&disk_key).filter(|p| p.exists())
                 && let Ok(tx) = cache.read_req.lock()
-                && tx.send((key, path)).is_ok()
             {
-                capture.in_flight_reads.insert(key);
+                capture.read_ticket = capture.read_ticket.wrapping_add(1);
+                if tx.send((capture.read_ticket, dir_id, key, path)).is_ok() {
+                    capture.in_flight_reads.insert(key, capture.read_ticket);
+                }
             }
         }
         capture.visible_dirs = visible_dirs;
@@ -624,7 +721,8 @@ pub(crate) fn update_thumbnails(
         if active.visit.is_none() && current_visit {
             active.visit = Some(ctx.visit.0);
         }
-        let stale = !ctx.tree.is_attached(active.folder)
+        let stale = active.invalidated
+            || !ctx.tree.is_attached(active.folder)
             || folder_key(&ctx.tree, active.folder) != Some(active.key)
             || (!active.refresh
                 && !still_requested
@@ -642,6 +740,8 @@ pub(crate) fn update_thumbnails(
         if active.frames == CAPTURE_FRAMES && !active.readback_sent {
             let key = active.key;
             let folder = active.folder;
+            capture.capture_ticket = capture.capture_ticket.wrapping_add(1);
+            let ticket = capture.capture_ticket;
             let mem = cache.capture_tx.lock().expect("画像を受け取る係").clone();
             commands
                 .spawn(ReadbackOnce::texture(active.target.clone()))
@@ -649,6 +749,7 @@ pub(crate) fn update_thumbnails(
                     let mut data = event.data.clone();
                     straighten_alpha(&mut data);
                     let _ = mem.send(CapturedImage {
+                        ticket,
                         folder,
                         key,
                         rgba: data,
@@ -656,7 +757,7 @@ pub(crate) fn update_thumbnails(
                     commands.entity(event.entity).despawn();
                 });
             active.readback_sent = true;
-            capture.in_flight_captures.insert(key);
+            capture.in_flight_captures.insert(key, ticket);
             return;
         }
         if active.frames > CAPTURE_FRAMES {
@@ -684,8 +785,9 @@ pub(crate) fn update_thumbnails(
             return None;
         }
         let key = folder_key(&ctx.tree, folder)?;
-        (!capture.in_flight_captures.contains(&key) && !capture.in_flight_reads.contains(&key))
-            .then_some(key)
+        (!capture.in_flight_captures.contains_key(&key)
+            && !capture.in_flight_reads.contains_key(&key))
+        .then_some(key)
     };
     let needs_refresh = |folder| {
         preview_generation(&ctx.tree, folder).is_some_and(|generation| {
@@ -742,6 +844,25 @@ pub(crate) fn update_thumbnails(
     let Some((folder, key, visit)) = target_folder else {
         return;
     };
+    if needs_refresh(folder) {
+        if !capture
+            .preview_request
+            .is_some_and(|(pending, _)| pending == key)
+        {
+            ctx.previews.request_capture(&ctx.tree, folder);
+            capture.preview_request = Some((key, std::time::Instant::now()));
+        }
+        if ctx.previews.capture_pending()
+            && capture
+                .preview_request
+                .is_some_and(|(_, started)| started.elapsed() < Duration::from_secs(1))
+        {
+            if !ctx.occluded.0 {
+                redraw.write(RequestRedraw);
+            }
+            return;
+        }
+    }
     let (spec, ears) = ear_spec(&ctx.settings, &ctx.window);
     let layouts = layout(&ctx.tree, folder, anchor_body(), spec);
     let (_, fit_scale) = fit(layouts[folder].fit, &ctx.window);
@@ -807,6 +928,8 @@ pub(crate) fn update_thumbnails(
     capture.active = Some(ActiveCapture {
         visit,
         folder,
+        disk_key: disk_key(&ctx.tree, folder),
+        invalidated: false,
         key,
         camera: cam_entity,
         scene,
@@ -923,6 +1046,39 @@ mod tests {
         );
         assert!(target.texture_descriptor.view_formats.is_empty());
         assert!(loaded.texture_descriptor.view_formats.is_empty());
+    }
+
+    #[test]
+    fn 更新範囲のディスク画像を消し旧読込を破棄する() {
+        let dir = std::env::temp_dir().join(format!("lisa-cache-refresh-{}", std::process::id()));
+        let cache = ImageCache::with_dir(Some(dir.clone()));
+        let target = Path::new("drive/folder");
+        let sibling = Path::new("drive/sibling");
+        let key = local_disk_key(target);
+        let sibling_key = local_disk_key(sibling);
+        let target_image = cache.path(&key).unwrap();
+        let sibling_image = cache.path(&sibling_key).unwrap();
+        std::fs::write(&target_image, b"fixture").unwrap();
+        std::fs::write(&sibling_image, b"fixture").unwrap();
+
+        let mut capture = ThumbnailCapture::default();
+        capture.in_flight_reads.insert(key, 1);
+        capture.in_flight_reads.insert(sibling_key, 2);
+        capture.invalidate_local(target);
+        capture.in_flight_reads.insert(key, 3);
+        assert!(!capture.take_disk_read(&key, 1));
+        assert!(capture.take_disk_read(&key, 3));
+        assert!(capture.take_disk_read(&sibling_key, 2));
+
+        cache.invalidate_local(target);
+        let start = std::time::Instant::now();
+        while target_image.exists() && start.elapsed() < Duration::from_secs(2) {
+            assert!(cache.path(&key).is_none() || !target_image.exists());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!target_image.exists());
+        assert!(sibling_image.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

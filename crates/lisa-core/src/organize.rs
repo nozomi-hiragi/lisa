@@ -102,9 +102,19 @@ impl Context {
 
 /// 親フォルダを変えずに名前だけを変更する行き先を求める。
 pub fn rename_destination(from: &std::path::Path, new_name: &str) -> Result<PathBuf, String> {
+    validate_entry_name(new_name)?;
+    let parent = from
+        .parent()
+        .filter(|p| from.is_absolute() && p.is_absolute())
+        .ok_or("対象の絶対パスと親フォルダが必要です")?;
+    Ok(parent.join(new_name))
+}
+
+/// ファイルシステムの名前を単一のパス成分に限定する。
+pub fn validate_entry_name(new_name: &str) -> Result<(), String> {
     use std::path::{Component, Path};
 
-    if new_name.is_empty() {
+    if new_name.trim().is_empty() {
         return Err("新しい名前を入力してください".into());
     }
     let mut components = Path::new(new_name).components();
@@ -121,11 +131,7 @@ pub fn rename_destination(from: &std::path::Path, new_name: &str) -> Result<Path
     {
         return Err("Windows の名前に使えない文字が含まれています".into());
     }
-    let parent = from
-        .parent()
-        .filter(|p| from.is_absolute() && p.is_absolute())
-        .ok_or("対象の絶対パスと親フォルダが必要です")?;
-    Ok(parent.join(new_name))
+    Ok(())
 }
 
 /// 行き先が別のディレクトリエントリで占有されているか。

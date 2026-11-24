@@ -530,10 +530,19 @@ pub(crate) struct PointerBlocked<'w, 's> {
     animating: Option<Res<'w, Animating>>,
     fades: Query<'w, 's, (), With<Fade>>,
     hover_map: Res<'w, HoverMap>,
+    progress_panel: super::progress::PanelPointer<'w, 's>,
+    debug_click: Option<Res<'w, crate::remote::DebugClick>>,
     ui_nodes: Query<'w, 's, (), With<Node>>,
 }
 
 impl PointerBlocked<'_, '_> {
+    pub(crate) fn cursor(&self, window: &Window) -> Option<Vec2> {
+        self.debug_click
+            .as_ref()
+            .map(|click| click.0)
+            .or_else(|| window.cursor_position())
+    }
+
     /// 右クリックのメニューが開いているか（`menu_busy`）は、呼ぶ側が渡す（メニューの側は書き換えるため、
     /// ここで読むと同じリソースの読み書きがぶつかる）。
     pub(crate) fn blocked(&self, window: &Window, menu_busy: bool) -> bool {
@@ -545,6 +554,7 @@ impl PointerBlocked<'_, '_> {
             .is_some_and(|hits| hits.keys().any(|e| self.ui_nodes.contains(*e)));
         ui_has_pointer(window, &self.popup, over_banner)
             || self.dialog.as_ref().is_some_and(|dialog| dialog.busy())
+            || self.progress_panel.contains(window, self.cursor(window))
             || over_ui
             || self.gesture.active()
             || self.animating.is_some()
@@ -564,7 +574,7 @@ pub(crate) fn node_under_cursor(
 }
 
 /// ウィンドウ内の論理座標 `pos` にあるもの（画面で見えている中で一番深いもの）。Root しか無いなら None。
-fn node_at_viewport_pos(
+pub(crate) fn node_at_viewport_pos(
     pos: Vec2,
     camera: (&Camera, &GlobalTransform, &Projection),
     tree: &FileTree,

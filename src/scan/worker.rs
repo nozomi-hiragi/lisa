@@ -10,6 +10,7 @@
 //! - 監視（`Request::Hint`、FSEvents など）で変わったと知らされたフォルダは、裏の分として（上の
 //!   決まりに従って）読み直す。
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -23,7 +24,10 @@ use lisa_core::db::{Db, ErrorCode, ListingSave};
 use lisa_core::hash::{self, Pace};
 use lisa_core::listing;
 
-use super::{Message, Progress, Root, SHOWN_NEXT, readable, report};
+mod manual;
+pub(super) use manual::directory_identity;
+
+use super::{Message, Progress, RefreshRequest, RefreshTarget, Root, SHOWN_NEXT, readable, report};
 
 /// 初回走査で、ロックの外で先読みするフォルダ数と項目数の目安。
 const INITIAL_FOLDERS: usize = 64;
@@ -42,6 +46,8 @@ const NAP: Duration = Duration::from_millis(250);
 
 /// UI から読む係への頼み。
 pub enum Request {
+    /// 共有の手動更新キューを見に行く。
+    ManualWake,
     /// このフォルダを今見ている（1 段読み直し、ハッシュの無いものをハッシュする）。
     Visible(PathBuf),
     /// このフォルダの中が変わったらしい（監視からの知らせ。裏の分として読み直す）。
@@ -66,6 +72,13 @@ const PRIORITY_FAILED: u64 = 4;
 const MODE_FLAGS: u64 = ACTIVE | BOOSTED | PRIORITY_FAILED;
 const MODE_REVISION: u64 = MODE_FLAGS + 1;
 
+#[derive(Default)]
+struct ManualQueue {
+    pending: VecDeque<RefreshRequest>,
+    active: Option<RefreshRequest>,
+    processed: HashSet<PathBuf>,
+}
+
 /// UI と読む係で分け合う、裏で読むときの決まり。
 pub struct Control {
     /// UI が走査結果の受け取りを終えた。
@@ -74,6 +87,10 @@ pub struct Control {
     pub paused: AtomicBool,
     /// まだ済んでいない見ているところの頼みの数。0 でなければ、裏の分はやめる。
     pub urgent: AtomicUsize,
+    manual_pending: AtomicBool,
+    created_pending: AtomicBool,
+    manual_sequence: AtomicU64,
+    manual: Mutex<ManualQueue>,
     /// 裏の分の速さの上限（バイト毎秒、0 なら上限なし）。
     pub limit: AtomicU64,
     /// 電池で動いているときは休む。
@@ -99,6 +116,10 @@ impl Default for Control {
                     && std::env::var_os("LISA_VERIFY_SCAN_ROOT").is_some(),
             ),
             urgent: AtomicUsize::new(0),
+            manual_pending: AtomicBool::new(false),
+            created_pending: AtomicBool::new(false),
+            manual_sequence: AtomicU64::new(0),
+            manual: Mutex::new(ManualQueue::default()),
             limit: AtomicU64::new(0),
             rest_on_battery: AtomicBool::new(true),
             cpu_limit: AtomicU32::new(100),
@@ -113,6 +134,55 @@ impl Default for Control {
 }
 
 impl Control {
+    pub(super) fn queue_refresh(
+        &self,
+        target: RefreshTarget,
+        created: Option<(PathBuf, Sender<Option<String>>)>,
+    ) -> Option<u64> {
+        let mut queue = self.manual.lock().ok()?;
+        if created.is_none()
+            && let Some(request) = queue.active.as_ref()
+            && request.created.is_none()
+            && request.target.covers(&target)
+            && !queue.processed.iter().any(|path| target.contains(path))
+        {
+            return Some(request.generation);
+        }
+        if created.is_none()
+            && let Some(request) = queue
+                .pending
+                .iter()
+                .find(|request| request.created.is_none() && request.target.covers(&target))
+        {
+            return Some(request.generation);
+        }
+        if queue.pending.len() >= 256 {
+            return None;
+        }
+        queue.pending.retain(|request| {
+            created.is_some() || request.created.is_some() || !target.covers(&request.target)
+        });
+        let generation = self.manual_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let request = RefreshRequest {
+            target,
+            generation,
+            created,
+        };
+        if request.created.is_some() {
+            let index = queue
+                .pending
+                .iter()
+                .position(|pending| pending.created.is_none())
+                .unwrap_or(queue.pending.len());
+            queue.pending.insert(index, request);
+            self.created_pending.store(true, Ordering::Relaxed);
+        } else {
+            queue.pending.push_back(request);
+        }
+        self.manual_pending.store(true, Ordering::Relaxed);
+        Some(generation)
+    }
+
     pub fn boost_status(&self) -> (bool, bool, bool) {
         let mode = self.mode.load(Ordering::Relaxed);
         (
@@ -280,6 +350,7 @@ impl Background {
     /// 見ているところの頼みが待っている。
     fn urgent(&self) -> bool {
         self.control.urgent.load(Ordering::Relaxed) > 0
+            || self.control.manual_pending.load(Ordering::Relaxed)
     }
 
     /// 裏の分を続けてよいか。`bytes` だけ読んだので、速さの上限を超えていれば待つ。
@@ -327,7 +398,7 @@ pub(super) struct Worker {
     pub roots: Vec<Root>,
     pub sender: Sender<Message>,
     pub requests: Receiver<Request>,
-    pub proxy: EventLoopProxy<WinitUserEvent>,
+    pub proxy: Option<EventLoopProxy<WinitUserEvent>>,
     pub progress: Arc<Mutex<Progress>>,
     pub control: Arc<Control>,
     /// 読み直しでハッシュを消したので、裏でドライブ全体のハッシュをやり直す（祖先を作り直す）。
@@ -773,6 +844,9 @@ impl Worker {
     /// 裏の分を進めてよくなるまで、頼みを済ませながら待つ。UI が閉じたら false。
     fn wait_turn(&mut self, background: &Background) -> bool {
         loop {
+            if !self.run_manual_queue() {
+                return false;
+            }
             // 待っている頼みを先に済ませる。
             while let Ok(request) = self.requests.try_recv() {
                 if !self.handle(request) {
@@ -806,12 +880,12 @@ impl Worker {
     /// 頼みを済ませる（決まりにかからず、すぐ）。UI が閉じたら false。
     fn handle(&mut self, request: Request) -> bool {
         match request {
+            Request::ManualWake => self.run_manual_queue(),
             Request::Visible(path) => {
                 // 見ているところは、知らせがあっても今読み直すので、二度は読まない。
                 self.hints.remove(&path);
-                let alive = self.visible(&path);
                 self.control.urgent.fetch_sub(1, Ordering::Relaxed);
-                alive
+                self.run_manual_queue() && self.visible(&path)
             }
             Request::Hint(path) => {
                 if let Some(path) = self.locate(&path)
@@ -838,7 +912,15 @@ impl Worker {
         let Some(index) = self.root_of(path) else {
             return true;
         };
-        self.hash(index, Some(path), &Pace::FREE)
+        let control = self.control.clone();
+        let step = |_| !control.manual_pending.load(Ordering::Relaxed);
+        let pace = Pace {
+            step: &step,
+            ..Pace::FREE
+        };
+        let alive = self.hash(index, Some(path), &pace);
+        self.dirty |= control.manual_pending.load(Ordering::Relaxed);
+        alive
     }
 
     /// フォルダ `path` を 1 段読み直す（`background` なら I/O を後回しに）。変わっていたら、新しく
@@ -908,6 +990,12 @@ impl Worker {
         let mount = self.roots[index].mount.clone();
         let mut stack = vec![path.to_path_buf()];
         while let Some(folder) = stack.pop() {
+            if self.control.closed.load(Ordering::Relaxed) {
+                return false;
+            }
+            if !self.run_manual_queue() {
+                return false;
+            }
             let Some(db) = self.db.as_ref() else {
                 return true;
             };
@@ -977,7 +1065,9 @@ impl Worker {
             if sender.send(message).is_err() {
                 closed.store(true, Ordering::Relaxed);
             }
-            let _ = proxy.send_event(WinitUserEvent::WakeUp);
+            if let Some(proxy) = proxy {
+                let _ = proxy.send_event(WinitUserEvent::WakeUp);
+            }
         };
         let step = |bytes| !closed.load(Ordering::Relaxed) && (pace.step)(bytes);
         let pace = Pace {
@@ -1148,7 +1238,9 @@ impl Worker {
 
     /// 止まっている間でも、すぐに木に足して描けるように起こす。
     fn wake(&self) {
-        let _ = self.proxy.send_event(WinitUserEvent::WakeUp);
+        if let Some(proxy) = &self.proxy {
+            let _ = proxy.send_event(WinitUserEvent::WakeUp);
+        }
     }
 }
 
