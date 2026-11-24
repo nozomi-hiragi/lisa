@@ -62,7 +62,8 @@ pub struct ViewSystems;
 impl Plugin for TreeViewPlugin {
     fn build(&self, app: &mut App) {
         let (update_settings, _) = update_settings_from_env();
-        app.insert_resource(update_settings)
+        app.add_plugins(crate::merged::MarkerViewPlugin)
+            .insert_resource(update_settings)
             .insert_resource(Location::root())
             .insert_resource(Nav {
                 stack: vec![Level {
@@ -180,7 +181,10 @@ impl Location {
         let Some(path) = tree.path_from_root(node) else {
             return Self::root();
         };
-        if tree.nodes[node].remote.is_some() || (path.len() == 2 && tree.nodes[node].device == 0) {
+        if tree.nodes[node].remote.is_some()
+            || tree.in_marker_view(node)
+            || (path.len() == 2 && tree.nodes[node].device == 0)
+        {
             return Self::Attached(
                 crate::model::display_path::steps(tree, node).unwrap_or_default(),
             );

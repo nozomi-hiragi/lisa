@@ -821,6 +821,40 @@ fn describe_rows(
         }
     };
     let node = &tree.nodes[id];
+    if let Some(marker) = &node.merged {
+        return vec![
+            row(
+                if full { "名前" } else { "" },
+                name_or_path(&node.name, MAX_NAME_CHARS),
+            ),
+            row("種類", "マージ済みリンク"),
+            row(
+                "元の場所",
+                name_or_path(&marker.source.display_path, MAX_PATH_CHARS),
+            ),
+            row(
+                "ハッシュ",
+                if full {
+                    marker.hash.value.clone()
+                } else {
+                    short_hash(&marker.hash.value)
+                },
+            ),
+            row(
+                "マージ先",
+                // 別の端末にあるなら、どの端末かを先に示す。
+                if marker.target.device_id == marker.source.device_id {
+                    name_or_path(&marker.target.display_path, MAX_PATH_CHARS)
+                } else {
+                    format!(
+                        "{} › {}",
+                        marker.target.device_name,
+                        name_or_path(&marker.target.display_path, MAX_PATH_CHARS)
+                    )
+                },
+            ),
+        ];
+    }
     let path = if full {
         local_item_path(tree, store, id)
     } else {
@@ -946,8 +980,10 @@ pub(crate) fn local_item_path(
     if node.remote.is_some() {
         return None;
     }
-    node.path
-        .clone()
+    node.marker_path
+        .as_ref()
+        .or(node.path.as_ref())
+        .cloned()
         .or_else(|| store?.stored_path(node.entry?))
         .or_else(|| local_path(tree, id))
 }
@@ -976,7 +1012,12 @@ pub(crate) fn local_path(tree: &FileTree, id: NodeId) -> Option<PathBuf> {
     let mut cur = id;
     loop {
         let node = &tree.nodes[cur];
-        if let Some(path) = &node.path {
+        let path = if cur == id {
+            node.marker_path.as_ref().or(node.path.as_ref())
+        } else {
+            node.path.as_ref()
+        };
+        if let Some(path) = path {
             let mut full = path.clone();
             for name in names.iter().rev() {
                 full.push(name);
@@ -1072,7 +1113,7 @@ fn group_digits(n: u64) -> String {
 }
 
 /// UTC の Unix 時刻（ミリ秒）を、この PC の時刻で「2026-11-18 23:45」の形にする。
-pub(super) fn format_local(ms: i64) -> String {
+pub(crate) fn format_local(ms: i64) -> String {
     format_with_offset(ms, local_offset_secs())
 }
 
@@ -2006,6 +2047,7 @@ mod tests {
         tree.add_remote_children(
             root_drive,
             vec![lisa_core::query::Item {
+                merged: None,
                 id: 2,
                 name: "Users".into(),
                 kind: "dir".into(),
@@ -2022,6 +2064,7 @@ mod tests {
         tree.add_remote_children(
             users,
             vec![lisa_core::query::Item {
+                merged: None,
                 id: 3,
                 name: "memo.txt".into(),
                 kind: "file".into(),
@@ -2074,6 +2117,7 @@ mod tests {
             drive,
             vec![
                 lisa_core::query::Item {
+                    merged: None,
                     id: 10,
                     name: "report.pdf".into(),
                     kind: "file".into(),
@@ -2086,6 +2130,7 @@ mod tests {
                     error: None,
                 },
                 lisa_core::query::Item {
+                    merged: None,
                     id: 11,
                     name: "cloud.mov".into(),
                     kind: "file".into(),
@@ -2098,6 +2143,7 @@ mod tests {
                     error: None,
                 },
                 lisa_core::query::Item {
+                    merged: None,
                     id: 12,
                     name: "broken.dat".into(),
                     kind: "file".into(),

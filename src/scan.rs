@@ -900,6 +900,20 @@ fn load_children(
     let Some(path) = tree.nodes[id].path.clone() else {
         return false;
     };
+    if tree.in_marker_view(id) {
+        if tree.marker_view_read_only(id) {
+            return false;
+        }
+        let Some(rows) = db
+            .zip(tree.nodes[id].entry)
+            .and_then(|(db, entry)| db.children(entry).ok())
+        else {
+            return false;
+        };
+        let (recent, hashed) = (&scanner.recent, &scanner.hashed);
+        tree.add_stored_children(id, rows, |p| recent.contains_key(p), |p| hashed.contains(p));
+        return true;
+    }
     if let Some(result) = scanner.recent.remove(&path) {
         tree.add_listing(id, result);
     } else {

@@ -109,6 +109,7 @@ pub struct OrganizeState {
     /// 裏のスレッドで実行・取り消し・掃除が動いているか。
     pub busy: bool,
     rename_pending: bool,
+    pub(crate) linked_delete: Option<LinkedDeletePrompt>,
     /// 一時的なお知らせ（結果やエラー）。
     pub notice: Option<(String, Instant)>,
     sender: Option<Mutex<Sender<Action>>>,
@@ -242,6 +243,15 @@ impl OrganizeState {
         self.notice = Some((message.into(), Instant::now()));
     }
 
+    pub(crate) fn confirm_linked_delete(
+        &mut self,
+        path: PathBuf,
+        decision: organize::DeleteRequest,
+    ) {
+        self.busy = true;
+        self.send(Action::UserTrashLinked { path, decision });
+    }
+
     pub fn current_notice(&self) -> Option<&str> {
         self.notice
             .as_ref()
@@ -250,17 +260,47 @@ impl OrganizeState {
     }
 }
 
+pub(crate) struct LinkedDeletePrompt {
+    pub path: PathBuf,
+    pub links: Vec<lisa_core::merged::links::Link>,
+}
+
 enum Action {
-    Approve { id: i64, skip_risky: bool },
-    Reject { id: i64 },
-    Undo { id: i64 },
-    PurgePlan { id: i64 },
+    Approve {
+        id: i64,
+        skip_risky: bool,
+    },
+    Reject {
+        id: i64,
+    },
+    Undo {
+        id: i64,
+    },
+    PurgePlan {
+        id: i64,
+    },
     PurgeAll,
-    LoadDetails { id: i64 },
-    Dismiss { id: i64 },
-    UserTrash { path: PathBuf },
-    UserMove { from: PathBuf, dest_dir: PathBuf },
-    UserRename { from: PathBuf, new_name: String },
+    LoadDetails {
+        id: i64,
+    },
+    Dismiss {
+        id: i64,
+    },
+    UserTrash {
+        path: PathBuf,
+    },
+    UserTrashLinked {
+        path: PathBuf,
+        decision: organize::DeleteRequest,
+    },
+    UserMove {
+        from: PathBuf,
+        dest_dir: PathBuf,
+    },
+    UserRename {
+        from: PathBuf,
+        new_name: String,
+    },
 }
 
 enum Event {
@@ -274,6 +314,7 @@ enum Event {
         result: Result<(), String>,
     },
     Details(PlanDetails),
+    LinkedDelete(LinkedDeletePrompt),
     Renamed {
         from: PathBuf,
         to: PathBuf,
@@ -347,6 +388,7 @@ pub(crate) fn receive_events(
                 }
             }
             Event::Dismissed { id, result } => state.finish_dismiss(id, result),
+            Event::LinkedDelete(prompt) => state.linked_delete = Some(prompt),
             Event::Details(details) => {
                 if state.selected_plan == Some(details.plan_id) {
                     state.selected_details = Some(details);
@@ -438,6 +480,9 @@ fn run_worker(
     let mut last_purge: Option<Instant> = None;
     let mut watched_detail: Option<i64> = None;
 
+    let mut last_transfer = None;
+    let mut last_link_sync: Option<Instant> = None;
+    let mut link_sync_worker: Option<std::thread::JoinHandle<()>> = None;
     // 起動時: 途中で落ちた計画の再開と、期限切れの掃除（ダミーモードでは触らない）。
     if !dummy && let Some((mut db, ctx, settings)) = open_env() {
         match organize::recover_running_plans(&mut db, &ctx) {
@@ -456,6 +501,14 @@ fn run_worker(
             }
             Err(error) => warn!("中断していた計画の再開に失敗しました: {error}"),
         }
+        match organize::clean_expired_receives(&db) {
+            Ok(failures) => {
+                for failure in failures {
+                    warn!("一時転送の片付けを次回に回します: {failure}");
+                }
+            }
+            Err(error) => warn!("一時転送の掃除に失敗しました: {error}"),
+        }
         run_daily_purge(&mut db, &ctx.data_dir, settings.as_deref());
         last_purge = Some(Instant::now());
     }
@@ -466,6 +519,24 @@ fn run_worker(
     }
 
     loop {
+        if !dummy
+            && last_link_sync.is_none_or(|time| time.elapsed() >= Duration::from_secs(30))
+            && link_sync_worker
+                .as_ref()
+                .is_none_or(|worker| worker.is_finished())
+        {
+            last_link_sync = Some(Instant::now());
+            link_sync_worker = std::thread::Builder::new()
+                .name("lisa-link-sync".into())
+                .spawn(|| {
+                    if let Some((mut db, ctx, _)) = open_env()
+                        && let Err(error) = organize::flush_links(&mut db, &ctx)
+                    {
+                        warn!("リンクの同期を続けられませんでした: {error}");
+                    }
+                })
+                .ok();
+        }
         match rx.recv_timeout(POLL_EVERY) {
             Ok(Action::Dismiss { id }) => {
                 let result = dismiss_history(id);
@@ -609,9 +680,22 @@ fn run_worker(
                         continue;
                     }
                     Action::UserTrash { path } => {
-                        handle_user_trash(&mut db, &ctx, path, &send);
+                        match organize::linked_delete_sources(&db, &path) {
+                            Ok(links) if links.is_empty() => {
+                                handle_user_trash(&mut db, &ctx, path, None, &send)
+                            }
+                            Ok(links) => {
+                                send(Event::LinkedDelete(LinkedDeletePrompt { path, links }));
+                            }
+                            Err(error) => {
+                                send(Event::Notice(format!("リンク元を確認できません: {error}")));
+                            }
+                        }
                         send(Event::Idle);
-                        last_fp = None;
+                    }
+                    Action::UserTrashLinked { path, decision } => {
+                        handle_user_trash(&mut db, &ctx, path, Some(decision), &send);
+                        send(Event::Idle);
                     }
                     Action::UserRename { from, new_name } => {
                         handle_user_rename(&mut db, &ctx, from, &new_name, &send);
@@ -631,6 +715,22 @@ fn run_worker(
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !dummy
+                    && let Some(path) = crate::scan::db_path().filter(|path| path.is_file())
+                    && let Ok(db) = Db::open(&path)
+                    && let Ok(progress) = lisa_core::merged::links::transfer_progress(&db)
+                    && progress != last_transfer
+                {
+                    last_transfer = progress;
+                    if let Some((received, total)) = progress {
+                        send(Event::Notice(format!(
+                            "リンクの復元を転送中（{} / {}）",
+                            crate::ui::progress::bytes(received),
+                            crate::ui::progress::bytes(total)
+                        )));
+                    }
+                }
+
+                if !dummy
                     && last_purge.is_none_or(|t| t.elapsed() >= PURGE_EVERY)
                     && let Some((mut db, ctx, settings)) = open_env()
                 {
@@ -647,20 +747,23 @@ fn run_worker(
     }
 }
 
-fn handle_user_trash(db: &mut Db, ctx: &Context, path: PathBuf, send: &impl Fn(Event) -> bool) {
+fn handle_user_trash(
+    db: &mut Db,
+    ctx: &Context,
+    path: PathBuf,
+    decision: Option<organize::DeleteRequest>,
+    send: &impl Fn(Event) -> bool,
+) {
     let label = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
     let note = format!("右クリックから削除: {label}");
-    match organize::create_plan(
-        db,
-        ctx,
-        "user",
-        Some(&note),
-        &[OpInput::Trash { path, keep: None }],
-        false,
-    ) {
+    let operation = match decision {
+        Some(decision) => OpInput::TrashLinked { path, decision },
+        None => OpInput::Trash { path, keep: None },
+    };
+    match organize::create_plan(db, ctx, "user", Some(&note), &[operation], false) {
         Ok(res) if res.created => {
             let id = res.id.expect("created plan has id");
             if res.summary.risky > 0 {
@@ -1013,6 +1116,8 @@ fn open_env() -> Option<(Db, Context, Option<PathBuf>)> {
     let settings = crate::settings::settings_path();
     let mut ctx = Context::load(data_dir, settings.as_deref());
     ctx.keep_client = Some(lisa_mcp::relay_client);
+    ctx.link_client = Some(lisa_mcp::link_relay_client);
+    ctx.relocation_client = Some(lisa_mcp::relocation_client);
     Some((db, ctx, settings))
 }
 

@@ -16,7 +16,13 @@ pub(crate) fn show_breadcrumb(commands: &mut Commands, tree: &FileTree, node: No
     let text = lisa_core::display_path::text(&parts);
     let steps = crate::model::display_path::steps(tree, node).unwrap_or_default();
     commands.insert_resource(Breadcrumb(text.clone()));
-    commands.insert_resource(MenuBreadcrumb { text, parts, steps });
+    let marker_status = tree.marker_view_status(node).map(str::to_owned);
+    commands.insert_resource(MenuBreadcrumb {
+        text,
+        parts,
+        steps,
+        marker_status,
+    });
 }
 
 /// 木が作り直されると、登録前の項目を見分ける印（`Step::Attached`）も変わる。
@@ -34,11 +40,14 @@ pub(crate) fn refresh_breadcrumb_steps(
     let Some(steps) = crate::model::display_path::steps(&tree, node) else {
         return;
     };
-    if let Some(mut breadcrumb) = breadcrumb
-        && breadcrumb.steps != steps
-        && breadcrumb.parts.len() == steps.len()
-    {
-        breadcrumb.steps = steps;
+    if let Some(mut breadcrumb) = breadcrumb {
+        if breadcrumb.steps != steps && breadcrumb.parts.len() == steps.len() {
+            breadcrumb.steps = steps;
+        }
+        let status = tree.marker_view_status(node);
+        if breadcrumb.marker_status.as_deref() != status {
+            breadcrumb.marker_status = status.map(str::to_owned);
+        }
     }
     if matches!(*location, Location::Attached(_)) {
         let fresh = Location::from_tree(&tree, node);

@@ -354,8 +354,12 @@ fn draw_children(
             mark_duplicate(painter, source, child, slot, size, z);
             painter.parent = parent;
         } else {
-            let loaded = crate::ui::tooltip::local_path(tree, child)
-                .and_then(|path| source.previews.images.get(&path));
+            let loaded = if child_node.merged.is_none() {
+                crate::ui::tooltip::local_path(tree, child)
+                    .and_then(|path| source.previews.images.get(&path))
+            } else {
+                None
+            };
             in_group(painter, slot, size, |painter| {
                 status::draw_file(
                     painter,
@@ -374,6 +378,29 @@ fn draw_children(
             ear::draw_name(painter, slot, size, &child_node.name, color, z);
             mark_catalog(painter, source, child, slot, size, z);
             mark_duplicate(painter, source, child, slot, size, z);
+        }
+        if child_node.merged.is_some() {
+            if live {
+                let mut accessible = bevy::a11y::AccessibilityNode::default();
+                accessible.set_label(format!("{}、マージ済みリンク", child_node.name));
+                painter
+                    .commands
+                    .spawn((accessible, ChildOf(painter.parent)));
+            }
+            in_group(painter, slot, size, |painter| {
+                let edge = l.frame.size().min_element();
+                let height = (edge * 0.19).max(painter.scale * 5.0);
+                let at = l.frame.min + Vec2::splat(height * 0.28);
+                painter.text(
+                    "↗".into(),
+                    at,
+                    bevy::sprite::Anchor::BOTTOM_LEFT,
+                    height,
+                    height * 2.0,
+                    palette::BASE_CONTENT,
+                    z + 0.5,
+                );
+            });
         }
     }
     painter.no_cull = true;

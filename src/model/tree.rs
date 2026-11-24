@@ -59,6 +59,10 @@ pub struct Node {
     pub remote: Option<RemoteRef>,
     /// LAN の相手のノードで、相手から届いた更新日時とハッシュ（ツールチップに出す）。
     pub remote_meta: Option<RemoteMeta>,
+    pub merged: Option<lisa_core::merged::Marker>,
+    pub marker_path: Option<PathBuf>,
+    pub marker_status: Option<String>,
+    pub marker_read_only: bool,
 }
 
 /// LAN の相手から届いた、1 つのファイルかフォルダの情報（`lisa_core::query::Item` の一部）。
@@ -299,6 +303,42 @@ impl FileTree {
         self.nodes[id].listed = true;
     }
 
+    pub(crate) fn in_marker_view(&self, mut id: NodeId) -> bool {
+        while let Some(parent) = self.nodes[id].parent {
+            if self.nodes[parent].merged.is_some() {
+                return true;
+            }
+            id = parent;
+        }
+        false
+    }
+
+    pub(crate) fn marker_view_read_only(&self, mut id: NodeId) -> bool {
+        while let Some(parent) = self.nodes[id].parent {
+            if self.nodes[parent].marker_read_only {
+                return true;
+            }
+            id = parent;
+        }
+        false
+    }
+
+    pub(crate) fn marker_view_status(&self, mut id: NodeId) -> Option<&str> {
+        let mut result = None;
+        loop {
+            let node = &self.nodes[id];
+            if let Some(status) = node.marker_status.as_deref()
+                && (result.is_none() || node.marker_read_only)
+            {
+                result = Some(status);
+            }
+            let Some(parent) = node.parent else {
+                return result;
+            };
+            id = parent;
+        }
+    }
+
     /// フォルダ `id` の子を外す（読み直したら変わっていたので、出し直す）。外した子孫のスロットは
     /// `free` へ戻して再利用し、`nodes` の際限ない肥大化を防ぐ。
     pub fn reset_children(&mut self, id: NodeId) {
@@ -319,6 +359,10 @@ impl FileTree {
             node.path = None;
             node.remote = None;
             node.remote_meta = None;
+            node.merged = None;
+            node.marker_path = None;
+            node.marker_status = None;
+            node.marker_read_only = false;
             node.remote_mount = None;
             node.drive_id = None;
             node.listed = false;
@@ -329,6 +373,9 @@ impl FileTree {
         self.nodes[id].loaded = false;
         let mut cur = Some(id);
         while let Some(i) = cur {
+            if self.nodes[i].merged.is_some() {
+                break;
+            }
             self.nodes[i].size = self.nodes[i].size.saturating_sub(removed);
             cur = self.nodes[i].parent;
         }
@@ -418,11 +465,26 @@ impl FileTree {
         let base = self.nodes[id].path.clone().unwrap_or_default();
         let parent_hashed = hashed(&base);
         let mut added = 0;
+        let alias = self.nodes[id].merged.is_some() || self.in_marker_view(id);
         for row in rows {
+            if let Some(marker) = row.merged {
+                let path = base.join(lisa_core::name::from_raw_bytes(&row.name_raw));
+                let child = self.push_marker(id, marker, Some(path));
+                if alias {
+                    self.nodes[child].entry = Some(row.id);
+                } else {
+                    self.set_entry(child, row.id);
+                }
+                continue;
+            }
             let is_dir = row.kind == Kind::Dir;
             let readable = is_dir && !row.cloud_only && !row.other_volume;
             let child = self.push(&row.name_nfc, row.size, Some(id), device, is_dir);
-            self.set_entry(child, row.id);
+            if alias {
+                self.nodes[child].entry = Some(row.id);
+            } else {
+                self.set_entry(child, row.id);
+            }
             // ファイルはハッシュができたら読み込み済み。ハッシュしないもの（クラウドのみ、リンク、
             // 中に入らないフォルダ）は、一覧に載った時点で読み込み済み。
             let skip = row.kind != Kind::File || row.cloud_only;
@@ -469,6 +531,10 @@ impl FileTree {
             Ok(listing) => {
                 let mut added = 0;
                 for entry in listing.entries {
+                    if let Some(marker) = entry.merged {
+                        self.push_marker(id, marker, Some(base.join(&entry.name)));
+                        continue;
+                    }
                     let readable =
                         entry.kind == Kind::Dir && !entry.cloud_only && !entry.other_volume;
                     let is_dir = entry.kind == Kind::Dir;
@@ -580,11 +646,31 @@ impl FileTree {
         let Some(device_id) = self.nodes[id].remote.as_ref().map(|r| r.device_id.clone()) else {
             return;
         };
+        self.add_remote_children_from(id, &device_id, items);
+    }
+
+    pub(crate) fn add_remote_children_from(
+        &mut self,
+        id: NodeId,
+        device_id: &str,
+        items: Vec<lisa_core::query::Item>,
+    ) {
+        if self.nodes[id].loaded {
+            return;
+        }
         self.nodes[id].listed = true;
         self.nodes[id].loaded = true;
         let device = self.nodes[id].device;
         let mut added = 0;
         for item in items {
+            if let Some(marker) = item.merged {
+                let child = self.push_marker(id, marker, None);
+                self.nodes[child].remote = Some(RemoteRef {
+                    device_id: device_id.to_owned(),
+                    entry_id: Some(item.id),
+                });
+                continue;
+            }
             let is_dir = item.kind == "dir";
             let readable = is_dir && !item.cloud_only && !item.other_volume;
             let size = if is_dir { 0 } else { item.size };
@@ -598,7 +684,7 @@ impl FileTree {
                 LoadState::Unloaded
             };
             self.nodes[child].remote = Some(RemoteRef {
-                device_id: device_id.clone(),
+                device_id: device_id.to_owned(),
                 entry_id: Some(item.id),
             });
             self.nodes[child].remote_meta = Some(RemoteMeta {
@@ -626,6 +712,33 @@ impl FileTree {
         self.finish_children(id, added);
     }
 
+    fn push_marker(
+        &mut self,
+        parent: NodeId,
+        marker: lisa_core::merged::Marker,
+        path: Option<PathBuf>,
+    ) -> NodeId {
+        let name = marker
+            .source
+            .relative_path
+            .last()
+            .map_or("", String::as_str);
+        let id = self.push(
+            name,
+            0,
+            Some(parent),
+            self.nodes[parent].device,
+            marker.kind == Kind::Dir,
+        );
+        let node = &mut self.nodes[id];
+        node.state = LoadState::Loaded;
+        node.listed = true;
+        node.loaded = true;
+        node.marker_path = path;
+        node.merged = Some(marker);
+        id
+    }
+
     /// 子を足し終えたフォルダ `id` の状態と、祖先の大きさ（`added` を足す）と状態を直す。
     fn finish_children(&mut self, id: NodeId, added: u64) {
         // 子が無ければ、読み終えた空のフォルダ。
@@ -636,6 +749,9 @@ impl FileTree {
         };
         let mut cur = Some(id);
         while let Some(i) = cur {
+            if self.nodes[i].merged.is_some() {
+                break;
+            }
             self.nodes[i].size += added;
             cur = self.nodes[i].parent;
         }
@@ -733,6 +849,10 @@ impl FileTree {
             entry: None,
             remote: None,
             remote_meta: None,
+            merged: None,
+            marker_path: None,
+            marker_status: None,
+            marker_read_only: false,
         };
         let id = match self.free.pop() {
             Some(slot) => {
@@ -1069,6 +1189,7 @@ mod tests {
 
         let items = vec![
             lisa_core::query::Item {
+                merged: None,
                 id: 11,
                 name: "docs".into(),
                 kind: "dir".into(),
@@ -1081,6 +1202,7 @@ mod tests {
                 error: None,
             },
             lisa_core::query::Item {
+                merged: None,
                 id: 12,
                 name: "hashed.txt".into(),
                 kind: "file".into(),
@@ -1093,6 +1215,7 @@ mod tests {
                 error: None,
             },
             lisa_core::query::Item {
+                merged: None,
                 id: 13,
                 name: "unhashed.txt".into(),
                 kind: "file".into(),
@@ -1105,6 +1228,7 @@ mod tests {
                 error: None,
             },
             lisa_core::query::Item {
+                merged: None,
                 id: 14,
                 name: "broken.txt".into(),
                 kind: "file".into(),
