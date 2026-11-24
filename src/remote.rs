@@ -103,6 +103,7 @@ struct DebugContext<'w, 's> {
         ),
     >,
     pointer_writer: MessageWriter<'w, PointerInput>,
+    context_writer: MessageWriter<'w, crate::ui::context_menu::ContextCommand>,
 }
 
 /// 届いた頼みを受け取る口と、書いた `control.json` の場所。
@@ -183,6 +184,10 @@ fn handle(
         let read_only = matches!(command, Command::State | Command::DebugState);
         let result: Result<(), String> = match command {
             Command::State => Ok(()),
+            Command::OpenMarker { path } => {
+                crate::open_marker::enqueue(path);
+                Ok(())
+            }
             Command::Show { chain } => {
                 if chain.is_empty() {
                     Err("行き先が空です".into())
@@ -384,6 +389,35 @@ fn handle(
                                 Ok(())
                             } else {
                                 Err(format!("{action} には screen_pos が必要です"))
+                            }
+                        }
+                        // 右クリックの「詳細」と同じ（検証用）。
+                        "details" => {
+                            let (camera, camera_global, _, projection) = *dbg.camera;
+                            let found = screen_pos.and_then(|[x, y]| {
+                                let Projection::Orthographic(ortho) = projection else {
+                                    return None;
+                                };
+                                let world = camera
+                                    .viewport_to_world_2d(camera_global, Vec2::new(x, y))
+                                    .ok()?;
+                                crate::ui::tooltip::node_at(&tree, &dbg.layouts, world, ortho.scale)
+                            });
+                            match found {
+                                Some(node) => {
+                                    let target = crate::ui::context_menu::target_of(
+                                        node, &tree, None, &nav, None,
+                                    );
+                                    dbg.context_writer.write(
+                                        crate::ui::context_menu::ContextCommand {
+                                            action: crate::ui::context_menu::ContextAction::Details,
+                                            target,
+                                            world: Vec2::ZERO,
+                                        },
+                                    );
+                                    Ok(())
+                                }
+                                None => Err("その位置に項目がありません".into()),
                             }
                         }
                         "click" => match screen_pos {

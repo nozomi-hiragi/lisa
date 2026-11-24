@@ -54,6 +54,9 @@ pub enum Command {
     Pause { paused: bool },
     /// アプリを終了する。
     Quit,
+    /// Finder・エクスプローラーから開かれたマージ済みの目印（`.lmf`／`.lmd`）を表示し、窓を前面に出す。
+    /// 閲覧だけで、ファイルは動かさない。
+    OpenMarker { path: PathBuf },
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 描画・ナビ・場面・カメラの状態を返す。
     DebugState,
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 指定フォルダを「読み直したら変わっていた」扱いにして
