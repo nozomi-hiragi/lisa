@@ -3121,10 +3121,16 @@ impl HttpListener {
         let handle = self.handle();
         let active_requests = Arc::new(AtomicUsize::new(0));
         let active_pairs = Arc::new(AtomicUsize::new(0));
+        let active_health = Arc::new(AtomicUsize::new(0));
         let sidecar = self.sidecar;
         for request in self.http.incoming_requests() {
-            let Some(req_guard) = CounterGuard::try_acquire(&active_requests, MAX_ACTIVE_REQUESTS)
-            else {
+            // DB や画面の応答を待つ頼みで埋まっていても、生存確認用の枠を残す。
+            let (active, limit) = if request_path(&request) == "/health" {
+                (&active_health, 2)
+            } else {
+                (&active_requests, MAX_ACTIVE_REQUESTS)
+            };
+            let Some(req_guard) = CounterGuard::try_acquire(active, limit) else {
                 let _ = request.respond(empty(503));
                 continue;
             };
@@ -3149,6 +3155,10 @@ impl HttpListener {
                 });
         }
     }
+}
+
+fn request_path(request: &Request) -> &str {
+    request.url().split('?').next().unwrap_or("")
 }
 
 fn serve_request(
@@ -3176,7 +3186,7 @@ fn serve_request(
         }
     }
 
-    let path = request.url().split('?').next().unwrap_or("");
+    let path = request_path(&request);
     if path == "/health" {
         if *request.method() != Method::Get {
             let _ = request.respond(empty(405));

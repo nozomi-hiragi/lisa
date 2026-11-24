@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bevy::prelude::*;
 use bevy::window::RequestRedraw;
-use lisa_core::catalog::{self, CatalogSet, Role, State};
+use lisa_core::catalog::{self, CatalogSet, Role, State, db::IncrementalMatches};
 use lisa_core::db::Db;
 use lisa_core::query;
 
@@ -210,9 +210,12 @@ fn run(tx: Sender<Snapshot>, wake: Receiver<()>) {
     let mut last_signature = None;
     let mut last_run: Option<Instant> = None;
     let mut forced = true;
+    let mut matches = IncrementalMatches::default();
+    // 失敗したら、次に全体を当て直す時刻と、そのときの待ち（失敗が続くほど延ばす）。
+    let mut retry: Option<(Instant, Duration)> = None;
     loop {
         let dirs = catalog_dirs();
-        let files = fingerprint(&dirs);
+        let files = (dirs.clone(), fingerprint(&dirs));
         let Some(path) = crate::scan::db_path().filter(|p| p.exists()) else {
             if !sleep(&wake, &mut forced) {
                 return;
@@ -230,12 +233,13 @@ fn run(tx: Sender<Snapshot>, wake: Receiver<()>) {
             }
         };
         let signature = lisa_core::dups::signature(&db).ok().flatten();
-        let due = forced
-            || last_files.as_ref() != Some(&files)
+        let retry_due = retry.is_some_and(|(at, _)| Instant::now() >= at);
+        let full = forced || retry_due || last_files.as_ref() != Some(&files);
+        let due = full
             || match &signature {
                 Some(_) => {
-                    signature != last_signature
-                        && last_run.is_none_or(|t| t.elapsed() >= MIN_INTERVAL)
+                    last_run.is_none_or(|t| t.elapsed() >= MIN_INTERVAL)
+                        && (signature != last_signature || matches.has_changes(&db).unwrap_or(true))
                 }
                 None => last_run.is_none_or(|t| t.elapsed() >= WHILE_HASHING.max(MIN_INTERVAL)),
             };
@@ -245,18 +249,26 @@ fn run(tx: Sender<Snapshot>, wake: Receiver<()>) {
             last_signature = signature;
             last_run = Some(Instant::now());
             let started = Instant::now();
-            match refresh(&mut db, &dirs) {
+            match refresh(&mut db, &dirs, &mut matches, full) {
                 Ok(snapshot) => {
                     info!(
                         "カタログ: {} か所に当たりました（{:.1} 秒）",
                         snapshot.hits.len(),
                         started.elapsed().as_secs_f32()
                     );
+                    retry = None;
                     if tx.send(snapshot).is_err() {
                         return;
                     }
                 }
-                Err(error) => warn!("カタログを当てられませんでした: {error}"),
+                Err(error) => {
+                    let wait = retry.map_or(CHECK_EVERY, |(_, wait)| (wait * 2).min(MIN_INTERVAL));
+                    retry = Some((Instant::now() + wait, wait));
+                    warn!(
+                        "カタログを当てられませんでした（{} 秒後にやり直します）: {error}",
+                        wait.as_secs()
+                    );
+                }
             }
         }
         drop(db);
@@ -283,7 +295,12 @@ fn color(rgb: [u8; 3]) -> Color {
 }
 
 /// 当て直して、画面に出すものをまとめる。
-fn refresh(db: &mut Db, dirs: &[PathBuf]) -> Result<Snapshot, String> {
+fn refresh(
+    db: &mut Db,
+    dirs: &[PathBuf],
+    matches: &mut IncrementalMatches,
+    full: bool,
+) -> Result<Snapshot, String> {
     let set = CatalogSet::load_with_builtin(dirs);
     let mut snapshot = Snapshot {
         errors: set
@@ -294,10 +311,7 @@ fn refresh(db: &mut Db, dirs: &[PathBuf]) -> Result<Snapshot, String> {
         catalogs: set.catalogs.len(),
         ..default()
     };
-    let found = catalog::db::find(db, &set, None, true, &|| true)
-        .map_err(|e| e.to_string())?
-        .map(|(found, _)| found)
-        .unwrap_or_default();
+    let found = matches.refresh(db, &set, full).map_err(|e| e.to_string())?;
     catalog::db::save(db, &set, &found, None).map_err(|e| e.to_string())?;
 
     let mut apps: Vec<String> = set.catalogs.iter().map(|l| l.catalog.app.clone()).collect();
@@ -324,7 +338,7 @@ fn refresh(db: &mut Db, dirs: &[PathBuf]) -> Result<Snapshot, String> {
             color: color(catalog::app_color(&assignment.app)),
             state: State::Match,
             path: located.path,
-            size: query::folder_total(db, entry).map_or(0, |t| t.2),
+            size: matches.folder_size(entry),
             assignment: Some(assignment.id),
         });
     }
@@ -353,7 +367,7 @@ fn refresh(db: &mut Db, dirs: &[PathBuf]) -> Result<Snapshot, String> {
             color: color(cat.color_rgb()),
             state: f.state,
             path: located.path,
-            size: query::folder_total(db, f.entry_id).map_or(0, |t| t.2),
+            size: matches.folder_size(f.entry_id),
             assignment: None,
         });
     }
@@ -375,19 +389,18 @@ fn refresh(db: &mut Db, dirs: &[PathBuf]) -> Result<Snapshot, String> {
     apps.dedup();
     snapshot.apps = apps;
     let matched: HashSet<i64> = snapshot.hits.iter().map(Hit::entry_id).collect();
-    snapshot.unclassified =
-        catalog::db::unclassified(db, &matched, None, UNCLASSIFIED_MIN, UNCLASSIFIED_LIMIT)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|(entry, size)| {
-                let located = query::path_of(db, entry).ok()??;
-                Some(Big {
-                    chain: located.chain,
-                    path: located.path,
-                    size,
-                })
+    snapshot.unclassified = matches
+        .unclassified(&matched, UNCLASSIFIED_MIN, UNCLASSIFIED_LIMIT)
+        .into_iter()
+        .filter_map(|(entry, size)| {
+            let located = query::path_of(db, entry).ok()??;
+            Some(Big {
+                chain: located.chain,
+                path: located.path,
+                size,
             })
-            .collect();
+        })
+        .collect();
     Ok(snapshot)
 }
 

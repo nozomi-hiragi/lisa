@@ -1,7 +1,7 @@
 //! カタログ（型）を DB の木に当てはめて、結果を保存・読み出しする。
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -278,66 +278,117 @@ fn rule_anchor(catalog_idx: usize, rule: &Rule) -> Option<Anchor> {
     })
 }
 
+fn anchors(set: &CatalogSet) -> Vec<Anchor> {
+    set.catalogs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, loaded)| rule_anchor(idx, pick_anchor_rule(&loaded.catalog)?))
+        .collect()
+}
+
 fn collect_candidates(
     db: &Db,
-    anchors: Vec<Anchor>,
+    anchors: &[Anchor],
     drive_id: Option<&str>,
+    shape: Option<&mut FolderShape>,
     step: &dyn Fn() -> bool,
 ) -> rusqlite::Result<Option<Vec<(i64, usize)>>> {
     if !step() {
         return Ok(None);
     }
-    if anchors.is_empty() {
+    if anchors.is_empty() && shape.is_none() {
         return Ok(Some(Vec::new()));
     }
-    let patterns: Vec<&str> = anchors.iter().map(|a| a.regex_str.as_str()).collect();
-    let regex_set = RegexSet::new(patterns).expect("Pattern の正規表現は解析済み");
+    let regexes = anchor_regexes(anchors);
+    let mut seen = HashSet::new();
+    let mut shape = shape;
+    let finished = scan_entries(db, drive_id, step, |id, parent, name, kind, size| {
+        if let Some(shape) = shape.as_deref_mut() {
+            shape.add(id, parent, kind, size)?;
+        }
+        collect_anchor_hits(&mut seen, anchors, &regexes, parent, name, kind == "dir");
+        Ok(())
+    })?;
+    Ok(finished.then(|| sorted_candidates(seen)))
+}
 
-    let sql = match drive_id {
-        Some(_) => {
-            "SELECT id, parent_id, name_nfc, kind FROM entry
-             WHERE drive_id = ?1 AND parent_id IS NOT NULL"
-        }
-        None => {
-            "SELECT id, parent_id, name_nfc, kind FROM entry
-             WHERE parent_id IS NOT NULL"
-        }
-    };
-    let mut stmt = db.conn().prepare(sql)?;
-    let mut rows = match drive_id {
-        Some(id) => stmt.query([id])?,
-        None => stmt.query([])?,
-    };
+fn anchor_regexes(anchors: &[Anchor]) -> RegexSet {
+    let patterns = anchors.iter().map(|anchor| &anchor.regex_str);
+    RegexSet::new(patterns).expect("Pattern の正規表現は解析済み")
+}
 
-    let mut seen: HashSet<(i64, usize)> = HashSet::new();
-    let mut candidates: Vec<(i64, usize)> = Vec::new();
-    let mut scanned = 0usize;
-
-    while let Some(row) = rows.next()? {
-        scanned += 1;
-        if scanned.is_multiple_of(512) && !step() {
-            return Ok(None);
-        }
-        let name_nfc = row.get_ref(2)?.as_str()?;
-        let hits = regex_set.matches(name_nfc);
-        if !hits.matched_any() {
-            continue;
-        }
-        let parent_id: i64 = row.get(1)?;
-        let is_dir = row.get_ref(3)?.as_str()? == "dir";
-        for pat_idx in hits.iter() {
-            let anchor = &anchors[pat_idx];
-            if anchor.want_dir == is_dir {
-                let pair = (parent_id, anchor.catalog_idx);
-                if seen.insert(pair) {
-                    candidates.push(pair);
-                }
-            }
+fn collect_anchor_hits(
+    seen: &mut HashSet<(i64, usize)>,
+    anchors: &[Anchor],
+    regexes: &RegexSet,
+    parent: i64,
+    name: &str,
+    is_dir: bool,
+) {
+    for index in regexes.matches(name).iter() {
+        let anchor = &anchors[index];
+        if anchor.want_dir == is_dir {
+            seen.insert((parent, anchor.catalog_idx));
         }
     }
+}
 
+fn sorted_candidates(seen: HashSet<(i64, usize)>) -> Vec<(i64, usize)> {
+    let mut candidates: Vec<_> = seen.into_iter().collect();
     candidates.sort_unstable();
-    Ok(Some(candidates))
+    candidates
+}
+
+fn scan_entries(
+    db: &Db,
+    drive_id: Option<&str>,
+    step: &dyn Fn() -> bool,
+    mut visit: impl FnMut(i64, i64, &str, &str, i64) -> rusqlite::Result<()>,
+) -> rusqlite::Result<bool> {
+    let sql = match drive_id {
+        Some(_) => {
+            "SELECT id, parent_id, name_nfc, kind, size FROM entry
+             WHERE drive_id = ?3 AND id > ?1 AND id <= ?2 AND parent_id IS NOT NULL
+             ORDER BY id LIMIT 512"
+        }
+        None => {
+            "SELECT id, parent_id, name_nfc, kind, size FROM entry
+             WHERE id > ?1 AND id <= ?2 AND parent_id IS NOT NULL ORDER BY id LIMIT 512"
+        }
+    };
+    let conn = db.conn();
+    let end = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM entry", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    let mut stmt = conn.prepare(sql)?;
+    let mut after = i64::MIN;
+    loop {
+        // 1 ページずつ読み取りを終え、読み取りトランザクションを持ったまま待たない。
+        {
+            let mut rows = match drive_id {
+                Some(id) => stmt.query(params![after, end, id])?,
+                None => stmt.query(params![after, end])?,
+            };
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                after = row.get(0)?;
+                visit(
+                    after,
+                    row.get(1)?,
+                    row.get_ref(2)?.as_str()?,
+                    row.get_ref(3)?.as_str()?,
+                    row.get(4)?,
+                )?;
+                found = true;
+            }
+            if !found {
+                return Ok(true);
+            }
+        }
+        if !step() {
+            return Ok(false);
+        }
+    }
 }
 
 /// 全部のドライブ（`drive_id` を渡せばそのドライブだけ）の当たりを探す。DB は読むだけ
@@ -350,17 +401,9 @@ pub fn find(
     write_cache: bool,
     step: &dyn Fn() -> bool,
 ) -> rusqlite::Result<Option<(Vec<Found>, Progress)>> {
-    let anchors: Vec<Anchor> = set
-        .catalogs
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, loaded)| {
-            let rule = pick_anchor_rule(&loaded.catalog)?;
-            rule_anchor(idx, rule)
-        })
-        .collect();
+    let anchors = anchors(set);
 
-    let Some(candidates) = collect_candidates(db, anchors, drive_id, step)? else {
+    let Some(candidates) = collect_candidates(db, &anchors, drive_id, None, step)? else {
         return Ok(None);
     };
 
@@ -393,6 +436,218 @@ pub fn find(
         bytes_read: reader.read_bytes(),
     };
     Ok(Some((found, progress)))
+}
+
+fn read_mounts(db: &Db) -> rusqlite::Result<Vec<(String, Option<String>, bool)>> {
+    db.conn()
+        .prepare_cached("SELECT id, last_mount_path FROM drive ORDER BY id")?
+        .query_map([], |row| {
+            let path: Option<String> = row.get(1)?;
+            let seen = path.as_deref().is_some_and(|p| Path::new(p).exists());
+            Ok((row.get(0)?, path, seen))
+        })?
+        .collect()
+}
+
+/// 変わったフォルダがこれより多ければ、差分ではなく全体を当て直す。
+const DIRTY_FULL_LIMIT: i64 = 2048;
+
+/// 自動更新の前回結果。cache の中を除く前の結果も保持する。
+#[derive(Default)]
+pub struct IncrementalMatches {
+    raw: BTreeMap<(i64, usize), Found>,
+    initialized: bool,
+    shape: FolderShape,
+    /// 前回のドライブごとの場所と、そこが見えていたか。
+    mounts: Vec<(String, Option<String>, bool)>,
+}
+
+impl IncrementalMatches {
+    /// 変更が DB に書かれたとき、影響するフォルダを同じトランザクションで記録する。
+    /// ハッシュは見ない。中身が変われば大きさか更新日時も変わり、ハッシュの有無で当てはめの結果は
+    /// 変わらない（読めたときは同じ中身を読む）。ハッシュを付けている間に全体の当て直しにならないように。
+    fn install(db: &Db) -> rusqlite::Result<()> {
+        db.conn().execute_batch(
+            "CREATE TABLE IF NOT EXISTS catalog_dirty (id INTEGER PRIMARY KEY);
+             CREATE TRIGGER IF NOT EXISTS catalog_dirty_insert AFTER INSERT ON entry BEGIN
+                 INSERT OR IGNORE INTO catalog_dirty SELECT new.parent_id WHERE new.parent_id IS NOT NULL;
+             END;
+             CREATE TRIGGER IF NOT EXISTS catalog_dirty_delete AFTER DELETE ON entry BEGIN
+                 INSERT OR IGNORE INTO catalog_dirty SELECT old.parent_id WHERE old.parent_id IS NOT NULL;
+                 INSERT OR IGNORE INTO catalog_dirty SELECT old.id WHERE old.kind = 'dir';
+             END;
+             CREATE TRIGGER IF NOT EXISTS catalog_dirty_update AFTER UPDATE OF parent_id, name_nfc,
+                 kind, listed, size, mtime, cloud_only, other_volume ON entry
+             WHEN old.parent_id IS NOT new.parent_id OR old.name_nfc IS NOT new.name_nfc
+                 OR old.kind IS NOT new.kind OR old.listed IS NOT new.listed OR old.size IS NOT new.size
+                 OR old.mtime IS NOT new.mtime
+                 OR old.cloud_only IS NOT new.cloud_only OR old.other_volume IS NOT new.other_volume
+             BEGIN
+                 INSERT OR IGNORE INTO catalog_dirty SELECT old.parent_id WHERE old.parent_id IS NOT NULL;
+                 INSERT OR IGNORE INTO catalog_dirty SELECT new.parent_id WHERE new.parent_id IS NOT NULL;
+                 INSERT OR IGNORE INTO catalog_dirty SELECT new.id WHERE old.kind = 'dir' OR new.kind = 'dir';
+             END;",
+        )
+    }
+
+    /// 最初と明示的な更新では全体を見て、通常は変更があったフォルダとその親だけを当て直す。
+    pub fn refresh(
+        &mut self,
+        db: &Db,
+        set: &CatalogSet,
+        full: bool,
+    ) -> rusqlite::Result<Vec<Found>> {
+        // ドライブを付け外しすると、entry が変わらなくても中身を読めるかが変わるので全体を当て直す。
+        let mounts = read_mounts(db)?;
+        // 走査の直後など変わったフォルダが多いときは、1 つずつ読むより全体を読む方が速い。
+        let full = full
+            || !self.initialized
+            || mounts != self.mounts
+            || self.dirty_count(db)? > DIRTY_FULL_LIMIT;
+        // 差分を取り出した後で失敗したら、次は全体を読んで取りこぼしを埋める。
+        self.initialized = false;
+        let anchors = anchors(set);
+        let candidates = if full {
+            Self::install(db)?;
+            db.conn().execute("DELETE FROM catalog_dirty", [])?;
+            self.raw.clear();
+            self.shape = FolderShape::default();
+            collect_candidates(db, &anchors, None, Some(&mut self.shape), &|| true)?
+                .unwrap_or_default()
+        } else {
+            self.changed_candidates(db, &anchors)?
+        };
+        self.shape.read_roots(db)?;
+        let tree = DbTree::new(db);
+        let mut reader = FsReader::new(db, true);
+        for (parent, catalog) in candidates {
+            let cat = &set.catalogs[catalog].catalog;
+            let outcome = evaluate(cat, &tree, parent, &mut reader);
+            tree.take_error()?;
+            if outcome.state != State::Miss {
+                self.raw.insert(
+                    (parent, catalog),
+                    Found {
+                        entry_id: parent,
+                        catalog_id: cat.id.clone(),
+                        state: outcome.state,
+                        captures: outcome.captures,
+                    },
+                );
+            }
+        }
+        let result = drop_inside_cache(db, set, &tree, self.raw.values().cloned().collect())?;
+        tree.take_error()?;
+        self.mounts = mounts;
+        self.initialized = true;
+        Ok(result)
+    }
+
+    fn dirty_count(&self, db: &Db) -> rusqlite::Result<i64> {
+        db.conn()
+            .query_row("SELECT COUNT(*) FROM catalog_dirty", [], |row| row.get(0))
+    }
+
+    /// ドライブのハッシュに表れない変更（ドライブの付け外しも）も、次の自動更新で反映する。
+    pub fn has_changes(&self, db: &Db) -> rusqlite::Result<bool> {
+        if !self.initialized || read_mounts(db)? != self.mounts {
+            return Ok(true);
+        }
+        db.conn()
+            .query_row("SELECT EXISTS (SELECT 1 FROM catalog_dirty)", [], |row| {
+                row.get(0)
+            })
+    }
+
+    /// フォルダの中のファイルの大きさの合計を、取得済みの親子関係と大きさから求める
+    /// （`query::folder_total` の大きさと同じ）。
+    pub fn folder_size(&self, folder: i64) -> u64 {
+        self.shape.total_size(folder)
+    }
+
+    /// 大きな未分類フォルダを、取得済みの親子関係と大きさから求める。
+    pub fn unclassified(
+        &self,
+        matched: &HashSet<i64>,
+        min_size: u64,
+        limit: usize,
+    ) -> Vec<(i64, u64)> {
+        self.shape.unclassified(matched, None, min_size, limit)
+    }
+
+    fn changed_candidates(
+        &mut self,
+        db: &Db,
+        anchors: &[Anchor],
+    ) -> rusqlite::Result<Vec<(i64, usize)>> {
+        let conn = db.conn();
+        let count = self.dirty_count(db)?;
+        let mut take = conn.prepare_cached(
+            "DELETE FROM catalog_dirty
+             WHERE id IN (SELECT id FROM catalog_dirty ORDER BY id LIMIT 512)
+             RETURNING id",
+        )?;
+        let mut dirty: Vec<i64> = Vec::new();
+        // 書き込みを 1 ページずつ終える。更新中に追加された残りは次回に回す。
+        for _ in 0..(count as u64).div_ceil(512) {
+            let mut rows = take.query([])?;
+            while let Some(row) = rows.next()? {
+                dirty.push(row.get(0)?);
+            }
+        }
+        let mut affected = HashSet::new();
+        let mut lookup = conn.prepare_cached("SELECT parent_id FROM entry WHERE id = ?1")?;
+        for id in dirty {
+            self.shape.read_folder(db, id)?;
+            let mut next = Some(id);
+            while let Some(folder) = next {
+                if !affected.insert(folder) {
+                    break;
+                }
+                next = lookup
+                    .query_row([folder], |row| row.get::<_, Option<i64>>(0))
+                    .optional()?
+                    .flatten();
+            }
+        }
+        // 確かめ中・たぶんの当たりは、ドライブの付け外しなど entry に表れない変化で結果が変わるので
+        // 毎回当て直す。
+        let mut candidates: HashSet<(i64, usize)> = self
+            .raw
+            .iter()
+            .filter(|(_, found)| found.state != State::Match)
+            .map(|(&key, _)| key)
+            .collect();
+        // 消えたフォルダは当て直さない（読めないフォルダとして確かめ中に戻ってしまう）。
+        let mut exists = conn.prepare_cached("SELECT 1 FROM entry WHERE id = ?1")?;
+        let mut gone = Vec::new();
+        for &key @ (folder, _) in &candidates {
+            if !exists.exists([folder])? {
+                gone.push(key);
+            }
+        }
+        for key in &gone {
+            candidates.remove(key);
+            self.raw.remove(key);
+        }
+        self.raw
+            .retain(|key @ (folder, _), _| !affected.contains(folder) && !candidates.contains(key));
+        if anchors.is_empty() {
+            return Ok(sorted_candidates(candidates));
+        }
+        let regexes = anchor_regexes(anchors);
+        let mut children =
+            conn.prepare_cached("SELECT name_nfc, kind FROM entry WHERE parent_id = ?1")?;
+        for folder in affected {
+            let mut rows = children.query([folder])?;
+            while let Some(row) = rows.next()? {
+                let name = row.get_ref(0)?.as_str()?;
+                let is_dir = row.get_ref(1)?.as_str()? == "dir";
+                collect_anchor_hits(&mut candidates, anchors, &regexes, folder, name, is_dir);
+            }
+        }
+        Ok(sorted_candidates(candidates))
+    }
 }
 
 /// ほかの当たりの `cache` の中にある当たりを除く（`node_modules` の中の 1 つ 1 つのパッケージなど。
@@ -455,81 +710,135 @@ pub fn unclassified(
     min_size: u64,
     limit: usize,
 ) -> rusqlite::Result<Vec<(i64, u64)>> {
-    let conn = db.conn();
-    // フォルダの直下のファイルの合計。
-    let mut files: HashMap<i64, u64> = HashMap::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT parent_id, SUM(size) FROM entry
-             WHERE kind != 'dir' AND parent_id IS NOT NULL GROUP BY parent_id",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            files.insert(row.get(0)?, row.get::<_, i64>(1)?.max(0) as u64);
-        }
+    Ok(FolderShape::load(db)?.unclassified(matched, under, min_size, limit))
+}
+
+/// フォルダの直下のサイズと子フォルダ。自動更新では変わった親の分だけ読み直す。
+#[derive(Default)]
+struct FolderShape {
+    /// 直下のフォルダ以外（リンクなども含む）の大きさの合計。未分類の計算に使う。
+    files: HashMap<i64, i64>,
+    /// 直下のファイルだけの大きさの合計（`query::folder_total` と同じ数え方）。
+    file_bytes: HashMap<i64, i64>,
+    children: HashMap<i64, Vec<i64>>,
+    roots: Vec<i64>,
+}
+
+impl FolderShape {
+    fn load(db: &Db) -> rusqlite::Result<Self> {
+        let mut shape = Self::default();
+        scan_entries(db, None, &|| true, |id, parent, _, kind, size| {
+            shape.add(id, parent, kind, size)
+        })?;
+        shape.read_roots(db)?;
+        Ok(shape)
     }
-    // フォルダの親子。
-    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
-    let mut roots = Vec::new();
-    {
-        let mut stmt = conn.prepare("SELECT id, parent_id FROM entry WHERE kind = 'dir'")?;
-        let mut rows = stmt.query([])?;
+
+    fn add(&mut self, id: i64, parent: i64, kind: &str, size: i64) -> rusqlite::Result<()> {
+        if kind == "dir" {
+            self.children.entry(parent).or_default().push(id);
+            return Ok(());
+        }
+        let overflow = || rusqlite::Error::IntegralValueOutOfRange(3, size);
+        let total = self.files.entry(parent).or_default();
+        *total = total.checked_add(size).ok_or_else(overflow)?;
+        if kind == "file" {
+            let total = self.file_bytes.entry(parent).or_default();
+            *total = total.checked_add(size).ok_or_else(overflow)?;
+        }
+        Ok(())
+    }
+
+    /// フォルダの中のファイルの大きさの合計（子孫も含む）。
+    fn total_size(&self, folder: i64) -> u64 {
+        let mut total = 0u64;
+        let mut stack = vec![folder];
+        while let Some(id) = stack.pop() {
+            if let Some(kids) = self.children.get(&id) {
+                stack.extend(kids);
+            }
+            total += self.file_bytes.get(&id).copied().unwrap_or(0).max(0) as u64;
+        }
+        total
+    }
+
+    fn read_roots(&mut self, db: &Db) -> rusqlite::Result<()> {
+        self.roots = db
+            .conn()
+            .prepare_cached("SELECT id FROM entry WHERE parent_id IS NULL AND kind = 'dir'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(())
+    }
+
+    fn read_folder(&mut self, db: &Db, folder: i64) -> rusqlite::Result<()> {
+        self.files.remove(&folder);
+        self.file_bytes.remove(&folder);
+        self.children.remove(&folder);
+        let mut stmt = db
+            .conn()
+            .prepare_cached("SELECT id, kind, size FROM entry WHERE parent_id = ?1")?;
+        let mut rows = stmt.query([folder])?;
         while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            match row.get::<_, Option<i64>>(1)? {
-                Some(parent) => children.entry(parent).or_default().push(id),
-                None => roots.push(id),
+            self.add(row.get(0)?, folder, row.get_ref(1)?.as_str()?, row.get(2)?)?;
+        }
+        Ok(())
+    }
+
+    fn unclassified(
+        &self,
+        matched: &HashSet<i64>,
+        under: Option<i64>,
+        min_size: u64,
+        limit: usize,
+    ) -> Vec<(i64, u64)> {
+        let starts = under.map_or_else(|| self.roots.clone(), |id| vec![id]);
+        // 当たりを除いた大きさを、下から足す（深い木でもあふれないよう、手で積む）。
+        let mut rest: HashMap<i64, u64> = HashMap::new();
+        let mut stack: Vec<(i64, bool)> = starts.iter().map(|&id| (id, false)).collect();
+        while let Some((id, done)) = stack.pop() {
+            if matched.contains(&id) {
+                continue;
+            }
+            let kids = self.children.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+            if done {
+                let sum = self.files.get(&id).copied().unwrap_or(0).max(0) as u64
+                    + kids.iter().filter_map(|k| rest.get(k)).sum::<u64>();
+                rest.insert(id, sum);
+            } else {
+                stack.push((id, true));
+                stack.extend(kids.iter().map(|&k| (k, false)));
             }
         }
+        let mut out = Vec::new();
+        let mut stack = starts;
+        while let Some(id) = stack.pop() {
+            let Some(&size) = rest.get(&id) else {
+                continue;
+            };
+            if size < min_size {
+                continue;
+            }
+            let big: Vec<i64> = self
+                .children
+                .get(&id)
+                .map(|kids| {
+                    kids.iter()
+                        .copied()
+                        .filter(|k| rest.get(k).is_some_and(|&s| s >= min_size))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if big.is_empty() {
+                out.push((id, size));
+            } else {
+                stack.extend(big);
+            }
+        }
+        out.sort_by_key(|&(id, size)| (std::cmp::Reverse(size), id));
+        out.truncate(limit);
+        out
     }
-    let starts = match under {
-        Some(id) => vec![id],
-        None => roots,
-    };
-    // 当たりを除いた大きさを、下から足す（深い木でもあふれないよう、手で積む）。
-    let mut rest: HashMap<i64, u64> = HashMap::new();
-    let mut stack: Vec<(i64, bool)> = starts.iter().map(|&id| (id, false)).collect();
-    while let Some((id, done)) = stack.pop() {
-        if matched.contains(&id) {
-            continue;
-        }
-        let kids = children.get(&id).map(Vec::as_slice).unwrap_or(&[]);
-        if done {
-            let sum = files.get(&id).copied().unwrap_or(0)
-                + kids.iter().filter_map(|k| rest.get(k)).sum::<u64>();
-            rest.insert(id, sum);
-        } else {
-            stack.push((id, true));
-            stack.extend(kids.iter().map(|&k| (k, false)));
-        }
-    }
-    let mut out = Vec::new();
-    let mut stack = starts;
-    while let Some(id) = stack.pop() {
-        let Some(&size) = rest.get(&id) else {
-            continue;
-        };
-        if size < min_size {
-            continue;
-        }
-        let big: Vec<i64> = children
-            .get(&id)
-            .map(|kids| {
-                kids.iter()
-                    .copied()
-                    .filter(|k| rest.get(k).is_some_and(|&s| s >= min_size))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if big.is_empty() {
-            out.push((id, size));
-        } else {
-            stack.extend(big);
-        }
-    }
-    out.sort_by_key(|&(id, size)| (std::cmp::Reverse(size), id));
-    out.truncate(limit);
-    Ok(out)
 }
 
 /// 1 か所の仕分け（`assignment` の 1 行）。
@@ -751,7 +1060,7 @@ pub fn find_near_misses(
         }
     }
 
-    let Some(candidates) = collect_candidates(db, anchors, drive_id, step)? else {
+    let Some(candidates) = collect_candidates(db, &anchors, drive_id, None, step)? else {
         return Ok(None);
     };
 
@@ -1142,6 +1451,229 @@ path = "package.json"
         save(&mut db, &set, &found2, None).unwrap();
         assert!(matches(&db).unwrap().is_empty());
         assert!(counts(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_matches_follow_nested_changes_and_deletions() {
+        let tmp = TempDir::new("catalog-incremental");
+        let game = tmp.0.join("Game");
+        let settings = game.join("ProjectSettings");
+        let version = settings.join("ProjectVersion.txt");
+        fs::create_dir_all(game.join("Assets")).unwrap();
+        fs::create_dir_all(&settings).unwrap();
+        fs::write(&version, b"m_EditorVersion: 6000.0.23f1\n").unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        let dev = db.this_device("mac", "mac.local", "macos").unwrap();
+        db.upsert_drive(&dev, &volume("test:1", &tmp.0)).unwrap();
+        save_tree(&mut db, "test:1", &tmp.0, &tmp.0);
+        let set = unity_set();
+        let mut incremental = IncrementalMatches::default();
+        let full = |db: &Db| find(db, &set, None, false, &|| true).unwrap().unwrap().0;
+        let initial = incremental.refresh(&db, &set, false).unwrap();
+        assert_eq!(initial, full(&db));
+        assert_eq!(initial.len(), 1);
+
+        fs::remove_file(&version).unwrap();
+        save_tree(&mut db, "test:1", &tmp.0, &tmp.0);
+        let changed = incremental.refresh(&db, &set, false).unwrap();
+        assert_eq!(changed, full(&db));
+        assert!(changed.is_empty());
+        assert_eq!(
+            incremental.unclassified(&HashSet::new(), 1, 20),
+            unclassified(&db, &HashSet::new(), None, 1, 20).unwrap(),
+        );
+
+        fs::write(&version, b"m_EditorVersion: 6000.0.40f1\n").unwrap();
+        save_tree(&mut db, "test:1", &tmp.0, &tmp.0);
+        let restored = incremental.refresh(&db, &set, false).unwrap();
+        assert_eq!(restored, full(&db));
+        assert_eq!(
+            incremental.unclassified(&HashSet::new(), 1, 20),
+            unclassified(&db, &HashSet::new(), None, 1, 20).unwrap(),
+        );
+        assert_eq!(
+            restored[0].captures.get("ver").map(String::as_str),
+            Some("6000.0.40f1")
+        );
+        for folder in [&tmp.0, &game, &settings] {
+            let id = db.find_folder("test:1", &tmp.0, folder).unwrap().unwrap();
+            assert_eq!(
+                incremental.folder_size(id),
+                query::folder_total(&db, id).unwrap().2
+            );
+        }
+
+        fs::remove_dir_all(&game).unwrap();
+        save_tree(&mut db, "test:1", &tmp.0, &tmp.0);
+        assert_eq!(incremental.refresh(&db, &set, false).unwrap(), full(&db));
+    }
+
+    #[test]
+    fn incremental_matches_follow_moves_renames_cascades_and_drives() {
+        let make = |root: &Path, name: &str| {
+            let game = root.join(name);
+            fs::create_dir_all(game.join("Assets")).unwrap();
+            fs::create_dir_all(game.join("ProjectSettings")).unwrap();
+            fs::write(
+                game.join("ProjectSettings/ProjectVersion.txt"),
+                b"m_EditorVersion: 6000.0.23f1\n",
+            )
+            .unwrap();
+            game
+        };
+        let one = TempDir::new("catalog-incremental-moves-1");
+        let two = TempDir::new("catalog-incremental-moves-2");
+        let game = make(&one.0, "Game");
+        let inner = make(&one.0.join("Archive"), "Inner");
+        let other = make(&two.0, "Other");
+
+        let mut db = Db::open_in_memory().unwrap();
+        let dev = db.this_device("mac", "mac.local", "macos").unwrap();
+        db.upsert_drive(&dev, &volume("test:1", &one.0)).unwrap();
+        db.upsert_drive(&dev, &volume("test:2", &two.0)).unwrap();
+        save_tree(&mut db, "test:1", &one.0, &one.0);
+        save_tree(&mut db, "test:2", &two.0, &two.0);
+        let set = unity_set();
+        let full = |db: &Db| find(db, &set, None, false, &|| true).unwrap().unwrap().0;
+        let mut incremental = IncrementalMatches::default();
+        let mut check = |db: &Db, hits: usize| {
+            let got = incremental.refresh(db, &set, false).unwrap();
+            assert_eq!(got, full(db));
+            assert_eq!(got.len(), hits);
+            got
+        };
+        check(&db, 3);
+
+        let id = |db: &mut Db, drive: &str, mount: &Path, path: &Path| {
+            db.find_folder(drive, mount, path).unwrap().unwrap()
+        };
+        let game_id = id(&mut db, "test:1", &one.0, &game);
+        let archive_id = id(&mut db, "test:1", &one.0, &one.0.join("Archive"));
+        let settings_id = id(&mut db, "test:1", &one.0, &game.join("ProjectSettings"));
+        let exec = |db: &Db, sql: &str, args: &[&dyn rusqlite::ToSql]| {
+            db.conn().execute(sql, args).unwrap();
+        };
+
+        // フォルダを別の親へ動かす（旧い親と新しい親の両方を当て直す）。
+        exec(
+            &db,
+            "UPDATE entry SET parent_id = ?1 WHERE id = ?2",
+            &[&archive_id, &game_id],
+        );
+        check(&db, 3);
+        // 当たりの目印のファイルの名前を変える。
+        exec(
+            &db,
+            "UPDATE entry SET name_nfc = 'Other.txt' WHERE parent_id = ?1",
+            &[&settings_id],
+        );
+        check(&db, 2);
+        exec(
+            &db,
+            "UPDATE entry SET name_nfc = 'ProjectVersion.txt' WHERE parent_id = ?1",
+            &[&settings_id],
+        );
+        check(&db, 3);
+        // まだ読んでいない扱いに戻す（後から読むときの逆）。
+        exec(
+            &db,
+            "UPDATE entry SET listed = 0 WHERE id = ?1",
+            &[&settings_id],
+        );
+        check(&db, 3);
+        exec(
+            &db,
+            "UPDATE entry SET listed = 1 WHERE id = ?1",
+            &[&settings_id],
+        );
+        let before = check(&db, 3);
+        let inner_id = id(&mut db, "test:1", &one.0, &inner);
+        assert!(
+            before
+                .iter()
+                .any(|f| f.entry_id == inner_id && f.state == State::Match)
+        );
+        // 親を消すと子もまとめて消える（ON DELETE CASCADE）。当たっていた Inner も消える。
+        exec(&db, "DELETE FROM entry WHERE id = ?1", &[&archive_id]);
+        check(&db, 1);
+        // もう 1 つのドライブの当たりは残り、そのドライブを消すと無くなる。
+        let other_id = id(&mut db, "test:2", &two.0, &other);
+        exec(&db, "DELETE FROM entry WHERE id = ?1", &[&other_id]);
+        check(&db, 0);
+
+        // カタログの定義が変わったときは呼ぶ側が全体を求める。
+        let empty = CatalogSet::default();
+        assert!(incremental.refresh(&db, &empty, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_matches_recheck_pending_without_entry_changes() {
+        let tmp = TempDir::new("catalog-incremental-pending");
+        let game = tmp.0.join("Game");
+        fs::create_dir_all(game.join("Assets")).unwrap();
+        fs::create_dir_all(game.join("ProjectSettings")).unwrap();
+        fs::write(
+            game.join("ProjectSettings/ProjectVersion.txt"),
+            b"m_EditorVersion: 6000.0.23f1\n",
+        )
+        .unwrap();
+
+        let mut db = Db::open_in_memory().unwrap();
+        let dev = db.this_device("mac", "mac.local", "macos").unwrap();
+        db.upsert_drive(&dev, &volume("test:1", &tmp.0)).unwrap();
+        save_tree(&mut db, "test:1", &tmp.0, &tmp.0);
+        let set = unity_set();
+        let full = |db: &Db| find(db, &set, None, false, &|| true).unwrap().unwrap().0;
+        let set_mount = |db: &Db, path: &Path| {
+            db.conn()
+                .execute(
+                    "UPDATE drive SET last_mount_path = ?1 WHERE id = 'test:1'",
+                    [path.to_str().unwrap()],
+                )
+                .unwrap();
+        };
+
+        // ドライブが外れていて中身を読めない間は、確かめきれない。
+        set_mount(&db, &tmp.0.join("unmounted"));
+        let mut incremental = IncrementalMatches::default();
+        let away = incremental.refresh(&db, &set, false).unwrap();
+        assert_eq!(away, full(&db));
+        assert_ne!(away[0].state, State::Match);
+
+        // つなぎ直しても entry は変わらないが、当て直す。
+        set_mount(&db, &tmp.0);
+        assert!(incremental.has_changes(&db).unwrap());
+        let back = incremental.refresh(&db, &set, false).unwrap();
+        assert_eq!(back, full(&db));
+        assert_eq!(back[0].state, State::Match);
+        assert!(!incremental.has_changes(&db).unwrap());
+
+        // 中身を読んで当たったあとでドライブが外れたら、全件と同じく確かめきれない側に戻る。
+        set_mount(&db, &tmp.0.join("unmounted"));
+        assert!(incremental.has_changes(&db).unwrap());
+        let gone = incremental.refresh(&db, &set, false).unwrap();
+        assert_eq!(gone, full(&db));
+        assert_ne!(gone[0].state, State::Match);
+        set_mount(&db, &tmp.0);
+        assert_eq!(incremental.refresh(&db, &set, false).unwrap(), full(&db));
+
+        // ハッシュを付けるだけでは当て直さない。
+        db.conn()
+            .execute("UPDATE entry SET hash = zeroblob(32)", [])
+            .unwrap();
+        assert!(!incremental.has_changes(&db).unwrap());
+
+        // 変わったフォルダが多いときは全体を当て直し、記録も空にする。
+        db.conn()
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                 INSERT OR IGNORE INTO catalog_dirty SELECT i FROM n",
+                [DIRTY_FULL_LIMIT + 1],
+            )
+            .unwrap();
+        assert_eq!(incremental.refresh(&db, &set, false).unwrap(), full(&db));
+        assert!(!incremental.has_changes(&db).unwrap());
     }
 
     #[test]

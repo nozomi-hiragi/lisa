@@ -579,11 +579,6 @@ fn start_listener(lan: &LanState) -> Result<RunningListener, String> {
         let _ = proxy.send_event(WinitUserEvent::WakeUp);
         rx.recv_timeout(PAIR_TIMEOUT).ok().flatten()
     }));
-    std::thread::Builder::new()
-        .name("lisa-lan-http".into())
-        .spawn(move || listener.run())
-        .map_err(|e| e.to_string())?;
-
     let udp_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT))
         .or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))
         .map_err(|e| format!("UDP で待てませんでした: {e}"))?;
@@ -617,6 +612,14 @@ fn start_listener(lan: &LanState) -> Result<RunningListener, String> {
         })
         .map_err(|e| e.to_string())?;
 
+    if let Err(error) = std::thread::Builder::new()
+        .name("lisa-lan-http".into())
+        .spawn(move || run_http_listener(listener))
+    {
+        stop_udp.store(true, Ordering::Relaxed);
+        return Err(error.to_string());
+    }
+
     info!("LAN に公開しています（HTTP:{http_port}, UDP:{udp_port}）");
     Ok(RunningListener {
         http: http_handle,
@@ -624,6 +627,27 @@ fn start_listener(lan: &LanState) -> Result<RunningListener, String> {
         udp_port,
         http_port,
     })
+}
+
+fn run_http_listener(listener: HttpListener) {
+    // 「LAN に公開」の間は、ウィンドウが隠れていても App Nap で絞られないようにする（アイドル時の
+    // スリープは許す）。待ち受けを止めたら終える。
+    #[cfg(target_os = "macos")]
+    let activity = objc2::rc::autoreleasepool(|_| {
+        use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+        NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+            NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+            &NSString::from_str("Lisa LAN sharing"),
+        )
+    });
+
+    listener.run();
+
+    #[cfg(target_os = "macos")]
+    objc2::rc::autoreleasepool(|_| {
+        // SAFETY: `beginActivityWithOptions_reason` が返したアクティビティをそのまま渡す。
+        unsafe { objc2_foundation::NSProcessInfo::processInfo().endActivity(&activity) };
+    });
 }
 
 fn stop_on_exit(mut exit: MessageReader<AppExit>, lan: Option<ResMut<LanState>>) {

@@ -37,7 +37,7 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 # 動画のプレビュー（video.rs）で、AVAssetImageGenerator から 1 コマを取る。
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVAssetImageGenerator", "AVTime", "objc2-core-foundation", "objc2-core-media", "objc2-core-graphics"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMTime"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSURL", "NSString", "NSArray"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSProcessInfo", "NSURL", "NSString", "NSArray"] }
 objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "CGImageProperties", "objc2-core-graphics"] }
 
 [profile.dev]

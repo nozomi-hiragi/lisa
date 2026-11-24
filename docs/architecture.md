@@ -336,7 +336,7 @@ assets/fonts/              Noto Sans JP と、そのライセンス
 
 ## LAN の他の PC の Lisa を見る（`lan.rs`）
 
-- 設定の「LAN に公開」（`lan_share`）が 1 のあいだ、アプリの中で `lisa_mcp::HttpListener`（既定 `0.0.0.0:47800`、使えなければ空いている番号）と UDP の返事（`0.0.0.0:47801`）を動かします。あわせて、同じフォルダの `lisa-mcp` を別プロセス（sidecar、既定 `0.0.0.0:47802`、`sidecar.json` に `pid` と `port` を記録）として裏で立ち上げます。0 に戻せば `unblock` でアプリの待ち受けを止め、sidecar も `/health` を確かめてから止めます。
+- 設定の「LAN に公開」（`lan_share`）が 1 のあいだ、アプリの中で `lisa_mcp::HttpListener`（既定 `0.0.0.0:47800`、使えなければ空いている番号）と UDP の返事（`0.0.0.0:47801`）を動かします。あわせて、同じフォルダの `lisa-mcp` を別プロセス（sidecar、既定 `0.0.0.0:47802`、`sidecar.json` に `pid` と `port` を記録）として裏で立ち上げます。0 に戻せば `unblock` でアプリの待ち受けを止め、sidecar も `/health` を確かめてから止めます。待ち受けている間、macOS では `NSProcessInfo` のアクティビティ（`UserInitiatedAllowingIdleSystemSleep`）を持ち、ウィンドウが隠れていても App Nap で応答が遅れないようにします（止めるときに `endActivity`）。`/health` は通常の頼みとは別の受付枠（同時 2 件）で答えます。
 - sidecar（`lisa-mcp`）はアプリ本体が落ちたあとも既定で 10 分間（`--linger 600`）残るので、ペアリングした端末から `lisa_logs` で `logs/lisa.log` や `crash.log` を読んだり、`lisa_update` や `lisa_app_start` / `lisa_app_stop` / `lisa_app_alive` でバイナリの入れ替えや再起動を行えます。
 - 認証は `lan.json`（`{"token", "peers": [{"device_id", "name", "key", "added_at"}]}`）で、合言葉（`token`）かペアリングで発行した `peer.key` のどちらでも通します（`lisa_update` や `lisa_app_start` / `lisa_app_stop` は `peer.key` のみ）。設定のポップアップの「つないだ端末」から相手ごとに `key` を取り消せます。
 - どの側も起動時と 30 秒ごとに UDP 47801 へ `{"lisa":"hello","v":1}` をブロードキャストし、`{"lisa":"here","v":1,"device_id","name","port","mcp_port"}` の返事を 2 秒集めます。

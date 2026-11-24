@@ -241,6 +241,10 @@ pub struct State {
     pub bytes_hashed: u64,
     pub hashing: Option<PathBuf>,
     pub finished: bool,
+    /// 画面の処理を待たずに、直近に写した様子を返したとき、その写しが何ミリ秒前のものか。
+    /// 大きければ画面の処理が止まっている（窓が隠れているなど）。画面の処理で返したときは無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_age_ms: Option<u64>,
 }
 
 /// アプリに届いた頼み。`reply` に返事を送る。

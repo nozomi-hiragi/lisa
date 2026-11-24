@@ -143,6 +143,17 @@ Lisa が SQLite に残すものと、残さないものをまとめます。
 カタログの当たり、中身の条件の結果、1 か所の仕分けです。列は [catalog.md](catalog.md) の
 「保存するデータ（DB）」にあります。
 
+## catalog_dirty（カタログの当て直しが要るフォルダ）
+
+`id INTEGER PRIMARY KEY` だけの表です。`entry` の 3 つのトリガー（`catalog_dirty_insert`・`catalog_dirty_delete`・
+`catalog_dirty_update`）が、行の追加・削除と、`parent_id`・`name_nfc`・`kind`・`listed`・`size`・`mtime`・
+`cloud_only`・`other_volume` の変更のたびに、親（と、フォルダならそれ自身）の `id` を同じトランザクションで書きます。
+アプリのカタログの係が初めて当てるときに作り、読んだ分を消します。行の数はフォルダの数より増えません。
+
+- 古い版の Lisa で開いても、トリガーがこの表に書くだけで動きは変わりません。
+- 戻すときは `DROP TRIGGER catalog_dirty_insert; DROP TRIGGER catalog_dirty_delete;
+  DROP TRIGGER catalog_dirty_update; DROP TABLE catalog_dirty;`。次に新しい版が起動すると作り直します。
+
 ## plan・plan_op（整理の計画）
 
 ファイルの移動・フォルダの作成・隔離フォルダへの退避・取り消しの計画と、1 件ごとの記録です。
