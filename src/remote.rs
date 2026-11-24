@@ -1,14 +1,16 @@
 //! 外（`lisa-mcp` など）からの頼みを受けて、画面を動かす（`lisa_core::remote`）。
 //!
 //! 起動したら `127.0.0.1` で待ち、番号と合言葉を DB と同じフォルダの `control.json` に書く。頼みは
-//! 待つ係のスレッドから届くので、届いたらアプリを起こし、毎フレーム `handle` で受け取って返事をする。
+//! 頼みが届いたらアプリを起こし、画面の変更は毎フレーム `handle` で受け取る。
+//! 状態の問い合わせには待つ係のスレッドから直近の状態を返す。
 //! 頼めるのは、今の様子を聞く、場所へ飛ぶ（`scan::JumpTo`）、重複の一覧の開け閉めと組を選ぶ、
 //! フォルダを先に読み直す、一時停止だけ。ファイルは動かさない。
 
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bevy::camera::{RenderTarget, visibility::RenderLayers};
 use bevy::ecs::system::SystemParam;
@@ -45,6 +47,7 @@ pub struct RemotePlugin;
 impl Plugin for RemotePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, start)
+            .add_systems(First, request_exit)
             .add_systems(Update, (handle, select_pending).chain().after(ViewSystems))
             .add_systems(Last, remove_on_exit);
     }
@@ -111,6 +114,12 @@ struct DebugContext<'w, 's> {
 struct Inbox {
     receiver: Mutex<Receiver<Incoming>>,
     file: PathBuf,
+    state: Arc<Mutex<(State, Instant)>>,
+    quit: Arc<AtomicBool>,
+    /// 受け取ったが、まだ様子の写しに表れていない画面の頼みの数。
+    pending: Arc<AtomicUsize>,
+    /// 前のフレームで処理した画面の頼みの数。`Commands` が効くのは次のフレームなので、そこで写してから減らす。
+    released: AtomicUsize,
 }
 
 impl Drop for Inbox {
@@ -123,13 +132,46 @@ impl Drop for Inbox {
 #[derive(Resource)]
 struct PendingSelect(String);
 
-fn start(mut commands: Commands, proxy: Res<EventLoopProxyWrapper>) {
+fn start(
+    mut commands: Commands,
+    proxy: Res<EventLoopProxyWrapper>,
+    nav: Res<Nav>,
+    tree: Res<FileTree>,
+    dups: Res<Dups>,
+) {
     let Some(dir) = crate::scan::db_path().and_then(|p| p.parent().map(PathBuf::from)) else {
         return;
     };
     let (sender, receiver) = channel();
     let proxy = (**proxy).clone();
+    let snapshot = Arc::new(Mutex::new((
+        state(&nav, &tree, &dups, None, None),
+        Instant::now(),
+    )));
+    let published = Arc::clone(&snapshot);
+    let quit = Arc::new(AtomicBool::new(false));
+    let quit_requested = Arc::clone(&quit);
+    let pending = Arc::new(AtomicUsize::new(0));
+    let queued = Arc::clone(&pending);
     let deliver = move |incoming: Incoming| {
+        let quitting = matches!(incoming.command, Command::Quit);
+        if quitting {
+            quit_requested.store(true, Ordering::Relaxed);
+            let _ = proxy.send_event(WinitUserEvent::WakeUp);
+        }
+        let is_state = matches!(incoming.command, Command::State);
+        // 先に届いた画面の頼みがまだ写しに表れていなければ、従来どおり画面の処理の順で答える。
+        if quitting || (is_state && queued.load(Ordering::SeqCst) == 0) {
+            let (mut state, at) = published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            state.snapshot_age_ms = Some(at.elapsed().as_millis() as u64);
+            return incoming.reply.send(Reply::ok(state)).is_ok();
+        }
+        if !is_state {
+            queued.fetch_add(1, Ordering::SeqCst);
+        }
         let sent = sender.send(incoming).is_ok();
         // 止まっている間でも、すぐ受け取れるように起こす。
         let _ = proxy.send_event(WinitUserEvent::WakeUp);
@@ -141,9 +183,20 @@ fn start(mut commands: Commands, proxy: Res<EventLoopProxyWrapper>) {
             commands.insert_resource(Inbox {
                 receiver: Mutex::new(receiver),
                 file,
+                state: snapshot,
+                quit,
+                pending,
+                released: AtomicUsize::new(0),
             });
         }
         Err(error) => warn!("外からの頼みを待てませんでした: {error}"),
+    }
+}
+
+/// 画面の頼みの列を待たず、次のフレームの最初に通常の終了処理に入る。
+fn request_exit(inbox: Option<Res<Inbox>>, mut exit: MessageWriter<AppExit>) {
+    if inbox.is_some_and(|inbox| inbox.quit.load(Ordering::Relaxed)) {
+        exit.write(AppExit::Success);
     }
 }
 
@@ -168,10 +221,9 @@ fn handle(
     progress: Option<Res<ScanProgress>>,
     occluded: Res<WindowOccludedState>,
     mut redraw: MessageWriter<RequestRedraw>,
-    mut exit: MessageWriter<AppExit>,
     mut dbg: DebugContext,
 ) {
-    let Some(inbox) = inbox else {
+    let Some(inbox) = inbox.filter(|inbox| !inbox.quit.load(Ordering::Relaxed)) else {
         return;
     };
     let incoming: Vec<Incoming> = match inbox.receiver.lock() {
@@ -179,11 +231,16 @@ fn handle(
         Err(_) => return,
     };
     let debug_enabled = debug_remote_enabled();
+    let mut processed = 0;
     for Incoming { command, reply } in incoming {
         let mut debug_out: Option<DebugState> = None;
         let read_only = matches!(command, Command::State | Command::DebugState);
+        if !matches!(command, Command::State) {
+            processed += 1;
+        }
         let result: Result<(), String> = match command {
             Command::State => Ok(()),
+            Command::Quit => continue,
             Command::OpenMarker { path } => {
                 crate::open_marker::enqueue(path);
                 Ok(())
@@ -263,10 +320,6 @@ fn handle(
                 }
                 None => Err("読む係がまだ動いていません".into()),
             },
-            Command::Quit => {
-                exit.write(AppExit::Success);
-                Ok(())
-            }
             Command::DebugState => {
                 if !debug_enabled {
                     Err("LISA_DEBUG_REMOTE=1 が必要です".into())
@@ -453,6 +506,13 @@ fn handle(
             redraw.write(RequestRedraw);
         }
     }
+    let snapshot = state(&nav, &tree, &dups, control.as_deref(), progress.as_deref());
+    if let Ok(mut published) = inbox.state.lock() {
+        *published = (snapshot, Instant::now());
+    }
+    // 前のフレームの頼みは、`Commands` が効いたあとの写しに表れたので数から外す。
+    let released = inbox.released.swap(processed, Ordering::SeqCst);
+    inbox.pending.fetch_sub(released, Ordering::SeqCst);
 }
 
 /// 頼まれた組を、一覧ができたら選ぶ。一覧を閉じたら諦める。

@@ -173,6 +173,9 @@ claude mcp add --transport http lisa-<名前> http://<IP>:47800/mcp --header "Au
 - `lisa_app_*` は、起動中のアプリに頼みます。アプリは起動すると `127.0.0.1` の空いている番号で待ち、
   番号と合言葉（起動ごとに作る）を DB と同じフォルダの `control.json` に書きます（自分だけ読める）。
   合言葉の合わない頼みは断ります。
+  - 様子を聞く頼み（`state`）と終了（`quit`）には、画面の処理を待たずに、毎フレーム写している直近の様子で
+    答えます。そのとき返事に `snapshot_age_ms`（写しが何ミリ秒前か）が付きます。大きければ画面の処理が
+    止まっています。先に送った画面の頼みがまだ写しに表れていない間は、従来どおり画面の処理の順で答えます。
 - `lisa_update`、`lisa_app_start`、`lisa_app_stop`、`lisa_app_alive`、`lisa_screenshot` は、ペアリングした端末の鍵（`peers.json` の `key`）で来たときだけ使えます（合言葉 token や標準入出力では使えません）。
 
 ### 落ちたときに Mac から調べる
