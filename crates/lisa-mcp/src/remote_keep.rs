@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use lisa_core::merged::links;
 use lisa_core::organize::remote_keep::{self, KEEP_LEASE_MS, KeepReference, ProtectedKeep};
 use serde_json::{Value, json};
 
@@ -60,6 +61,24 @@ impl Server {
         let Auth::Peer { device_id, .. } = auth else {
             return Err("残す項目の予約はペアリング済み端末からだけ使えます".into());
         };
+        if tool == "lisa_merged_receive_transfer" {
+            let request = serde_json::from_value(args["request"].clone()).map_err(err)?;
+            let reply =
+                lisa_core::organize::receive_transfer(&mut self.db()?, device_id, &request)?;
+            return serde_json::to_value(reply).map_err(err);
+        }
+        if tool == "lisa_merged_link_update" {
+            let update: links::Update =
+                serde_json::from_value(args["update"].clone()).map_err(err)?;
+            self.apply_link_update(
+                &mut self.db()?,
+                &update,
+                args["token"].as_str(),
+                device_id,
+                device_id,
+            )?;
+            return Ok(json!({"updated": true}));
+        }
         let db = self.db()?;
         if tool == "lisa_keep_inspect" {
             let reference = parse_reference(args)?;
@@ -69,6 +88,7 @@ impl Server {
         if tool == "lisa_keep_reserve" {
             let reference = parse_reference(args)?;
             let prepared = ProtectedKeep::open(&db, &reference)?;
+            let location = prepared.location(&db, &reference);
             let token = uuid::Uuid::new_v4().to_string();
             let mut state = RESERVATIONS.lock().map_err(err)?;
             let state = state.get_or_insert_with(HashMap::new);
@@ -89,7 +109,7 @@ impl Server {
                     prepared,
                 })),
             );
-            return Ok(json!({"token": token, "expires_at": expires_at}));
+            return Ok(json!({"token": token, "expires_at": expires_at, "location": location}));
         }
 
         let token = args
@@ -125,12 +145,60 @@ impl Server {
             ..
         } = &mut *reservation;
         prepared.verify_held(&db, reference)?;
+        let location = prepared.location(&db, reference);
         if Instant::now() >= reservation.deadline {
             return Err("検証中に予約が失効しました。重複を再取得して確認してください".into());
         }
         let expires_at = remote_keep::renew(&db, token)?;
         reservation.deadline = Instant::now() + lease_duration();
-        Ok(json!({"token": token, "expires_at": expires_at}))
+        Ok(json!({"token": token, "expires_at": expires_at, "location": location}))
+    }
+    pub(super) fn apply_link_update(
+        &self,
+        db: &mut lisa_core::db::Db,
+        update: &links::Update,
+        token: Option<&str>,
+        auth_device: &str,
+        relay_device: &str,
+    ) -> Result<(), String> {
+        let marker = &update.marker;
+        if db.meta("this_device").map_err(err)?.as_deref() != Some(&marker.target.device_id) {
+            return Err("実体の端末が一致しません".into());
+        }
+        if update.state == links::State::Reserved {
+            let token = token.ok_or("リンク登録には保持側の予約が必要です")?;
+            let lease = RESERVATIONS
+                .lock()
+                .map_err(err)?
+                .as_ref()
+                .and_then(|reservations| reservations.get(token))
+                .cloned()
+                .ok_or("保持側の予約が失効しました")?;
+            let reservation = lease.lock().map_err(err)?;
+            if reservation.owner != auth_device
+                || reservation.data_dir != self.data_dir
+                || Instant::now() >= reservation.deadline
+            {
+                return Err("リンク登録と保持側の予約が一致しません".into());
+            }
+            let key = &reservation.reference.key;
+            if reservation
+                .prepared
+                .location(db, &reservation.reference)
+                .as_ref()
+                != Some(&marker.target)
+                || marker.kind == lisa_core::listing::Kind::Dir && !key.directory
+                || marker.kind == lisa_core::listing::Kind::File && key.directory
+                || marker.size != key.size
+                || lisa_core::query::parse_hash(&marker.hash.value) != Some(key.hash)
+            {
+                return Err("リンクと予約の実体が一致しません".into());
+            }
+        } else if token.is_some() {
+            return Err("リンクの更新には保持側の予約を使いません".into());
+        }
+        links::apply(db, update, Some(relay_device), false)?;
+        Ok(())
     }
 }
 

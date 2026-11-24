@@ -129,6 +129,28 @@ impl Device {
         .unwrap();
     }
 
+    /// 一番上に `name` を置き、読み直してハッシュする。
+    fn add(&self, name: &str, bytes: &[u8]) {
+        fs::write(self.mount.join(name), bytes).unwrap();
+        let mut db = self.reopen();
+        db.save_listing(
+            "fixture-drive",
+            &self.mount,
+            &self.mount,
+            &listing::read_dir(&self.mount).map_err(|e| e.to_string()),
+        )
+        .unwrap();
+        hash::hash_drive(
+            &mut db,
+            "fixture-drive",
+            &self.mount,
+            1,
+            &mut |_| {},
+            &Pace::FREE,
+        )
+        .unwrap();
+    }
+
     fn reopen(&self) -> Db {
         Db::open(&self.dir.join("lisa.db")).unwrap()
     }
@@ -243,8 +265,215 @@ fn execute(target: &Device, id: i64) -> Result<organize::ApplyReport, String> {
     let mut db = target.reopen();
     let mut ctx = Context::with_builtin(target.dir.clone());
     ctx.keep_client = Some(relay_client);
+    ctx.link_client = Some(super::link_relay_client);
     organize::approve_plan_with_context(&mut db, &ctx, id, false)?;
     organize::execute_plan(&mut db, &ctx, id)
+}
+
+#[test]
+fn over_http_marker_sync_keeps_reservation_until_ack_and_retries_terminal_generation() {
+    use lisa_core::merged::{self, links};
+
+    let (a, b) = fixtures();
+    let id = a.ask(&b, &["1.txt"]);
+    assert_eq!(execute(&b, id).unwrap().done, 1);
+    let path = b.mount.join("1.txt.lmf");
+    let marker = merged::read(&path).expect("マージ済みリンクを作りました");
+    let mut db = b.reopen();
+    let keeper = a.reopen();
+    let mut ctx = Context::with_builtin(b.dir.clone());
+    ctx.link_client = Some(super::link_relay_client);
+    let pending = links::sources(&keeper, &marker.target).unwrap();
+    assert_eq!(pending[0].state, links::State::Reserved);
+    assert_eq!(pending[0].sync_state, "pending");
+    assert_eq!(
+        links::status(&db, &marker.link_id).unwrap().as_deref(),
+        Some("pending")
+    );
+
+    organize::flush_links(&mut db, &ctx).unwrap();
+    let active = links::sources(&keeper, &marker.target).unwrap();
+    assert_eq!(active[0].state, links::State::Active);
+    assert_eq!(
+        links::status(&db, &marker.link_id).unwrap().as_deref(),
+        Some("confirmed")
+    );
+
+    fs::remove_file(&path).unwrap();
+    organize::flush_links(&mut db, &ctx).unwrap();
+    assert!(links::sources(&keeper, &marker.target).unwrap().is_empty());
+    assert!(links::permits(&keeper).unwrap()[0].revoked);
+    assert!(links::pending(&db).unwrap().is_empty());
+}
+
+#[test]
+fn over_http_restores_a_peer_from_streamed_bytes_when_quarantine_is_absent() {
+    use lisa_core::merged::{self, links};
+    use organize::{DeleteChoice, DeleteRequest, OpInput};
+
+    let (a, b) = fixtures();
+    let merge = a.ask(&b, &["1.txt"]);
+    assert_eq!(execute(&b, merge).unwrap().done, 1);
+    let mut source = b.reopen();
+    let mut source_ctx = Context::with_builtin(b.dir.clone());
+    source_ctx.link_client = Some(super::link_relay_client);
+    organize::flush_links(&mut source, &source_ctx).unwrap();
+    let marker = merged::read(&b.mount.join("1.txt.lmf")).unwrap();
+    let mut keeper = a.reopen();
+    assert_eq!(
+        links::sources(&keeper, &marker.target).unwrap()[0].state,
+        links::State::Active
+    );
+    let quarantined = organize::plan_ops(&source, merge).unwrap()[0]
+        .dst
+        .clone()
+        .unwrap();
+    fs::remove_file(quarantined).unwrap();
+
+    let mut ctx = Context::with_builtin(a.dir.clone());
+    ctx.relocation_client = Some(super::relocation_client);
+    let path = a.mount.join("0.txt");
+    let plan = organize::create_plan(
+        &mut keeper,
+        &ctx,
+        "test",
+        None,
+        &[OpInput::TrashLinked {
+            path: path.clone(),
+            decision: DeleteRequest {
+                choice: DeleteChoice::Restore {
+                    link_id: marker.link_id.clone(),
+                },
+                links: vec![marker.link_id],
+            },
+        }],
+        false,
+    )
+    .unwrap()
+    .id
+    .unwrap();
+    organize::approve_plan(&mut keeper, plan, false).unwrap();
+    let report = organize::execute_plan(&mut keeper, &ctx, plan).unwrap();
+    assert_eq!(report.done, 1);
+    assert!(!path.exists());
+    assert_eq!(fs::read(b.mount.join("1.txt")).unwrap(), b"same");
+    assert!(!b.mount.join("1.txt.lmf").exists());
+}
+
+#[test]
+fn over_http_streams_several_chunks_in_parallel_and_restores_identical_bytes() {
+    use lisa_core::merged::{self, links};
+    use organize::{DeleteChoice, DeleteRequest, OpInput};
+
+    let (a, b) = fixtures();
+    // 4 MiB の小分けが 4 本になり、並行で順不同に届く大きさ。
+    let bytes: Vec<u8> = (0..13 * 1024 * 1024 + 7)
+        .map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    a.add("big.bin", &bytes);
+    b.add("big.bin", &bytes);
+    let merge = a.ask_keep(&b, "big.bin", &["big.bin"]);
+    assert_eq!(execute(&b, merge).unwrap().done, 1);
+    let mut source = b.reopen();
+    let mut source_ctx = Context::with_builtin(b.dir.clone());
+    source_ctx.link_client = Some(super::link_relay_client);
+    organize::flush_links(&mut source, &source_ctx).unwrap();
+    let marker = merged::read(&b.mount.join("big.bin.lmf")).unwrap();
+    let quarantined = organize::plan_ops(&source, merge).unwrap()[0]
+        .dst
+        .clone()
+        .unwrap();
+    fs::remove_file(quarantined).unwrap();
+
+    let mut keeper = a.reopen();
+    let mut ctx = Context::with_builtin(a.dir.clone());
+    ctx.relocation_client = Some(super::relocation_client);
+    let path = a.mount.join("big.bin");
+    let plan = organize::create_plan(
+        &mut keeper,
+        &ctx,
+        "test",
+        None,
+        &[OpInput::TrashLinked {
+            path: path.clone(),
+            decision: DeleteRequest {
+                choice: DeleteChoice::Restore {
+                    link_id: marker.link_id.clone(),
+                },
+                links: vec![marker.link_id.clone()],
+            },
+        }],
+        false,
+    )
+    .unwrap()
+    .id
+    .unwrap();
+    organize::approve_plan(&mut keeper, plan, false).unwrap();
+    assert_eq!(
+        organize::execute_plan(&mut keeper, &ctx, plan)
+            .unwrap()
+            .done,
+        1
+    );
+    assert!(!path.exists());
+    assert!(fs::read(b.mount.join("big.bin")).unwrap() == bytes);
+    assert!(!b.mount.join("big.bin.lmf").exists());
+    assert!(links::sources(&keeper, &marker.target).unwrap().is_empty());
+}
+
+#[test]
+fn over_http_deleting_an_actual_with_a_peer_source_marks_the_link_missing() {
+    use lisa_core::merged::{self, links};
+    use organize::{DeleteChoice, DeleteRequest, OpInput};
+
+    let (a, b) = fixtures();
+    let merge = a.ask(&b, &["1.txt"]);
+    assert_eq!(execute(&b, merge).unwrap().done, 1);
+    let mut source = b.reopen();
+    let mut source_ctx = Context::with_builtin(b.dir.clone());
+    source_ctx.link_client = Some(super::link_relay_client);
+    organize::flush_links(&mut source, &source_ctx).unwrap();
+    let marker = merged::read(&b.mount.join("1.txt.lmf")).unwrap();
+
+    let mut keeper = a.reopen();
+    let ctx = Context::with_builtin(a.dir.clone());
+    let path = a.mount.join("0.txt");
+    let plan = organize::create_plan(
+        &mut keeper,
+        &ctx,
+        "test",
+        None,
+        &[OpInput::TrashLinked {
+            path: path.clone(),
+            decision: DeleteRequest {
+                choice: DeleteChoice::DeleteActual,
+                links: vec![marker.link_id.clone()],
+            },
+        }],
+        false,
+    )
+    .unwrap()
+    .id
+    .unwrap();
+    organize::approve_plan(&mut keeper, plan, false).unwrap();
+    assert_eq!(
+        organize::execute_plan(&mut keeper, &ctx, plan)
+            .unwrap()
+            .done,
+        1
+    );
+    assert!(!path.exists());
+    assert!(b.mount.join("1.txt.lmf").exists(), "別の端末の目印は残す");
+    assert_eq!(
+        links::status(&keeper, &marker.link_id).unwrap().as_deref(),
+        Some("missing")
+    );
+    organize::undo_plan(&mut keeper, &ctx, plan).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"same");
+    assert_eq!(
+        links::status(&keeper, &marker.link_id).unwrap().as_deref(),
+        Some("confirmed")
+    );
 }
 
 #[test]
@@ -298,14 +527,14 @@ fn cut(
     route: &Route,
     keeper: &KeepReference,
     action: RelayAction,
-) -> Result<(), String> {
-    relay_client(data, route, keeper, action)?;
+) -> Result<Option<lisa_core::merged::Location>, String> {
+    let location = relay_client(data, route, keeper, action)?;
     if action == RelayAction::Renew
         && let Some(listener) = CUT_AFTER_FIRST.lock().unwrap().take()
     {
         listener.unblock();
     }
-    Ok(())
+    Ok(location)
 }
 
 #[test]
@@ -320,6 +549,7 @@ fn over_http_a_lost_link_stops_the_remaining_op_and_preserves_the_first_mtime() 
     let mut db = b.reopen();
     let mut ctx = Context::with_builtin(b.dir.clone());
     ctx.keep_client = Some(cut);
+    ctx.link_client = Some(super::link_relay_client);
     organize::approve_plan_with_context(&mut db, &ctx, id, false).unwrap();
     let result = organize::execute_plan(&mut db, &ctx, id).unwrap();
     assert_eq!(result.done, 1);
@@ -342,7 +572,7 @@ fn expire(
     route: &Route,
     keeper: &KeepReference,
     action: RelayAction,
-) -> Result<(), String> {
+) -> Result<Option<lisa_core::merged::Location>, String> {
     if action == RelayAction::Renew {
         std::thread::sleep(std::time::Duration::from_millis(
             organize::remote_keep::KEEP_LEASE_MS as u64 + 1200,
@@ -358,6 +588,7 @@ fn over_http_expired_reservation_cannot_authorize_isolation() {
     let mut db = b.reopen();
     let mut ctx = Context::with_builtin(b.dir.clone());
     ctx.keep_client = Some(expire);
+    ctx.link_client = Some(super::link_relay_client);
     organize::approve_plan_with_context(&mut db, &ctx, id, false).unwrap();
     let result = organize::execute_plan(&mut db, &ctx, id).unwrap();
     assert_eq!(result.done, 0);
@@ -400,6 +631,7 @@ fn over_http_crash_after_first_rename_recovers_without_repeating_it() {
     let mut db = b.reopen();
     let mut ctx = Context::with_builtin(b.dir.clone());
     ctx.keep_client = Some(relay_client);
+    ctx.link_client = Some(super::link_relay_client);
     let recovered = organize::recover_running_plans(&mut db, &ctx).unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].done, 2);
@@ -482,6 +714,7 @@ fn over_http_one_way_pairing_and_changed_keep_at_execution() {
     let mut db = b.reopen();
     let mut ctx = Context::with_builtin(b.dir.clone());
     ctx.keep_client = Some(relay_client);
+    ctx.link_client = Some(super::link_relay_client);
     organize::approve_plan_with_context(&mut db, &ctx, id, false).unwrap();
     fs::write(a.mount.join("0.txt"), b"else").unwrap();
     let failure = organize::execute_plan(&mut db, &ctx, id).unwrap_err();

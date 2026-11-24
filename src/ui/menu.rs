@@ -62,6 +62,7 @@ pub struct MenuBreadcrumb {
     pub(crate) text: String,
     pub(crate) parts: Vec<String>,
     pub(crate) steps: Vec<Step>,
+    pub(crate) marker_status: Option<String>,
 }
 
 #[derive(Resource)]
@@ -434,6 +435,9 @@ fn show_breadcrumb(
                 TEXT_COLOR
             };
             breadcrumb_item(strip, &font, part, target, color);
+        }
+        if let Some(status) = &breadcrumb.marker_status {
+            breadcrumb_item(strip, &font, status, None, palette::MUTED);
         }
     });
     scroll.follow_end = true;

@@ -128,6 +128,20 @@ pub(crate) fn prepare_ops(
     // 5. 1 件ずつ確かめる。
     let mut out = Vec::with_capacity(resolved.len());
     for (i, mut item) in resolved.into_iter().enumerate() {
+        if item.op == OpKind::Trash
+            && item.early_refused.is_none()
+            && let Some(location) = item
+                .drive_id
+                .as_deref()
+                .and_then(|drive| crate::merged::Location::local(db, drive, &item.src))
+        {
+            let request = match &ops[i] {
+                OpInput::TrashLinked { decision, .. } => Some(decision),
+                _ => None,
+            };
+            item.early_refused =
+                super::linked_delete::require_decision(db, &location, request).err();
+        }
         if let Some(reason) = item
             .early_refused
             .take()
@@ -148,6 +162,17 @@ pub(crate) fn prepare_ops(
             });
             continue;
         }
+        // 戻し先を選んだ実体の削除は、照合済みの写しを先に元の場所へ戻すので最後の 1 つではない。
+        let restored = matches!(
+            &ops[i],
+            OpInput::TrashLinked {
+                decision: super::DeleteRequest {
+                    choice: super::DeleteChoice::Restore { .. },
+                    ..
+                },
+                ..
+            }
+        );
         out.push(check_single_op(
             db,
             ctx,
@@ -156,7 +181,7 @@ pub(crate) fn prepare_ops(
             &planned_mkdirs,
             &trashed_entry_ids,
             &trashed_paths,
-            remote_keep,
+            remote_keep || restored,
             item,
         )?);
     }
@@ -295,7 +320,11 @@ fn resolve_input(
                 early_refused: early.or(dst_err),
             })
         }
-        OpInput::Trash { path, keep } => {
+        OpInput::Trash { path, .. } | OpInput::TrashLinked { path, .. } => {
+            let keep = match input {
+                OpInput::Trash { keep, .. } => keep.as_ref(),
+                _ => None,
+            };
             let clean = match clean_absolute_path(path) {
                 Ok(p) => p,
                 Err(reason) => {
@@ -304,7 +333,7 @@ fn resolve_input(
                         op: OpKind::Trash,
                         src: path.clone(),
                         dst: None,
-                        keep: keep.clone(),
+                        keep: keep.cloned(),
                         drive_id: None,
                         mount: None,
                         rel_path: None,
@@ -907,6 +936,18 @@ pub(crate) fn recheck_op_before_apply(db: &Db, ctx: &Context, op: &PlanOp) -> Re
                 .ok_or_else(|| "元が DB にありません".to_string())?;
             let verified = check_db_and_disk_source(db, &loc)?;
             check_matches_recorded(op, &verified)?;
+            if let Some(location) = op
+                .drive_id
+                .as_deref()
+                .and_then(|drive| crate::merged::Location::local(db, drive, &op.src))
+            {
+                match super::linked_delete::load_request(db, op)? {
+                    Some((_, request)) => {
+                        super::linked_delete::preflight(db, &location, &request, op)?
+                    }
+                    None => super::linked_delete::require_decision(db, &location, None)?,
+                }
+            }
 
             // trash のファイルは、実行の直前に中身をハッシュし直して DB（と計画）のハッシュと同じか見る。
             if verified.stored.kind == Kind::File
@@ -937,6 +978,12 @@ pub(crate) fn recheck_op_before_apply(db: &Db, ctx: &Context, op: &PlanOp) -> Re
                     if actual != expected {
                         return Err("残すファイルの中身が変わっています".into());
                     }
+                } else if verified.stored.kind == Kind::Dir
+                    && let Some(expected) = op.hash
+                    && (super::markers::folder_hash(&op.src)? != expected
+                        || super::markers::folder_hash(&path)? != expected)
+                {
+                    return Err("フォルダの完全ハッシュが一致しません".into());
                 }
             }
             Ok(())
@@ -944,7 +991,11 @@ pub(crate) fn recheck_op_before_apply(db: &Db, ctx: &Context, op: &PlanOp) -> Re
     }
 }
 
-fn keep_path_for_apply(db: &Db, plan_id: i64, keep: &Path) -> Result<Option<PathBuf>, String> {
+pub(super) fn keep_path_for_apply(
+    db: &Db,
+    plan_id: i64,
+    keep: &Path,
+) -> Result<Option<PathBuf>, String> {
     if fs::symlink_metadata(keep).is_ok() {
         return Ok(Some(keep.to_path_buf()));
     }

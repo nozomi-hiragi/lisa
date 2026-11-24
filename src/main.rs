@@ -9,7 +9,9 @@ mod dups;
 mod input;
 mod lan;
 mod layout;
+mod merged;
 mod model;
+mod open_marker;
 mod organize;
 mod preview;
 mod remote;
@@ -25,6 +27,10 @@ use bevy::window::PresentMode;
 
 fn main() {
     crash::install();
+    // 目印をダブルクリックされたとき、すでに動いている Lisa があればそちらで開いて終わる。
+    if open_marker::forward_to_running(&open_marker::marker_args()) {
+        return;
+    }
     if settings::load().lan_share >= 0.5 {
         lan::ensure_sidecar();
     }
@@ -89,6 +95,7 @@ fn main() {
         ui::organize::OrganizePanelPlugin,
         remote::RemotePlugin,
     ));
+    app.add_plugins(open_marker::OpenMarkerPlugin);
     app.add_plugins(ui::SidePanelScrollPlugin);
     app.add_plugins(render::diag::RenderDiagPlugin);
     #[cfg(debug_assertions)]

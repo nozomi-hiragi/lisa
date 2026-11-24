@@ -175,11 +175,89 @@ CREATE TABLE IF NOT EXISTS plan_op (
     done_at   INTEGER,
     PRIMARY KEY (plan_id, seq)
 );
+CREATE TABLE IF NOT EXISTS merge_marker (
+    plan_id INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    journal TEXT NOT NULL,
+    PRIMARY KEY (plan_id, seq)
+);
+CREATE TABLE IF NOT EXISTS merged_link (
+    link_id TEXT PRIMARY KEY,
+    source_device TEXT NOT NULL,
+    target_device TEXT NOT NULL,
+    target_volume TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    marker TEXT NOT NULL,
+    relay_device TEXT,
+    checked_at INTEGER NOT NULL,
+    sync_state TEXT NOT NULL,
+    sync_reason TEXT,
+    marker_checked_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS merged_link_target ON merged_link(target_device, target_volume, target_path);
+CREATE TABLE IF NOT EXISTS merged_link_outbox (
+    link_id TEXT PRIMARY KEY REFERENCES merged_link(link_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    queued_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS merged_link_outbox_age ON merged_link_outbox(queued_at, link_id);
+CREATE TABLE IF NOT EXISTS merged_link_relay (
+    link_id TEXT PRIMARY KEY,
+    source_device TEXT NOT NULL,
+    target_device TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    secret_hash BLOB NOT NULL,
+    marker_hash BLOB NOT NULL,
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    relocation_operation TEXT,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS merged_link_delete (
+    plan_id INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE,
+    request TEXT NOT NULL,
+    progress TEXT,
+    PRIMARY KEY(plan_id, seq),
+    FOREIGN KEY(plan_id, seq) REFERENCES plan_op(plan_id, seq) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS merged_link_receive (
+    operation_id TEXT NOT NULL,
+    link_id TEXT NOT NULL,
+    receipt TEXT NOT NULL,
+    touched_at INTEGER NOT NULL,
+    PRIMARY KEY(operation_id, link_id)
+);
+CREATE TABLE IF NOT EXISTS merged_link_transfer_progress (
+    operation_id TEXT PRIMARY KEY,
+    received INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    touched_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merged_link_rewrite (
+    operation_id TEXT NOT NULL,
+    link_id TEXT NOT NULL,
+    progress TEXT NOT NULL,
+    PRIMARY KEY(operation_id,link_id)
+);
+CREATE TABLE IF NOT EXISTS merged_link_relocation_target (
+    operation_id TEXT PRIMARY KEY,
+    marker TEXT NOT NULL,
+    generation INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merged_link_relocation_done (
+    operation_id TEXT NOT NULL,
+    link_id TEXT NOT NULL,
+    marker_hash BLOB NOT NULL,
+    PRIMARY KEY(operation_id,link_id)
+);
 ";
 
 /// `Stored` に読む列（`row_to_stored` と同じ順）。
-const COLUMNS: &str =
-    "id, name, name_nfc, kind, size, cloud_only, other_volume, error, listed, mtime, hash";
+const COLUMNS: &str = "id, name, name_nfc, kind, size, cloud_only, other_volume, error, listed, mtime, hash, merged, merged_verified";
 
 fn row_to_stored(r: &rusqlite::Row) -> Result<Stored> {
     let kind: String = r.get(3)?;
@@ -197,6 +275,10 @@ fn row_to_stored(r: &rusqlite::Row) -> Result<Stored> {
         hash: r
             .get::<_, Option<Vec<u8>>>(10)?
             .and_then(|h| h.try_into().ok()),
+        merged: r
+            .get::<_, Option<String>>(11)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
+        merged_verified: r.get(12)?,
         children: Vec::new(),
     })
 }
@@ -221,6 +303,8 @@ pub struct Stored {
     pub mtime: Option<i64>,
     /// 中身のハッシュ（blake3）。フォルダは子から作る Merkle。まだなら None。
     pub hash: Option<crate::hash::Hash>,
+    pub merged: Option<crate::merged::Marker>,
+    pub merged_verified: bool,
     /// 子（読んだときの並び = `name::hash_order`）。
     pub children: Vec<Stored>,
 }
@@ -284,6 +368,9 @@ impl Db {
         )?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS entry_merged ON entry(id) WHERE merged IS NOT NULL;",
+        )?;
         Ok(Self {
             instance: uuid::Uuid::new_v4(),
             conn,
@@ -925,6 +1012,8 @@ struct OldEntry {
     nlink: Option<i64>,
     cloud_only: bool,
     other_volume: bool,
+    merged: Option<String>,
+    merged_verified: bool,
 }
 
 struct ListingRow<'a> {
@@ -934,6 +1023,8 @@ struct ListingRow<'a> {
     size: i64,
     file_id: Option<i64>,
     nlink: Option<i64>,
+    merged: Option<String>,
+    merged_verified: bool,
 }
 
 struct ListingDiff<'a> {
@@ -953,7 +1044,7 @@ impl<'a> ListingDiff<'a> {
         let mut old = HashMap::with_capacity(listing.entries.len());
         {
             let mut select = conn.prepare_cached(
-                "SELECT name, id, pos, name_nfc, kind, size, mtime, file_id, nlink, cloud_only, other_volume
+                "SELECT name, id, pos, name_nfc, kind, size, mtime, file_id, nlink, cloud_only, other_volume, merged, merged_verified
                  FROM entry WHERE parent_id = ?1",
             )?;
             let mut rows = select.query([folder])?;
@@ -971,6 +1062,8 @@ impl<'a> ListingDiff<'a> {
                         nlink: r.get(8)?,
                         cloud_only: r.get(9)?,
                         other_volume: r.get(10)?,
+                        merged: r.get(11)?,
+                        merged_verified: r.get(12)?,
                     },
                 );
             }
@@ -988,7 +1081,14 @@ impl<'a> ListingDiff<'a> {
             };
             let file_id = entry.file_id.map(|i| i as i64);
             let nlink = entry.nlink.map(|n| n as i64);
+            let merged_verified = crate::organize::markers::verified(conn, entry)?;
+            let merged = entry
+                .merged
+                .as_ref()
+                .and_then(|marker| serde_json::to_string(marker).ok());
             let row = ListingRow {
+                merged,
+                merged_verified,
                 pos,
                 entry,
                 kind,
@@ -1000,8 +1100,11 @@ impl<'a> ListingDiff<'a> {
                 inserts.push(row);
                 continue;
             };
-            let content_changed =
-                previous.kind != kind || previous.size != size || previous.mtime != entry.mtime_ms;
+            let content_changed = previous.kind != kind
+                || previous.size != size
+                || previous.mtime != entry.mtime_ms
+                || previous.merged != row.merged
+                || previous.merged_verified != merged_verified;
             hash_changed |= content_changed;
             if content_changed
                 || previous.pos != pos
@@ -1040,8 +1143,8 @@ impl<'a> ListingDiff<'a> {
         if !self.inserts.is_empty() {
             let mut insert = conn.prepare_cached(
                 "INSERT INTO entry (drive_id, parent_id, pos, name, name_nfc, kind, size, mtime,
-                                    file_id, nlink, cloud_only, other_volume, status, listed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'unloaded', 0)
+                                    file_id, nlink, cloud_only, other_volume, status, listed, merged, merged_verified)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'unloaded', 0, ?13, ?14)
                  RETURNING id",
             )?;
             for ListingRow {
@@ -1051,6 +1154,8 @@ impl<'a> ListingDiff<'a> {
                 size,
                 file_id,
                 nlink,
+                merged,
+                merged_verified,
             } in self.inserts
             {
                 let id = insert.query_row(
@@ -1066,7 +1171,9 @@ impl<'a> ListingDiff<'a> {
                         file_id,
                         nlink,
                         entry.cloud_only,
-                        entry.other_volume
+                        entry.other_volume,
+                        merged,
+                        merged_verified
                     ],
                     |r| r.get(0),
                 )?;
@@ -1081,7 +1188,8 @@ impl<'a> ListingDiff<'a> {
                  file_id = ?7, nlink = ?8, cloud_only = ?9, other_volume = ?10,
                  hash = CASE WHEN ?11 THEN NULL ELSE hash END,
                  error = CASE WHEN ?11 THEN NULL ELSE error END,
-                 listed = CASE WHEN kind = ?4 THEN listed ELSE 0 END WHERE id = ?1",
+                 listed = CASE WHEN kind = ?4 THEN listed ELSE 0 END,
+                 merged = ?12, merged_verified = ?13 WHERE id = ?1",
             )?;
             for (
                 id,
@@ -1092,6 +1200,8 @@ impl<'a> ListingDiff<'a> {
                     size,
                     file_id,
                     nlink,
+                    merged,
+                    merged_verified,
                 },
                 content_changed,
             ) in self.updates
@@ -1107,7 +1217,9 @@ impl<'a> ListingDiff<'a> {
                     nlink,
                     entry.cloud_only,
                     entry.other_volume,
-                    content_changed
+                    content_changed,
+                    merged,
+                    merged_verified
                 ])?;
             }
         }
@@ -1132,6 +1244,8 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("algo", "TEXT"),
         ("hashed_size", "INTEGER"),
         ("hashed_mtime", "INTEGER"),
+        ("merged", "TEXT"),
+        ("merged_verified", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !columns.iter().any(|c| c == name) {
             conn.execute_batch(&format!("ALTER TABLE entry ADD COLUMN {name} {kind}"))?;
@@ -1158,7 +1272,7 @@ fn kind_from(name: &str) -> Kind {
     }
 }
 
-pub(crate) fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)

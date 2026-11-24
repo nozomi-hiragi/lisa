@@ -47,23 +47,41 @@ pub const DISCOVERY_FILE: &str = "relay-endpoints.json";
 const DISCOVERY_VALID_MS: i64 = 65_000;
 
 pub fn address(data_dir: &std::path::Path, route: &Route) -> std::net::SocketAddr {
-    let current = std::fs::read(data_dir.join(DISCOVERY_FILE))
-        .ok()
-        .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok());
-    current
-        .as_ref()
-        .and_then(|data| data.get(&route.requester_device))
-        .filter(|peer| {
-            peer["seen_at"].as_i64().is_some_and(|time| {
-                (0..=DISCOVERY_VALID_MS).contains(&db::now_ms().saturating_sub(time))
-            })
-        })
-        .and_then(|peer| peer["address"].as_str())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(route.address)
+    discovered_address(data_dir, &route.requester_device).unwrap_or(route.address)
 }
 
-pub type Client = fn(&std::path::Path, &Route, &KeepReference, RelayAction) -> Result<(), String>;
+pub fn discovered_address(
+    data_dir: &std::path::Path,
+    device: &str,
+) -> Option<std::net::SocketAddr> {
+    let data = std::fs::read(data_dir.join(DISCOVERY_FILE)).ok()?;
+    let current: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    let peer = current.get(device)?;
+    if !peer["seen_at"]
+        .as_i64()
+        .is_some_and(|time| (0..=DISCOVERY_VALID_MS).contains(&db::now_ms().saturating_sub(time)))
+    {
+        return None;
+    }
+    peer["address"].as_str()?.parse().ok()
+}
+
+/// 発見の記録の期限を問わず、最後に分かっている相手の宛先。応答を鍵で照合する呼び出しだけで使う。
+pub fn last_known_address(
+    data_dir: &std::path::Path,
+    device: &str,
+) -> Option<std::net::SocketAddr> {
+    let data = std::fs::read(data_dir.join(DISCOVERY_FILE)).ok()?;
+    let current: serde_json::Value = serde_json::from_slice(&data).ok()?;
+    current.get(device)?["address"].as_str()?.parse().ok()
+}
+
+pub type Client = fn(
+    &std::path::Path,
+    &Route,
+    &KeepReference,
+    RelayAction,
+) -> Result<Option<crate::merged::Location>, String>;
 
 /// 対象端末が依頼元に発行した既存のペアリング鍵で要求を署名する。
 pub fn client_call(
@@ -72,7 +90,7 @@ pub fn client_call(
     expected: &KeepReference,
     action: RelayAction,
     mut exchange: impl FnMut(serde_json::Value) -> Result<serde_json::Value, String>,
-) -> Result<(), String> {
+) -> Result<Option<crate::merged::Location>, String> {
     use serde_json::{Value, json};
     let config: Value =
         serde_json::from_slice(&std::fs::read(data_dir.join("lan.json")).map_err(display)?)
@@ -111,7 +129,7 @@ pub fn client_call(
     let result = reply.result;
     if action == RelayAction::Release {
         return if result["released"] == true {
-            Ok(())
+            Ok(None)
         } else {
             Err(invalid())
         };
@@ -131,7 +149,14 @@ pub fn client_call(
     {
         return Err("中継先の保持項目が計画と異なります。重複を再取得してください".into());
     }
-    Ok(())
+    let location = serde_json::from_value::<crate::merged::Location>(result["location"].clone())
+        .ok()
+        .filter(|location| {
+            location.device_id == expected.device_id
+                && location.volume_id == expected.drive_id
+                && location.valid()
+        });
+    Ok(location)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -373,4 +398,83 @@ mod tests {
         revoke(&db, "target", id).unwrap();
         assert!(authorize(&mut db, &proof(&call, key), key).is_err());
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LinkProof {
+    pub request_id: String,
+    pub update: crate::merged::links::Update,
+    pub secret: String,
+    pub signature: [u8; 32],
+}
+
+pub fn link_secret(grant_secret: &str, link_id: &str) -> String {
+    let key = blake3::derive_key("Lisa link relay secret v1", grant_secret.as_bytes());
+    blake3::keyed_hash(&key, link_id.as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+pub fn sign_link(
+    request: &str,
+    update: &crate::merged::links::Update,
+    secret: &str,
+    key: &str,
+    reply: bool,
+) -> Result<blake3::Hash, String> {
+    let payload = serde_json::to_vec(&(request, update, secret, reply)).map_err(display)?;
+    let key = blake3::derive_key("Lisa durable link relay v1", key.as_bytes());
+    Ok(blake3::keyed_hash(&key, &payload))
+}
+
+pub fn verify_link_signature(
+    request: &str,
+    update: &crate::merged::links::Update,
+    secret: &str,
+    key: &str,
+    reply: bool,
+    signature: [u8; 32],
+) -> Result<bool, String> {
+    Ok(sign_link(request, update, secret, key, reply)? == blake3::Hash::from_bytes(signature))
+}
+
+pub fn link_reservation(db: &Db, proof: &LinkProof) -> Result<(KeepReference, String), String> {
+    let (keep, lease): (String, String) = db
+        .conn()
+        .query_row(
+            "SELECT keep, lease FROM keep_relay_grant
+         WHERE target_device=?1 AND request_id=?2 AND secret_hash=?3
+           AND expires_at>?4 AND revoked=0 AND lease IS NOT NULL",
+            rusqlite::params![
+                proof.update.marker.source.device_id,
+                proof.request_id,
+                blake3::hash(proof.secret.as_bytes()).as_bytes().as_slice(),
+                db::now_ms()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| invalid())?;
+    Ok((serde_json::from_str(&keep).map_err(display)?, lease))
+}
+
+pub fn sign_transfer<T: Serialize>(
+    request: &super::super::TransferRequest,
+    response: Option<&T>,
+    key: &str,
+) -> Result<[u8; 32], String> {
+    let payload = serde_json::to_vec(&(request, response)).map_err(display)?;
+    let key = blake3::derive_key("Lisa merge transfer relay v1", key.as_bytes());
+    Ok(*blake3::keyed_hash(&key, &payload).as_bytes())
+}
+
+pub fn verify_transfer<T: Serialize>(
+    request: &super::super::TransferRequest,
+    response: Option<&T>,
+    key: &str,
+    signature: [u8; 32],
+) -> Result<bool, String> {
+    Ok(
+        blake3::Hash::from_bytes(sign_transfer(request, response, key)?)
+            == blake3::Hash::from_bytes(signature),
+    )
 }

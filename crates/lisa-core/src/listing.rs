@@ -55,6 +55,9 @@ pub struct Entry {
     /// NFC に正規化した名前。
     pub name_nfc: String,
     pub kind: Kind,
+    pub merged: Option<crate::merged::Marker>,
+    pub marker_identity: Option<(u64, [u8; 16])>,
+    pub marker_parent: Option<(u64, [u8; 16])>,
     /// バイト数。フォルダとリンクは OS が返す値そのまま（中の合計ではない）。
     pub size: u64,
     /// 更新日時（UTC の Unix 時刻、ミリ秒）。取れなければ None。
@@ -123,11 +126,25 @@ pub fn read_dir(dir: &Path) -> io::Result<Listing> {
         } else {
             None
         };
+        let merged = if kind == Kind::File {
+            crate::merged::read_with_metadata(&item.path(), &meta)
+        } else {
+            None
+        };
+        let marker_identity = merged
+            .as_ref()
+            .and_then(|_| crate::organize::file_identity(&item.path()));
+        let marker_parent = merged
+            .as_ref()
+            .and_then(|_| crate::organize::file_identity(dir));
         listing.entries.push(Entry {
             name_raw: name::raw_bytes(&file_name),
             name_nfc: name::nfc(&file_name),
             name: file_name,
             kind,
+            merged,
+            marker_identity,
+            marker_parent,
             size: meta.len(),
             mtime_ms: mtime_ms(&meta),
             file_id: file_id(&meta),

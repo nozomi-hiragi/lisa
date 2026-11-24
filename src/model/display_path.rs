@@ -277,6 +277,7 @@ mod tests {
         tree.add_remote_children(
             drive,
             vec![lisa_core::query::Item {
+                merged: None,
                 id,
                 name: "Root".into(),
                 kind: "dir".into(),

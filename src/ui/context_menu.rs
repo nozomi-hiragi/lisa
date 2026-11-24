@@ -141,6 +141,37 @@ pub struct Target {
     pub path_text: Option<String>,
 }
 
+/// ノード `node` を右クリックしたときと同じ対象（目印を開いたときの詳細にも使う）。
+pub(crate) fn target_of(
+    node: NodeId,
+    tree: &FileTree,
+    store: Option<&crate::scan::Store>,
+    nav: &Nav,
+    organize: Option<&crate::organize::OrganizeState>,
+) -> Target {
+    let local = if tree.marker_view_read_only(node) {
+        None
+    } else {
+        local_item_path(tree, store, node)
+    };
+    let local_movable =
+        tree.nodes[node].remote.is_none() && tree.nodes[node].depth >= 3 && local.is_some();
+    let path_text = local
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| remote_path_text(tree, node));
+    Target {
+        node,
+        is_open: nav.top().node == node,
+        at_root: nav.stack.len() < 2,
+        local_path: local,
+        is_dir: tree.nodes[node].is_dir,
+        local_movable,
+        cut_source: organize.and_then(|o| o.cut_source.clone()),
+        path_text,
+    }
+}
+
 /// 項目を押せるか。
 pub fn availability(action: ContextAction, target: &Target) -> bool {
     match action {
@@ -224,23 +255,7 @@ fn open_menu(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    let local = local_item_path(&tree, store.as_deref(), node);
-    let local_movable =
-        tree.nodes[node].remote.is_none() && tree.nodes[node].depth >= 3 && local.is_some();
-    let path_text = local
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or_else(|| remote_path_text(&tree, node));
-    let target = Target {
-        node,
-        is_open: nav.top().node == node,
-        at_root: nav.stack.len() < 2,
-        local_path: local,
-        is_dir: tree.nodes[node].is_dir,
-        local_movable,
-        cut_source: organize.as_ref().and_then(|o| o.cut_source.clone()),
-        path_text,
-    };
+    let target = target_of(node, &tree, store.as_deref(), &nav, organize.as_deref());
     let window_size = Vec2::new(window.width(), window.height());
     menu.open = Some(spawn_menu(
         &mut commands,
@@ -295,10 +310,22 @@ fn run_command(
     mut reader: MessageReader<ContextCommand>,
     mut clipboard: Option<ResMut<Clipboard>>,
     mut organize: Option<ResMut<crate::organize::OrganizeState>>,
+    tree: Res<FileTree>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
     for command in reader.read() {
         let target = &command.target;
+        if (target.node >= tree.nodes.len() || tree.marker_view_read_only(target.node))
+            && matches!(
+                command.action,
+                ContextAction::Reveal
+                    | ContextAction::Cut
+                    | ContextAction::Paste
+                    | ContextAction::Delete
+            )
+        {
+            continue;
+        }
         match command.action {
             ContextAction::Open => {
                 commands.insert_resource(NavRequest::ClickAt(command.world));

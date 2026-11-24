@@ -34,7 +34,7 @@ objc2-core-graphics = { version = "0.3.2", default-features = false, features = 
 # 動画のプレビュー（video.rs）で、AVAssetImageGenerator から 1 コマを取る。
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVAssetImageGenerator", "AVTime", "objc2-core-foundation", "objc2-core-media", "objc2-core-graphics"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMTime"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSURL", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSURL", "NSString", "NSArray"] }
 objc2-image-io = { version = "0.3.2", default-features = false, features = ["std", "CGImageSource", "CGImageProperties", "objc2-core-graphics"] }
 
 [profile.dev]
@@ -46,7 +46,7 @@ opt-level = 3
 [target.'cfg(windows)'.dependencies]
 # 落ちたときに小さな窓で知らせる（src/crash.rs）、管理者として動いているか見る（src/main.rs）、
 # ツールチップの日時をこの PC の時刻にする（src/ui/tooltip.rs）。
-windows-sys = { version = "0.61.2", features = ["Win32_System_Time", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Registry", "Win32_System_Time", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # DX12 も Vulkan も不安定な古い Intel GPU 向けに、`WGPU_BACKEND=gl` で OpenGL も選べるようにする
 # （Bevy の既定では Windows に OpenGL が入らない）。版は Bevy が使う wgpu に合わせる。
 wgpu = { version = "30.0.2", default-features = false, features = ["gles"] }

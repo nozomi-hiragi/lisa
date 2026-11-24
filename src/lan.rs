@@ -211,6 +211,10 @@ impl LanState {
             .map(|peer| (peer.device_id.as_str(), peer.name.as_str()))
     }
 
+    pub(crate) fn is_this_device(&self, id: &str) -> bool {
+        self.this_device_id == id
+    }
+
     /// ペアリング済みの相手を `device_id` で引く。
     pub(crate) fn saved_peer(&self, device_id: &str) -> Option<SavedPeer> {
         self.saved
@@ -662,26 +666,38 @@ fn poll_discovery(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            let relay_endpoints: serde_json::Map<_, _> = found
-                .iter()
-                .filter(|peer| {
-                    lan.authorized_peers
-                        .iter()
-                        .any(|allowed| allowed.device_id == peer.device_id)
-                })
-                .map(|peer| {
-                    (
-                        peer.device_id.clone(),
-                        json!({
-                            "address": SocketAddr::new(peer.addr,peer.port),
-                            "seen_at": seen_at,
-                        }),
-                    )
-                })
-                .collect();
             let path = lan
                 .data_dir
                 .join(lisa_core::organize::remote_keep::relay::DISCOVERY_FILE);
+            // 1 回の発見で取りこぼした相手も、前回の記録（期限は読む側が確かめる）を残す。
+            // 上書きすると、長い転送の途中で中継端末を見失って止まる。
+            let mut relay_endpoints: serde_json::Map<String, Value> = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            relay_endpoints.retain(|device, _| {
+                lan.authorized_peers
+                    .iter()
+                    .any(|allowed| &allowed.device_id == device)
+            });
+            relay_endpoints.extend(
+                found
+                    .iter()
+                    .filter(|peer| {
+                        lan.authorized_peers
+                            .iter()
+                            .any(|allowed| allowed.device_id == peer.device_id)
+                    })
+                    .map(|peer| {
+                        (
+                            peer.device_id.clone(),
+                            json!({
+                                "address": SocketAddr::new(peer.addr,peer.port),
+                                "seen_at": seen_at,
+                            }),
+                        )
+                    }),
+            );
             let tmp = path.with_extension("tmp");
             if let Ok(bytes) = serde_json::to_vec(&relay_endpoints)
                 && std::fs::write(&tmp, bytes).is_ok()
@@ -734,20 +750,44 @@ fn poll_discovery(
     }
 }
 
+/// 既定の経路で外へ出るときの、この PC の IPv4 アドレス（パケットは送らない）。
+fn primary_ipv4() -> Option<Ipv4Addr> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // 経路を決めるだけで、UDP の connect は何も送らない。
+    sock.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match sock.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() && !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
+}
+
 fn run_discovery(own_device_id: &str) -> Vec<DiscoveredPeer> {
     let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
         return Vec::new();
     };
-    let _ = sock.set_broadcast(true);
-    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
     let hello = make_hello_packet();
-    let _ = sock.send_to(&hello, (Ipv4Addr::BROADCAST, DISCOVERY_PORT));
-    let _ = sock.send_to(&hello, (Ipv4Addr::LOCALHOST, DISCOVERY_PORT));
+    let mut sockets = vec![sock];
+    // Windows は 255.255.255.255 宛てを、リンクローカルや VPN など LAN でないアダプタから出すことが
+    // ある。既定の経路のアドレスに結び付けたソケットからも送り、LAN に確実に届ける。
+    if let Some(ip) = primary_ipv4()
+        && let Ok(bound) = UdpSocket::bind((ip, 0))
+    {
+        sockets.push(bound);
+    }
+    for sock in &sockets {
+        let _ = sock.set_broadcast(true);
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = sock.send_to(&hello, (Ipv4Addr::BROADCAST, DISCOVERY_PORT));
+    }
+    let _ = sockets[0].send_to(&hello, (Ipv4Addr::LOCALHOST, DISCOVERY_PORT));
 
     let started = Instant::now();
     let mut map: HashMap<String, DiscoveredPeer> = HashMap::new();
     let mut buf = [0u8; 512];
+    let mut turn = 0usize;
     while started.elapsed() < DISCOVER_WAIT {
+        let sock = &sockets[turn % sockets.len()];
+        turn += 1;
         let Ok((n, src)) = sock.recv_from(&mut buf) else {
             continue;
         };
@@ -1159,7 +1199,12 @@ fn request_remote_nodes(
             continue;
         }
         let node = &tree.nodes[id];
-        if !node.is_dir || node.loaded || !node.listed || node.state == LoadState::Failed {
+        if !node.is_dir
+            || node.loaded
+            || !node.listed
+            || node.state == LoadState::Failed
+            || tree.marker_view_read_only(id)
+        {
             continue;
         }
         let Some(remote) = node.remote.clone() else {
@@ -1466,7 +1511,7 @@ fn fetch_drives(peer: &SavedPeer) -> Result<Vec<RemoteDrive>, (bool, String)> {
     Ok(out)
 }
 
-fn fetch_children(peer: &SavedPeer, entry_id: i64) -> Result<Vec<Item>, (bool, String)> {
+pub(crate) fn fetch_children(peer: &SavedPeer, entry_id: i64) -> Result<Vec<Item>, (bool, String)> {
     let mut all = Vec::new();
     let mut offset = 0usize;
     loop {

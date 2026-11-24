@@ -109,6 +109,56 @@ pub fn tree_bytes(children: &[Child]) -> Vec<u8> {
     bytes
 }
 
+pub(crate) struct NamedChild {
+    pub name: String,
+    pub raw_name: Vec<u8>,
+    pub kind: Kind,
+    pub hash: Option<Hash>,
+    pub size: u64,
+}
+
+pub(crate) fn tree_bytes_with_markers(
+    mut parts: Vec<NamedChild>,
+    mut markers: Vec<&crate::merged::Marker>,
+) -> Vec<u8> {
+    if !markers.is_empty() {
+        let mut seen: std::collections::HashSet<_> =
+            parts.iter().map(|part| part.raw_name.clone()).collect();
+        markers.sort_unstable_by_key(|marker| {
+            std::cmp::Reverse((marker.executed_at.unix_ms, marker.plan_id, marker.item_id))
+        });
+        for marker in markers {
+            let Some(name) = marker.source.relative_path.last() else {
+                continue;
+            };
+            let name = std::ffi::OsStr::new(name);
+            let raw_name = crate::name::raw_bytes(name);
+            if seen.insert(raw_name.clone())
+                && let Ok(hash) = blake3::Hash::from_hex(&marker.hash.value)
+            {
+                parts.push(NamedChild {
+                    name: crate::name::nfc(name),
+                    raw_name,
+                    kind: marker.kind,
+                    hash: Some(*hash.as_bytes()),
+                    size: marker.size,
+                });
+            }
+        }
+        parts.sort_by(|a, b| crate::name::hash_order(&a.name, &a.raw_name, &b.name, &b.raw_name));
+    }
+    let parts: Vec<_> = parts
+        .iter()
+        .map(|part| Child {
+            kind: part.kind,
+            name_nfc: &part.name,
+            hash: part.hash.as_ref(),
+            size: part.size,
+        })
+        .collect();
+    tree_bytes(&parts)
+}
+
 /// ハッシュの進み具合。
 pub enum Event<'a> {
     /// このフォルダの中のファイルをハッシュし始める。
@@ -221,7 +271,11 @@ impl Walker<'_> {
         let files: Vec<usize> = (0..children.len())
             .filter(|&i| {
                 let c = &children[i];
-                c.kind == Kind::File && !c.cloud_only && c.hash.is_none() && c.error.is_none()
+                c.kind == Kind::File
+                    && !c.merged_verified
+                    && !c.cloud_only
+                    && c.hash.is_none()
+                    && c.error.is_none()
             })
             .collect();
         if !files.is_empty() {
@@ -255,16 +309,36 @@ impl Walker<'_> {
             self.maybe_commit()?;
             return Ok(None);
         }
-        let parts: Vec<Child> = children
-            .iter()
-            .map(|c| Child {
-                kind: c.kind,
-                name_nfc: &c.name_nfc,
-                hash: c.hash.as_ref(),
-                size: c.size,
-            })
-            .collect();
-        let entries = tree_bytes(&parts);
+        let entries = if children.iter().any(|child| child.merged_verified) {
+            let real = children
+                .iter()
+                .filter(|child| !child.merged_verified)
+                .map(|child| NamedChild {
+                    name: child.name_nfc.clone(),
+                    raw_name: child.name_raw.clone(),
+                    kind: child.kind,
+                    hash: child.hash,
+                    size: child.size,
+                })
+                .collect();
+            let markers = children
+                .iter()
+                .filter(|child| child.merged_verified)
+                .filter_map(|child| child.merged.as_ref())
+                .collect();
+            tree_bytes_with_markers(real, markers)
+        } else {
+            let parts: Vec<_> = children
+                .iter()
+                .map(|child| Child {
+                    kind: child.kind,
+                    name_nfc: &child.name_nfc,
+                    hash: child.hash.as_ref(),
+                    size: child.size,
+                })
+                .collect();
+            tree_bytes(&parts)
+        };
         let hash = *blake3::hash(&entries).as_bytes();
         self.db.begin()?;
         self.db.set_hash(folder.id, &hash, 0, folder.mtime)?;

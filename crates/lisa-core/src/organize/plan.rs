@@ -23,6 +23,10 @@ pub enum OpInput {
         from: PathBuf,
         to: PathBuf,
     },
+    TrashLinked {
+        path: PathBuf,
+        decision: super::DeleteRequest,
+    },
     Trash {
         path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,6 +575,11 @@ fn create_plan_inner(
                 OpState::Pending.as_str(),
             ])
             .map_err(|e| e.to_string())?;
+        }
+    }
+    for (seq, op) in ops.iter().enumerate() {
+        if let OpInput::TrashLinked { decision, .. } = op {
+            super::linked_delete::save_request(&tx, plan_id, seq as i64, decision)?;
         }
     }
     let response = CreateResult {

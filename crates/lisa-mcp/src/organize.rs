@@ -29,6 +29,8 @@ impl Server {
         let settings = self.settings_path();
         let mut ctx = Context::load(self.data_dir.clone(), settings.as_deref());
         ctx.keep_client = Some(super::relay_client);
+        ctx.link_client = Some(super::link_relay_client);
+        ctx.relocation_client = Some(super::relocation_client);
         ctx
     }
 
