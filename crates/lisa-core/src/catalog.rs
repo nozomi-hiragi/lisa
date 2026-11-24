@@ -18,6 +18,7 @@ pub fn builtin() -> &'static [(&'static str, &'static str)] {
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
@@ -364,11 +365,17 @@ impl CatalogSet {
     /// 組み込みの型を先に読み、続いて `dirs` を順に読む。
     /// 同じ `id` は後に読んだ方で置き換える。
     pub fn load_with_builtin(dirs: &[PathBuf]) -> CatalogSet {
-        let mut set = CatalogSet::default();
-        for &(name, text) in builtin() {
-            let source = PathBuf::from(format!("builtin:{name}"));
-            set.push_parsed(source, parse(text));
-        }
+        static BUILTIN_SET: OnceLock<CatalogSet> = OnceLock::new();
+        let mut set = BUILTIN_SET
+            .get_or_init(|| {
+                let mut set = CatalogSet::default();
+                for &(name, text) in builtin() {
+                    let source = PathBuf::from(format!("builtin:{name}"));
+                    set.push_parsed(source, parse(text));
+                }
+                set
+            })
+            .clone();
         set.load_dirs(dirs);
         set
     }
