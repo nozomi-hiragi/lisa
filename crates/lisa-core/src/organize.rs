@@ -407,6 +407,7 @@ mod tests {
             };
             let pace = Pace {
                 background: true,
+                priority: None,
                 step: &step,
             };
             hash::hash_drive(&mut db, "test:vol1", &drive, 1, &mut |_| {}, &pace)

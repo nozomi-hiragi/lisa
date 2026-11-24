@@ -9,8 +9,58 @@
 
 /// このスレッドの I/O を、裏で読む分として後回しにする（`false` で元に戻す）。
 pub fn set_thread_background(on: bool) {
+    let _ = try_set_thread_background(on, 0);
+}
+
+#[derive(Clone, Copy)]
+struct PriorityFailure {
+    background: bool,
+    revision: u64,
+    error: i32,
+}
+
+thread_local! {
+    // 新しいスレッドは通常優先度から始まる。失敗も同じ変更の間は繰り返さない。
+    static PRIORITY: std::cell::Cell<(bool, Option<PriorityFailure>)> =
+        const { std::cell::Cell::new((false, None)) };
+}
+
+/// 優先度が変わるときだけ OS を呼び、変更できたら true。失敗時は OS のエラー番号を返す。
+pub fn try_set_thread_background(on: bool, revision: u64) -> Result<bool, i32> {
+    PRIORITY.with(|priority| {
+        let (current, failure) = priority.get();
+        if current == on {
+            priority.set((current, None));
+            return Ok(false);
+        }
+        if let Some(failure) = failure
+            && (failure.background, failure.revision) == (on, revision)
+        {
+            return Err(failure.error);
+        }
+        match change_thread_background(on) {
+            Ok(()) => {
+                priority.set((on, None));
+                Ok(true)
+            }
+            Err(error) => {
+                priority.set((
+                    current,
+                    Some(PriorityFailure {
+                        background: on,
+                        revision,
+                        error,
+                    }),
+                ));
+                Err(error)
+            }
+        }
+    })
+}
+
+fn change_thread_background(on: bool) -> Result<(), i32> {
     #[cfg(target_os = "macos")]
-    {
+    let ok = {
         use std::ffi::c_int;
         // <sys/resource.h>
         const IOPOL_TYPE_DISK: c_int = 0;
@@ -22,12 +72,10 @@ pub fn set_thread_background(on: bool) {
         }
         let policy = if on { IOPOL_THROTTLE } else { IOPOL_DEFAULT };
         // SAFETY: 引数は整数だけで、ポインタを渡さない。
-        unsafe {
-            setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, policy);
-        }
-    }
+        (unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, policy) }) == 0
+    };
     #[cfg(windows)]
-    {
+    let ok = {
         use windows_sys::Win32::System::Threading::{
             GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
             THREAD_MODE_BACKGROUND_END,
@@ -38,12 +86,18 @@ pub fn set_thread_background(on: bool) {
             THREAD_MODE_BACKGROUND_END
         };
         // SAFETY: 今のスレッドの擬似ハンドルを渡すだけ。
-        unsafe {
-            SetThreadPriority(GetCurrentThread(), mode);
-        }
-    }
+        (unsafe { SetThreadPriority(GetCurrentThread(), mode) }) != 0
+    };
     #[cfg(not(any(target_os = "macos", windows)))]
-    let _ = on;
+    let ok = {
+        let _ = on;
+        true
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
 }
 
 /// 電池で動いているか。分からなければ false。

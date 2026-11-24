@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 
 use crate::render::palette;
@@ -25,7 +26,7 @@ pub struct ProgressPlugin;
 impl Plugin for ProgressPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PostStartup, spawn_panel)
-            .add_systems(Update, show_progress);
+            .add_systems(Update, (show_progress, boost_hover));
     }
 }
 
@@ -33,10 +34,15 @@ impl Plugin for ProgressPlugin {
 struct Panel;
 
 #[derive(Component)]
-struct Summary;
+enum ProgressLine {
+    Summary,
+    Details,
+    Paths,
+    BoostLabel,
+}
 
 #[derive(Component)]
-struct Lines;
+struct BoostButton;
 
 fn spawn_panel(mut commands: Commands, font: Res<LabelFont>, progress: Option<Res<ScanProgress>>) {
     if progress.is_none() {
@@ -61,14 +67,84 @@ fn spawn_panel(mut commands: Commands, font: Res<LabelFont>, progress: Option<Re
             Pickable::IGNORE,
         ))
         .with_children(|panel| {
+            panel
+                .spawn((
+                    Node {
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    },
+                    Pickable::IGNORE,
+                ))
+                .with_children(|row| {
+                    row.spawn((
+                        ProgressLine::Summary,
+                        // 走査からハッシュへ移るときや連打したときにも、ボタンを同じ場所に置く。
+                        Node {
+                            min_width: Val::Px(144.0),
+                            ..default()
+                        },
+                        Text::new("読み込み中"),
+                        font.clone(),
+                        TextColor(TEXT_COLOR),
+                        Pickable::IGNORE,
+                    ));
+                    let (mut button, color) = super::menu::menu_button();
+                    button.display = Display::None;
+                    button.width = Val::Px(82.0);
+                    button.justify_content = JustifyContent::Center;
+                    button.border = UiRect::all(Val::Px(1.0));
+                    row.spawn((
+                        BoostButton,
+                        button,
+                        color,
+                        BorderColor::all(palette::NEUTRAL),
+                        Hovered::default(),
+                        children![(
+                            ProgressLine::BoostLabel,
+                            Text::new("ブースト"),
+                            font.clone(),
+                            TextColor(TEXT_COLOR),
+                            Pickable::IGNORE,
+                        )],
+                    ))
+                    .observe(toggle_boost);
+                    row.spawn((
+                        ProgressLine::Details,
+                        Text::new(""),
+                        font.clone(),
+                        TextColor(TEXT_COLOR),
+                        Pickable::IGNORE,
+                    ));
+                });
             panel.spawn((
-                Summary,
-                Text::new("読み込み中"),
-                font.clone(),
-                TextColor(TEXT_COLOR),
+                ProgressLine::Paths,
+                Text::new(""),
+                font,
+                TextColor(DIM_COLOR),
+                Pickable::IGNORE,
             ));
-            panel.spawn((Lines, Text::new(""), font, TextColor(DIM_COLOR)));
         });
+}
+
+fn toggle_boost(click: On<PointerClick>, control: Option<Res<crate::scan::ScanControl>>) {
+    if click.button == PointerButton::Primary
+        && let Some(control) = control
+    {
+        control.control.set_boost(!control.control.boost_status().1);
+    }
+}
+
+type ChangedBoostHover = (With<BoostButton>, Changed<Hovered>);
+
+fn boost_hover(mut buttons: Query<(&Hovered, &mut BackgroundColor), ChangedBoostHover>) {
+    for (hovered, mut color) in &mut buttons {
+        color.0 = if hovered.get() {
+            palette::BASE_100
+        } else {
+            palette::NEUTRAL
+        };
+    }
 }
 
 fn show_progress(
@@ -77,8 +153,8 @@ fn show_progress(
     control: Option<Res<crate::scan::ScanControl>>,
     mut last: Local<Option<Instant>>,
     mut panel: Query<&mut Visibility, With<Panel>>,
-    mut summary: Query<&mut Text, (With<Summary>, Without<Lines>)>,
-    mut lines: Query<&mut Text, (With<Lines>, Without<Summary>)>,
+    mut button: Query<&mut Node, With<BoostButton>>,
+    mut text: Query<(&ProgressLine, &mut Text)>,
 ) {
     let Some(progress) = progress else {
         return;
@@ -102,9 +178,23 @@ fn show_progress(
         String::new()
     };
     let hash = &p.hash;
-    let (head, body) = match (p.finished, hash.started, hash.finished) {
+    let (working, boosted, priority_failed) = control
+        .as_ref()
+        .map_or((false, false, false), |c| c.control.boost_status());
+    let mode = if boosted { "・ブースト中" } else { "" };
+    let display = if working {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if let Ok(mut node) = button.single_mut()
+        && node.display != display
+    {
+        node.display = display;
+    }
+    let (head, details, body) = match (p.finished, hash.started, hash.finished) {
         // 読み終えて、ハッシュも終えた（か、ハッシュしない）。
-        (Some(at), started, finished) if started.is_none() || finished.is_some() => {
+        (Some(at), started, finished) if !working && (started.is_none() || finished.is_some()) => {
             let at = finished.unwrap_or(at);
             if let Ok(mut v) = panel.single_mut() {
                 *v = if at.elapsed() >= HIDE_AFTER {
@@ -125,7 +215,7 @@ fn show_progress(
                     p.done
                 ),
             };
-            (head, String::new())
+            (head, String::new(), String::new())
         }
         // ハッシュしている。
         (Some(_), Some(started), None) => {
@@ -142,8 +232,9 @@ fn show_progress(
                 );
             }
             (
+                format!("ハッシュ中{mode}"),
                 format!(
-                    "ハッシュ中  {} ファイル・{}・1 秒に {}",
+                    "{} ファイル・{}・1 秒に {}",
                     hash.files,
                     bytes(hash.bytes),
                     bytes(speed as u64)
@@ -152,6 +243,9 @@ fn show_progress(
             )
         }
         _ => {
+            if let Ok(mut v) = panel.single_mut() {
+                *v = Visibility::Inherited;
+            }
             let mut body = Vec::new();
             if let Some(current) = &p.current {
                 body.push(format!(
@@ -166,8 +260,9 @@ fn show_progress(
                 )
             }));
             (
+                format!("読み込み中{mode}"),
                 format!(
-                    "読み込み中  {} フォルダ{failed}・あと {}・1 秒に {rate:.0}",
+                    "{} フォルダ{failed}・あと {}・1 秒に {rate:.0}",
                     p.done, p.queued
                 ),
                 body.join("\n"),
@@ -176,24 +271,28 @@ fn show_progress(
     };
     // 裏の分を休んでいるなら、その理由を添える。
     let rest = control.map_or(crate::scan::Rest::No, |c| c.control.rest());
-    let working = p.finished.is_none() || (hash.started.is_some() && hash.finished.is_none());
-    let head = match rest {
-        _ if !working => head,
-        crate::scan::Rest::No => head,
-        crate::scan::Rest::Paused => format!("{head}（一時停止中）"),
-        crate::scan::Rest::Battery => format!("{head}（電池なので休み中）"),
-        crate::scan::Rest::Cpu => format!("{head}（CPU が混んでいるので休み中）"),
-        crate::scan::Rest::Disk => format!("{head}（ディスクが混んでいるので休み中）"),
+    let mut details = match rest {
+        _ if !working => details,
+        crate::scan::Rest::No => details,
+        crate::scan::Rest::Paused => format!("{details}（一時停止中）"),
+        crate::scan::Rest::Battery => format!("{details}（電池なので休み中）"),
+        crate::scan::Rest::Cpu => format!("{details}（CPU が混んでいるので休み中）"),
+        crate::scan::Rest::Disk => format!("{details}（ディスクが混んでいるので休み中）"),
     };
-    if let Ok(mut text) = summary.single_mut()
-        && text.0 != head
-    {
-        text.0 = head;
+    if working && priority_failed {
+        details.push_str("（OS優先度の変更に失敗）");
     }
-    if let Ok(mut text) = lines.single_mut()
-        && text.0 != body
-    {
-        text.0 = body;
+    for (line, mut text) in &mut text {
+        let next = match line {
+            ProgressLine::Summary => head.as_str(),
+            ProgressLine::Details => details.as_str(),
+            ProgressLine::Paths => body.as_str(),
+            ProgressLine::BoostLabel if boosted => "通常に戻す",
+            ProgressLine::BoostLabel => "ブースト",
+        };
+        if text.0 != next {
+            text.0 = next.into();
+        }
     }
 }
 
