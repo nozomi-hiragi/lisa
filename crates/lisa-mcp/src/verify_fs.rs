@@ -14,9 +14,26 @@ use super::err;
 const PREFIX: &str = "lisa-verify-";
 const MAX_WRITE_BYTES: u64 = 4 << 30;
 
-pub(super) fn call(args: &Value) -> Result<Value, String> {
+pub(super) fn call(data_dir: &Path, args: &Value) -> Result<Value, String> {
     if args["action"] == "processes" {
         return processes();
+    }
+    // 端末間の中継先として最後に見つけた相手（読むだけ）。
+    if args["action"] == "relay_endpoints" {
+        let path = data_dir.join(lisa_core::organize::remote_keep::relay::DISCOVERY_FILE);
+        return Ok(json!({
+            "text": std::fs::read_to_string(path).ok(),
+            "lan": super::load_lan_config(data_dir).peers.iter().map(|peer| peer.device_id.clone()).collect::<Vec<_>>(),
+        }));
+    }
+    if args["action"] == "net" {
+        return powershell_json(
+            "Get-NetIPAddress -AddressFamily IPv4 | Select-Object InterfaceAlias,IPAddress,PrefixLength | ConvertTo-Json; \
+             Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Select-Object InterfaceAlias,NextHop,RouteMetric,InterfaceMetric | ConvertTo-Json",
+        );
+    }
+    if args["action"] == "assoc" {
+        return associations();
     }
     let path = allowed(args["path"].as_str().ok_or("path が要ります")?)?;
     match args["action"].as_str().unwrap_or("") {
@@ -42,6 +59,15 @@ pub(super) fn call(args: &Value) -> Result<Value, String> {
             stat(&path)
         }
         "stat" => stat(&path),
+        "read" => {
+            let bytes = std::fs::read(&path).map_err(err)?;
+            if bytes.len() > 1 << 20 {
+                return Err("大きすぎます".into());
+            }
+            Ok(json!({"text": String::from_utf8_lossy(&bytes)}))
+        }
+        // エクスプローラーのダブルクリックと同じ既定の動作（ShellExecute の open）で開く。
+        "shell_open" => shell_open(&path),
         "tree" => {
             let mut out = Vec::new();
             walk(&path, &mut out)?;
@@ -230,4 +256,61 @@ fn processes() -> Result<Value, String> {
     }
     let output = command.output().map_err(err)?;
     serde_json::from_slice(&output.stdout).map_err(err)
+}
+
+/// ShellExecute の既定の動作で開く（エクスプローラーのダブルクリック相当）。
+fn shell_open(path: &Path) -> Result<Value, String> {
+    if !cfg!(windows) {
+        return Err("Windows だけで使えます".into());
+    }
+    const SCRIPT: &str = "Start-Process -FilePath $env:LISA_VERIFY_PATH";
+    let mut command = std::process::Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("LISA_VERIFY_PATH", path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().map_err(err)?;
+    Ok(json!({
+        "status": output.status.code(),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+    }))
+}
+
+/// 今のユーザーの .lmf・.lmd の関連付け（読むだけ）。
+fn associations() -> Result<Value, String> {
+    if !cfg!(windows) {
+        return Err("Windows だけで使えます".into());
+    }
+    const SCRIPT: &str = r#"
+$o = [ordered]@{}
+foreach ($k in 'HKCU:\Software\Classes\.lmf','HKCU:\Software\Classes\.lmd','HKCU:\Software\Classes\.lmf\OpenWithProgids','HKCU:\Software\Classes\.lmd\OpenWithProgids','HKCU:\Software\Classes\Lisa.MergedLink\shell\open\command','HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.lmf\UserChoice','HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.lmd\UserChoice') {
+  if (Test-Path $k) { $o[$k] = (Get-ItemProperty -LiteralPath $k | Select-Object * -ExcludeProperty PS* | ConvertTo-Json -Compress) } else { $o[$k] = $null }
+}
+$o | ConvertTo-Json
+"#;
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().map_err(err)?;
+    serde_json::from_slice(&output.stdout).map_err(err)
+}
+
+fn powershell_json(script: &str) -> Result<Value, String> {
+    let mut command = std::process::Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().map_err(err)?;
+    Ok(json!({"stdout": String::from_utf8_lossy(&output.stdout)}))
 }
