@@ -50,6 +50,8 @@ pub enum Request {
     ManualWake,
     /// このフォルダを今見ている（1 段読み直し、ハッシュの無いものをハッシュする）。
     Visible(PathBuf),
+    /// 整理で DB も更新済みのフォルダを、一覧とプレビューに反映する。
+    Refresh(PathBuf),
     /// このフォルダの中が変わったらしい（監視からの知らせ。裏の分として読み直す）。
     Hint(PathBuf),
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 1 段読み直し、DB と同じでも `Changed -> Listed -> Committed` を送る。
@@ -408,8 +410,17 @@ pub(super) struct Worker {
     pub pending_visible: Option<PathBuf>,
     /// 監視から知らされた、読み直すフォルダ（同じものは 1 つにまとめる）。
     pub hints: std::collections::BTreeSet<PathBuf>,
+    /// DB の競合で強制読み直しを保留したフォルダ。
+    pub refresh_hints: std::collections::BTreeSet<PathBuf>,
     /// 隔離フォルダなど、読む係が飛ばすフォルダの絶対パス。
     pub skip_dirs: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RereadMode {
+    Detect,
+    Debug,
+    Organize,
 }
 
 enum StoreOutcome {
@@ -543,7 +554,12 @@ impl Worker {
                     p.current = Some(path.clone());
                     p.queued = self.hints.len();
                 });
-                if !self.reread(&path, true) {
+                let mode = if self.refresh_hints.remove(&path) {
+                    RereadMode::Organize
+                } else {
+                    RereadMode::Detect
+                };
+                if !self.reread_mode(&path, true, mode) {
                     return;
                 }
                 self.dirty |= self.hash_ready(HASH_SCHEDULED).unwrap_or(true);
@@ -941,7 +957,10 @@ impl Worker {
         for ((path, result), saved) in batch.into_iter().zip(saved) {
             failed += u64::from(result.is_err());
             if (matches!(saved, ListingSave::Changed)
-                && !self.send(Message::Changed { path: path.clone() }))
+                && !self.send(Message::Changed {
+                    path: path.clone(),
+                    refresh_children: None,
+                }))
                 || !self.send(Message::Listed {
                     path,
                     result,
@@ -963,7 +982,7 @@ impl Worker {
         path: PathBuf,
     ) -> (bool, u64, u64) {
         let mut failed = false;
-        let outcome = self.store(index, &path, false, |result| {
+        let outcome = self.store(index, &path, RereadMode::Detect, |result| {
             failed = result.is_err();
             push_initial_children(stack, index, &path, result);
         });
@@ -1043,9 +1062,20 @@ impl Worker {
             Request::ManualWake => self.run_manual_queue(),
             Request::Visible(path) => {
                 // 見ているところは、知らせがあっても今読み直すので、二度は読まない。
-                self.hints.remove(&path);
+                if !self.refresh_hints.contains(&path) {
+                    self.hints.remove(&path);
+                }
                 self.control.urgent.fetch_sub(1, Ordering::Relaxed);
                 self.run_manual_queue() && self.visible(&path)
+            }
+            Request::Refresh(path) => {
+                self.control.urgent.fetch_sub(1, Ordering::Relaxed);
+                let Some(path) = self.locate(&path) else {
+                    return true;
+                };
+                self.refresh_hints.remove(&path);
+                self.hints.remove(&path);
+                self.reread_mode(&path, false, RereadMode::Organize)
             }
             Request::Hint(path) => {
                 if let Some(path) = self.locate(&path)
@@ -1141,6 +1171,10 @@ impl Worker {
     /// フォルダ `path` を 1 段読み直す（`background` なら I/O を後回しに）。変わっていたら、新しく
     /// できたフォルダの中も読み、あとで裏でハッシュし直す。UI が閉じたら false。
     fn reread(&mut self, path: &Path, background: bool) -> bool {
+        self.reread_mode(path, background, RereadMode::Detect)
+    }
+
+    fn reread_mode(&mut self, path: &Path, background: bool, mode: RereadMode) -> bool {
         if background {
             self.control.apply_priority();
         } else {
@@ -1164,7 +1198,7 @@ impl Worker {
             alive,
             changed,
             first,
-        } = self.store_reread(index, path, false)
+        } = self.store_reread(index, path, mode)
         else {
             return true;
         };
@@ -1172,6 +1206,28 @@ impl Worker {
             return false;
         }
         self.dirty |= changed || first;
+        if mode == RereadMode::Organize {
+            let root = &self.roots[index];
+            let already_hashed = self
+                .db
+                .as_ref()
+                .zip(root.drive_id.as_ref())
+                .and_then(|(db, drive)| {
+                    let id = db.find_folder_ref(drive, &root.mount, path).ok()??;
+                    db.entry(id).ok()?.and_then(|entry| entry.hash)
+                })
+                .is_some();
+            if already_hashed {
+                let alive = self.send(Message::Hashed {
+                    path: path.to_path_buf(),
+                });
+                self.wake();
+                if !alive {
+                    return false;
+                }
+            }
+        }
+
         if !background {
             if changed || first {
                 self.hints.insert(path.to_path_buf());
@@ -1198,7 +1254,7 @@ impl Worker {
             return true;
         }
         !matches!(
-            self.store_reread(index, &path, true),
+            self.store_reread(index, &path, RereadMode::Debug),
             StoreOutcome::Published { alive: false, .. }
         )
     }
@@ -1243,7 +1299,7 @@ impl Worker {
                     if background {
                         self.control.apply_priority();
                     }
-                    match self.store_reread(index, &child_path, false) {
+                    match self.store_reread(index, &child_path, RereadMode::Detect) {
                         StoreOutcome::Published { alive: false, .. } => return false,
                         StoreOutcome::Published { .. } => stack.push(child_path),
                         StoreOutcome::Busy => {}
@@ -1308,10 +1364,13 @@ impl Worker {
         alive
     }
 
-    fn store_reread(&mut self, index: usize, path: &Path, force_changed: bool) -> StoreOutcome {
-        let outcome = self.store(index, path, force_changed, |_| {});
+    fn store_reread(&mut self, index: usize, path: &Path, mode: RereadMode) -> StoreOutcome {
+        let outcome = self.store(index, path, mode, |_| {});
         if matches!(outcome, StoreOutcome::Busy) {
             self.hints.insert(path.to_path_buf());
+            if mode == RereadMode::Organize {
+                self.refresh_hints.insert(path.to_path_buf());
+            }
         }
         outcome
     }
@@ -1321,12 +1380,12 @@ impl Worker {
         &mut self,
         index: usize,
         path: &Path,
-        force_changed: bool,
+        mode: RereadMode,
         on_read: impl FnOnce(&Result<listing::Listing, String>),
     ) -> StoreOutcome {
         let root = &self.roots[index];
         let mut stored = false;
-        let mut changed = force_changed;
+        let mut changed = mode != RereadMode::Detect;
         let mut first = false;
         let mut retries = 0;
         let result = loop {
@@ -1387,6 +1446,16 @@ impl Worker {
         let alive = (!changed
             || self.send(Message::Changed {
                 path: path.to_path_buf(),
+                refresh_children: (mode == RereadMode::Organize).then(|| {
+                    result
+                        .as_ref()
+                        .ok()
+                        .into_iter()
+                        .flat_map(|listing| &listing.entries)
+                        .filter(|entry| super::readable(entry))
+                        .map(|entry| path.join(&entry.name))
+                        .collect()
+                }),
             }))
             && self.send(Message::Listed {
                 path: path.to_path_buf(),
@@ -1468,6 +1537,72 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 整理の読み直しは一覧が同じでも通知してハッシュ処理を起こす() {
+        let temp = crate::preview::TestTemp::new();
+        let mount = temp.0.join("volume");
+        let child = mount.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let drive = "test:organize-refresh";
+        let mut db = Db::open_in_memory().unwrap();
+        let device = db.this_device("test", "test", "test").unwrap();
+        db.upsert_drive(
+            &device,
+            &lisa_core::volumes::Volume {
+                id: Some(drive.into()),
+                mount_path: mount.clone(),
+                ..super::super::root_volume()
+            },
+        )
+        .unwrap();
+        let listing = listing::read_dir(&mount).map_err(|err| err.to_string());
+        db.save_listing(drive, &mount, &mount, &listing).unwrap();
+        assert!(matches!(
+            db.save_listing_at(drive, &mount, &mount, &listing, None)
+                .unwrap(),
+            ListingSave::Unchanged
+        ));
+
+        let (sender, results) = std::sync::mpsc::channel();
+        let (_send, requests) = std::sync::mpsc::channel();
+        let control = Arc::new(Control::default());
+        control.urgent.store(1, Ordering::Relaxed);
+        let mut worker = Worker {
+            db: Some(db),
+            roots: vec![Root {
+                node: 0,
+                drive_id: Some(drive.into()),
+                mount: mount.clone(),
+                mount_identity: lisa_core::volumes::mount_identity(&mount),
+                listed: true,
+            }],
+            sender,
+            requests,
+            proxy: None,
+            progress: Arc::new(Mutex::new(Progress::default())),
+            control: control.clone(),
+            dirty: false,
+            hash_retry_needed: false,
+            hash_stats_at: None,
+            pending_visible: None,
+            hints: Default::default(),
+            refresh_hints: Default::default(),
+            skip_dirs: vec![],
+        };
+        assert!(worker.handle(Request::Refresh(mount.clone())));
+        assert!(worker.dirty);
+        assert_eq!(control.urgent.load(Ordering::Relaxed), 0);
+        let sent = results.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            sent.as_slice(),
+            [
+                Message::Changed { path: changed, refresh_children: Some(children) },
+                Message::Listed { path: listed, stored: true, .. },
+                Message::Committed
+            ] if changed == &mount && listed == &mount && children == &[child]
+        ));
+    }
 
     #[test]
     fn busy_initial_folder_remains_pending_without_counting_as_finished() {

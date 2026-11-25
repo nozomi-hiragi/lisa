@@ -321,7 +321,7 @@ fn handle(
             }
             Command::Rescan { path } => match &control {
                 Some(control) if path.is_dir() => {
-                    control.visible(path);
+                    control.refresh_after_organize(path);
                     dups.invalidate();
                     dups.refresh_after_scan = true;
                     Ok(())

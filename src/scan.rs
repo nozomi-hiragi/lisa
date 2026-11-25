@@ -265,6 +265,13 @@ impl Store {
             .map(|target| target.chain)
     }
 
+    fn entry_chain_for(&self, entry: i64) -> Option<Vec<i64>> {
+        let db = self.reader.as_ref()?.lock().ok()?;
+        lisa_core::query::path_of(&db, entry)
+            .ok()?
+            .map(|item| item.chain)
+    }
+
     /// ノード `id` があるドライブの DB ID。DB に残さないドライブなら None。
     pub(crate) fn drive_id_of(&self, tree: &FileTree, id: NodeId) -> Option<String> {
         drive_of(tree, self, id).map(|(drive_id, _)| drive_id)
@@ -499,11 +506,9 @@ impl ScanControl {
         Some(rx)
     }
 
-    /// 整理で触ったフォルダなどを、裏の分として読み直してもらう（`Request::Hint`）。
-    pub(crate) fn hint(&self, path: PathBuf) {
-        if let Ok(sender) = self.requests.lock() {
-            let _ = sender.send(worker::Request::Hint(path));
-        }
+    /// 整理による DB の更新を、一覧が同じ場合も画面に反映する。
+    pub(crate) fn refresh_after_organize(&self, path: PathBuf) {
+        self.send_urgent(worker::Request::Refresh(path));
     }
 
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: フォルダを「変わっていた」扱いにして読み直す。
@@ -705,6 +710,7 @@ enum Message {
     /// 読み直したら DB と違っていた（このあと `Listed` が来る）。
     Changed {
         path: PathBuf,
+        refresh_children: Option<Vec<PathBuf>>,
     },
     /// ここまでに書いたものを確定した。
     Committed,
@@ -747,6 +753,7 @@ fn start_workers(
         hash_stats_at: None,
         pending_visible: None,
         hints: Default::default(),
+        refresh_hints: Default::default(),
         skip_dirs,
     };
     let watched: Vec<PathBuf> = worker
@@ -990,7 +997,20 @@ fn receive(
                 }
                 scanner.hashed.insert(path);
             }
-            Message::Changed { path } => {
+            Message::Changed {
+                path,
+                refresh_children,
+            } => {
+                if let Some(children) = refresh_children {
+                    invalidated.extend(children);
+                    invalidated.extend(
+                        scanner
+                            .folders
+                            .keys()
+                            .filter(|child| child.parent() == Some(path.as_path()))
+                            .cloned(),
+                    );
+                }
                 if let Some(mount) = store
                     .roots
                     .values()
@@ -1248,6 +1268,16 @@ pub(crate) fn resolve_location(
     }
     match location {
         crate::view::Location::Local(chain) => {
+            // CLI や MCP から動かした開いているフォルダも、維持された entry.id で追う。
+            let moved = if let Some(&entry) = chain.last()
+                && let Some(current) = store.and_then(|store| store.entry_chain_for(entry))
+                && current != *chain
+            {
+                *chain = current;
+                true
+            } else {
+                false
+            };
             let Some(&first_entry) = chain.first() else {
                 return vec![FileTree::ROOT];
             };
@@ -1257,6 +1287,21 @@ pub(crate) fn resolve_location(
             };
             let mut reader = store.and_then(|s| s.reader.as_ref()?.lock().ok());
             for &entry in &chain[1..] {
+                // 移動元の通知が先に届いても、移動先の既読一覧を DB から出し直す。
+                if moved
+                    && tree.nodes[node].loaded
+                    && !tree.nodes[node]
+                        .children
+                        .iter()
+                        .any(|&child| tree.nodes[child].entry == Some(entry))
+                    && let Some(sc) = scanner.as_deref_mut()
+                {
+                    sc.remove_descendants(tree, node);
+                    if let Some(path) = &tree.nodes[node].path {
+                        sc.recent.remove(path);
+                    }
+                    tree.reset_children(node);
+                }
                 if !tree.nodes[node].loaded
                     && let (Some(store), Some(sc)) = (store, scanner.as_deref_mut())
                     && !load_children(tree, store, reader.as_deref_mut(), sc, node)
@@ -1394,6 +1439,7 @@ mod tests {
             hash_stats_at: None,
             pending_visible: None,
             hints: Default::default(),
+            refresh_hints: Default::default(),
             skip_dirs: vec![],
         };
         let mut scanner = Scanner {
@@ -1679,6 +1725,8 @@ mod tests {
             std::env::temp_dir().join(format!("lisa-rename-location-{}", std::process::id()));
         let folder = mount.join("Numéro");
         let target = folder.join("child");
+        let destination = mount.join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         let volume = lisa_core::volumes::Volume {
             id: Some("test:rename".into()),
@@ -1724,6 +1772,56 @@ mod tests {
             Some(&target)
         );
         assert!(matches!(location, Location::Local(_)));
+        // 古い移動先の一覧がまだ表示されていても、移動元からの通知だけで追従できる。
+        let mut destination_location = Location::Local(store.entry_chain_at(&destination).unwrap());
+        let destination_nodes = resolve_location(
+            &mut tree,
+            Some(&store),
+            Some(&mut scanner),
+            &mut destination_location,
+        );
+        let destination_node = *destination_nodes.last().unwrap();
+        let moved = destination.join("child");
+        {
+            let mut db = store.reader.as_ref().unwrap().lock().unwrap();
+            save(&mut db, &destination);
+            let _ = load_children(
+                &mut tree,
+                &store,
+                Some(&mut db),
+                &mut scanner,
+                destination_node,
+            );
+            assert!(tree.nodes[destination_node].loaded);
+            let ctx = lisa_core::organize::Context::with_builtin(mount.join("organize-state"));
+            let plan = lisa_core::organize::create_plan(
+                &mut db,
+                &ctx,
+                "test",
+                None,
+                &[lisa_core::organize::OpInput::Move {
+                    from: target,
+                    to: moved.clone(),
+                }],
+                false,
+            )
+            .unwrap()
+            .id
+            .unwrap();
+            lisa_core::organize::approve_plan(&mut db, plan, false).unwrap();
+            assert_eq!(
+                lisa_core::organize::execute_plan(&mut db, &ctx, plan)
+                    .unwrap()
+                    .done,
+                1
+            );
+        }
+        let resolved = resolve_location(&mut tree, Some(&store), Some(&mut scanner), &mut location);
+        assert_eq!(
+            tree.nodes[*resolved.last().unwrap()].path.as_ref(),
+            Some(&moved)
+        );
+
         std::fs::remove_dir_all(mount).unwrap();
     }
 
