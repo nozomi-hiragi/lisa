@@ -4,6 +4,7 @@ pub mod cartridges;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -221,6 +222,7 @@ fn preview_geometry(
 }
 
 /// カートリッジの絵を描く。画像がまだ無い場合やテキストには、折れ耳の紙を敷く。
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     registry: &PreviewRegistry,
     painter: &mut Painter,
@@ -229,6 +231,7 @@ pub fn draw(
     background: Color,
     z: f32,
     loaded: Option<Preview>,
+    simple: bool,
 ) {
     let cartridge = registry.pick(name);
     let portrait_a4 = cartridge.portrait_a4();
@@ -237,6 +240,10 @@ pub fn draw(
     let base = over(background, palette::BASE_100, 0.80);
     let page = over(base, file_accent, 0.55);
     if let Some(paper_frame) = paper_rect {
+        if simple {
+            painter.rect(paper_frame, page, z);
+            return;
+        }
         let fold = over(base, file_accent, 0.88);
         let border = over(page, file_accent, 0.38);
         let border_w = (frame.height() * 0.015).max(painter.scale);
@@ -265,15 +272,7 @@ pub fn draw(
             page,
             z,
         );
-        painter.triangle(
-            [
-                Vec2::new(paper_frame.max.x - c, paper_frame.max.y),
-                Vec2::new(paper_frame.max.x - c, paper_frame.max.y - c),
-                Vec2::new(paper_frame.max.x, paper_frame.max.y - c),
-            ],
-            fold,
-            z,
-        );
+        painter.right_triangle(paper_frame.max - Vec2::splat(c), c, fold, z);
         let (min, max) = (paper_frame.min, paper_frame.max);
         for rect in [
             Rect::new(min.x, min.y, max.x, min.y + border_w),
@@ -370,14 +369,14 @@ impl PreviewRegistry {
     pub(crate) fn request_capture(&mut self, tree: &crate::model::tree::FileTree, folder: usize) {
         let mut files = self.folder_files(tree, folder);
         files.truncate(MAX_IMAGES);
-        self.images.capture = self.images.request_files(files);
+        self.images.request_files(files, Scope::Capture);
     }
 
     pub(crate) fn capture_pending(&self) -> bool {
-        self.images
-            .capture
-            .values()
-            .any(|key| self.images.requested.contains_key(key) && !self.images.order.contains(key))
+        self.images.capture_pending
+            || self.images.capture.values().any(|key| {
+                self.images.requested.contains_key(key) && !self.images.order.contains(key)
+            })
     }
 }
 
@@ -394,20 +393,6 @@ fn files_signature(tree: &crate::model::tree::FileTree, folder: usize) -> u64 {
     hasher.finish()
 }
 
-/// 中身が手元に無い（iCloud などのクラウドにだけある）ファイルか。
-#[cfg(target_os = "macos")]
-fn cloud_only(meta: &std::fs::Metadata) -> bool {
-    use std::os::macos::fs::MetadataExt;
-    /// `SF_DATALESS`（sys/stat.h）。
-    const SF_DATALESS: u32 = 0x4000_0000;
-    meta.st_flags() & SF_DATALESS != 0
-}
-
-#[cfg(not(target_os = "macos"))]
-fn cloud_only(_meta: &std::fs::Metadata) -> bool {
-    false
-}
-
 /// 読んだ絵の数の上限。超えたら古いものから捨てる。
 const MAX_IMAGES: usize = 500;
 /// 裏で読むスレッドの数。
@@ -421,7 +406,55 @@ pub struct PreviewKey {
     mtime: Option<SystemTime>,
 }
 
+type PreviewFiles = Vec<(PathBuf, Arc<dyn Cartridge>)>;
+
+#[derive(Clone, Copy)]
+enum Scope {
+    Current = 0,
+    Capture = 1,
+}
+
+struct MetadataJob {
+    scope: Scope,
+    generation: u64,
+    files: PreviewFiles,
+}
+
+enum Resolved {
+    File(Scope, u64, PreviewKey, Arc<dyn Cartridge>),
+    End(Scope, u64),
+}
+
+fn resolve_files(job: MetadataJob, generations: &[AtomicU64; 2], done: &Sender<Resolved>) {
+    for (path, cartridge) in job.files {
+        if generations[job.scope as usize].load(Ordering::Relaxed) != job.generation {
+            return;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // クラウドにだけあるファイルは読まない（読むとダウンロードが始まる）。
+        if !meta.is_file() || lisa_core::listing::cloud_only(&meta) {
+            continue;
+        }
+        let key = PreviewKey {
+            path,
+            len: meta.len(),
+            mtime: meta.modified().ok(),
+        };
+        if done
+            .send(Resolved::File(job.scope, job.generation, key, cartridge))
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = done.send(Resolved::End(job.scope, job.generation));
+}
+
 struct Job {
+    scope: Scope,
+    generation: u64,
     ticket: u64,
     key: PreviewKey,
     cartridge: Arc<dyn Cartridge>,
@@ -441,17 +474,34 @@ pub struct PreviewImages {
     requested: HashMap<PreviewKey, u64>,
     ticket: u64,
     revision: u64,
+    generations: Arc<[AtomicU64; 2]>,
+    metadata: Sender<MetadataJob>,
+    resolved: Mutex<Receiver<Resolved>>,
+    capture_pending: bool,
+    capture_invalidations: Vec<crate::scan::RefreshTarget>,
+    skipped: Mutex<Receiver<Job>>,
     jobs: Sender<Job>,
     done: Mutex<Receiver<Done>>,
 }
 
 impl Default for PreviewImages {
     fn default() -> Self {
+        let (metadata, metadata_rx) = channel();
+        let (resolved_tx, resolved) = channel();
+        let generations = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let active = generations.clone();
+        std::thread::spawn(move || {
+            while let Ok(job) = metadata_rx.recv() {
+                resolve_files(job, &active, &resolved_tx);
+            }
+        });
         let (jobs, job_rx) = channel::<Job>();
         let (done_tx, done) = channel::<Done>();
+        let (skipped_tx, skipped) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
         for _ in 0..WORKERS {
             let (job_rx, done_tx) = (job_rx.clone(), done_tx.clone());
+            let (active, skipped_tx) = (generations.clone(), skipped_tx.clone());
             std::thread::spawn(move || {
                 loop {
                     let job = match job_rx.lock() {
@@ -459,6 +509,12 @@ impl Default for PreviewImages {
                         Err(_) => return,
                     };
                     let Ok(job) = job else { return };
+                    if active[job.scope as usize].load(Ordering::Relaxed) != job.generation {
+                        if skipped_tx.send(job).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     // macOS の読み込み（ImageIO・AVFoundation）が返す autorelease のものを、
                     // 1 枚ごとに解放する（裏のスレッドには自前の autorelease pool が無い）。
                     #[cfg(target_os = "macos")]
@@ -482,6 +538,12 @@ impl Default for PreviewImages {
             requested: HashMap::new(),
             ticket: 0,
             revision: 0,
+            generations,
+            metadata,
+            resolved: Mutex::new(resolved),
+            capture_pending: false,
+            capture_invalidations: Vec::new(),
+            skipped: Mutex::new(skipped),
             jobs,
             done: Mutex::new(done),
         }
@@ -537,6 +599,11 @@ impl PreviewImages {
 
     pub(crate) fn invalidate(&mut self, target: &crate::scan::RefreshTarget) {
         self.revision = self.revision.wrapping_add(1);
+        self.generations[Scope::Current as usize].fetch_add(1, Ordering::Relaxed);
+        // 撮影用には、更新範囲外の解決・デコードを続ける。
+        if self.capture_pending {
+            self.capture_invalidations.push(target.clone());
+        }
         self.current.retain(|path, _| !target.contains(path));
         self.capture.retain(|path, _| !target.contains(path));
         self.images.retain(|key, _| !target.contains(&key.path));
@@ -545,49 +612,108 @@ impl PreviewImages {
     }
 
     /// 開いたフォルダの直接の子を渡す。鍵を作り直し、まだ無いものは読みを頼む。
-    fn request(&mut self, files: Vec<(PathBuf, Arc<dyn Cartridge>)>) {
-        self.current = self.request_files(files);
+    fn request(&mut self, files: PreviewFiles) {
+        self.request_files(files, Scope::Current);
     }
 
-    fn request_files(
-        &mut self,
-        files: Vec<(PathBuf, Arc<dyn Cartridge>)>,
-    ) -> HashMap<PathBuf, PreviewKey> {
-        let mut keys = HashMap::new();
-        for (path, cartridge) in files {
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            // クラウドにだけあるファイルは読まない（読むとダウンロードが始まる）。
-            if !meta.is_file() || cloud_only(&meta) {
-                continue;
-            }
-            let key = PreviewKey {
-                path: path.clone(),
-                len: meta.len(),
-                mtime: meta.modified().ok(),
-            };
-            keys.insert(path, key.clone());
-            if !self.requested.contains_key(&key) {
-                self.ticket = self.ticket.wrapping_add(1);
-                self.requested.insert(key.clone(), self.ticket);
-                let _ = self.jobs.send(Job {
-                    ticket: self.ticket,
-                    key,
-                    cartridge,
-                });
+    fn request_files(&mut self, files: PreviewFiles, scope: Scope) {
+        let generation = self.generations[scope as usize]
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        match scope {
+            Scope::Current => self.current.clear(),
+            Scope::Capture => {
+                self.capture.clear();
+                self.capture_invalidations.clear();
+                self.capture_pending = !files.is_empty();
             }
         }
-        keys
+        if !files.is_empty()
+            && self
+                .metadata
+                .send(MetadataJob {
+                    scope,
+                    generation,
+                    files,
+                })
+                .is_err()
+            && matches!(scope, Scope::Capture)
+        {
+            self.capture_pending = false;
+        }
     }
 
     /// 読めた絵を受け取って `Image` にする。1 枚でも入れたら true（再描画を 1 回頼む）。
     pub fn receive(&mut self, assets: &mut Assets<Image>) -> bool {
+        let mut changed = false;
+        if let Ok(rx) = self.resolved.get_mut() {
+            for result in rx.try_iter() {
+                let (scope, generation) = match &result {
+                    Resolved::File(scope, generation, ..) | Resolved::End(scope, generation) => {
+                        (*scope, *generation)
+                    }
+                };
+                if self.generations[scope as usize].load(Ordering::Relaxed) != generation {
+                    continue;
+                }
+                let Resolved::File(_, _, key, cartridge) = result else {
+                    if matches!(scope, Scope::Capture) {
+                        self.capture_pending = false;
+                        self.capture_invalidations.clear();
+                    }
+                    continue;
+                };
+                let keys = match scope {
+                    Scope::Current => &mut self.current,
+                    Scope::Capture => {
+                        if self
+                            .capture_invalidations
+                            .iter()
+                            .any(|target| target.contains(&key.path))
+                        {
+                            continue;
+                        }
+                        &mut self.capture
+                    }
+                };
+                keys.insert(key.path.clone(), key.clone());
+                if self.images.contains_key(&key) {
+                    changed = true;
+                } else if !self.requested.contains_key(&key) {
+                    self.ticket = self.ticket.wrapping_add(1);
+                    self.requested.insert(key.clone(), self.ticket);
+                    let _ = self.jobs.send(Job {
+                        scope,
+                        generation,
+                        ticket: self.ticket,
+                        key,
+                        cartridge,
+                    });
+                }
+            }
+        }
+        // 同じ鍵を別の依頼でも待っていれば、今の世代の仕事として戻す。
+        if let Ok(rx) = self.skipped.get_mut() {
+            for mut job in rx.try_iter() {
+                if self.requested.get(&job.key) != Some(&job.ticket) {
+                    continue;
+                }
+                if self.current.get(&job.key.path) == Some(&job.key) {
+                    job.scope = Scope::Current;
+                } else if self.capture.get(&job.key.path) == Some(&job.key) {
+                    job.scope = Scope::Capture;
+                } else {
+                    self.requested.remove(&job.key);
+                    continue;
+                }
+                job.generation = self.generations[job.scope as usize].load(Ordering::Relaxed);
+                let _ = self.jobs.send(job);
+            }
+        }
         let mut done = Vec::new();
         if let Ok(rx) = self.done.lock() {
             done.extend(rx.try_iter());
         }
-        let mut changed = false;
         for (ticket, key, loaded) in done {
             if self.requested.get(&key) != Some(&ticket) {
                 continue;
@@ -619,8 +745,9 @@ impl PreviewImages {
                     Preview::Image(assets.add(image), UVec2::new(width, height))
                 }
             };
-            self.images.insert(key.clone(), preview);
-            changed = true;
+            changed |= self.current.get(&key.path) == Some(&key)
+                || self.capture.get(&key.path) == Some(&key);
+            self.images.insert(key, preview);
         }
         while self.order.len() > MAX_IMAGES {
             if let Some(old) = self.order.pop_front() {
@@ -675,8 +802,8 @@ mod tests {
         let mut registry = PreviewRegistry::default();
         cartridges::register(&mut registry);
         let mut world = World::new();
-        let theme = crate::render::shapes::UiThemeAssets::load(&mut Assets::default());
         let mut meshes = Assets::default();
+        let theme = crate::render::shapes::UiThemeAssets::load(&mut Assets::default(), &mut meshes);
         let mut materials = Assets::default();
         let mut images = Assets::default();
         let thumbnail = images.add(Image::default());
@@ -687,6 +814,7 @@ mod tests {
             draw(
                 &registry,
                 &mut Painter {
+                    material_cache: default(),
                     commands: &mut world.commands(),
                     meshes: &mut meshes,
                     materials: &mut materials,
@@ -702,6 +830,7 @@ mod tests {
                 palette::BASE_200,
                 0.0,
                 Some(Preview::Image(thumbnail.clone(), UVec2::new(160, 90))),
+                false,
             );
             world.flush();
 
@@ -805,6 +934,7 @@ mod tests {
             requested: HashMap::from([(key.clone(), 1), (sibling_key, 2)]),
             ticket: 2,
             revision: 0,
+            ..PreviewImages::default()
         };
         images.invalidate(&crate::scan::RefreshTarget {
             drive_id: "test".into(),
@@ -842,6 +972,76 @@ mod tests {
         );
     }
 
+    fn receive_until(images: &mut PreviewImages, ready: impl Fn(&PreviewImages) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut assets = Assets::default();
+        while !ready(images) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "プレビューの受信がタイムアウトしました"
+            );
+            images.receive(&mut assets);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn metadata_jobs_skip_old_generations_and_non_files() {
+        let dir = std::env::temp_dir().join(format!("lisa-preview-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file.txt");
+        std::fs::write(&file, b"test").unwrap();
+        let cartridge: Arc<dyn Cartridge> = Arc::new(Dummy {
+            id: "text",
+            exts: &["txt"],
+            priority: 0,
+        });
+        let files = vec![
+            (dir.clone(), cartridge.clone()),
+            (file.clone(), cartridge.clone()),
+        ];
+        let (done, rx) = channel();
+        let generations = [AtomicU64::new(2), AtomicU64::new(0)];
+
+        resolve_files(
+            MetadataJob {
+                scope: Scope::Current,
+                generation: 1,
+                files: files.clone(),
+            },
+            &generations,
+            &done,
+        );
+        assert!(rx.try_recv().is_err());
+        let mut images = PreviewImages::default();
+        images.request(files);
+        assert!(
+            images.current.is_empty(),
+            "メインスレッドではファイルの鍵を作らない"
+        );
+        receive_until(&mut images, |images| images.current.contains_key(&file));
+        assert_eq!(images.current.len(), 1);
+        assert_eq!(images.current[&file].len, 4);
+        let sibling = dir.join("sibling.txt");
+        std::fs::write(&sibling, b"test").unwrap();
+        images.request_files(
+            vec![
+                (file.clone(), cartridge.clone()),
+                (sibling.clone(), cartridge),
+            ],
+            Scope::Capture,
+        );
+        images.invalidate(&crate::scan::RefreshTarget {
+            drive_id: "test".into(),
+            path: file.clone(),
+            subtree: false,
+        });
+        receive_until(&mut images, |images| !images.capture_pending);
+        assert!(!images.capture.contains_key(&file));
+        assert!(images.capture.contains_key(&sibling));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn moved_previews_are_reused_without_reloading() {
         let tmp = std::env::temp_dir().join(format!("lisa-preview-moved-{}", std::process::id()));
@@ -861,7 +1061,8 @@ mod tests {
             (a.clone(), cartridge.clone()),
             (inner.clone(), cartridge.clone()),
         ]);
-        // 読み終えたことにする（裏の読みを待たない）。
+        receive_until(&mut images, |images| images.current.len() == 2);
+        // デコード結果の代わりに、メモリキャッシュへ絵を入れる。
         for key in images.current.values() {
             let lines = Arc::new(vec![key.path.display().to_string()]);
             images.images.insert(key.clone(), Preview::Text(lines));
@@ -874,7 +1075,7 @@ mod tests {
         assert!(images.get(&a).is_some(), "読み直す前の古い名前でも引ける");
         assert!(images.get(&z).is_some());
         images.request(vec![(z.clone(), cartridge.clone())]);
-        assert!(images.get(&z).is_some(), "読み直したあとも同じ絵");
+        receive_until(&mut images, |images| images.get(&z).is_some());
         assert_eq!(images.requested.len(), requested, "読みを頼み直さない");
 
         // フォルダごと動かしたら、下のファイルも付け替わる。取り消しで戻しても同じ。
@@ -882,11 +1083,13 @@ mod tests {
         std::fs::rename(tmp.join("dir"), &moved).unwrap();
         images.moved(&tmp.join("dir"), &moved);
         images.request(vec![(moved.join("inner.txt"), cartridge.clone())]);
-        assert!(images.get(&moved.join("inner.txt")).is_some());
+        receive_until(&mut images, |images| {
+            images.get(&moved.join("inner.txt")).is_some()
+        });
         std::fs::rename(&moved, tmp.join("dir")).unwrap();
         images.moved(&moved, &tmp.join("dir"));
         images.request(vec![(inner.clone(), cartridge)]);
-        assert!(images.get(&inner).is_some());
+        receive_until(&mut images, |images| images.get(&inner).is_some());
         assert_eq!(images.requested.len(), requested);
         let _ = std::fs::remove_dir_all(&tmp);
     }

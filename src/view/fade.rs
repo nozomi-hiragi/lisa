@@ -50,7 +50,12 @@ pub(super) fn set_alpha(
     if let Some(mut text) = text {
         text.0.set_alpha(a);
     }
-    if let Some(mut material) = material.and_then(|m| materials.get_mut(&m.0)) {
+    if let Some(handle) = material.map(|material| &material.0)
+        && materials
+            .get(handle)
+            .is_some_and(|material| material.color.alpha() != a)
+        && let Some(mut material) = materials.get_mut(handle)
+    {
         material.color.set_alpha(a);
     }
 }

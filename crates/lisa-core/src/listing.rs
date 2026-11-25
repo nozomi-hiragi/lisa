@@ -255,10 +255,15 @@ pub fn cloud_only(meta: &Metadata) -> bool {
 #[cfg(windows)]
 pub fn cloud_only(meta: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
+    windows_cloud_only(meta.file_attributes())
+}
+
+#[cfg(any(windows, test))]
+fn windows_cloud_only(attributes: u32) -> bool {
     const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
     const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
     const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
-    meta.file_attributes()
+    attributes
         & (FILE_ATTRIBUTE_OFFLINE
             | FILE_ATTRIBUTE_RECALL_ON_OPEN
             | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
@@ -273,6 +278,16 @@ pub fn cloud_only(_meta: &Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_recall_and_offline_attributes_skip_file_content() {
+        for attributes in [0x0000_1000, 0x0004_0000, 0x0040_0000, 0x0044_1020] {
+            assert!(windows_cloud_only(attributes));
+        }
+        for attributes in [0, 0x20, 0x0080_0000] {
+            assert!(!windows_cloud_only(attributes));
+        }
+    }
 
     /// テストごとの空のフォルダ。終わったら消す。
     struct TempDir(PathBuf);

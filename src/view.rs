@@ -71,6 +71,8 @@ impl Plugin for TreeViewPlugin {
                 }],
             })
             .init_resource::<SyncRequest>()
+            .init_resource::<scene::PendingDenseFiles>()
+            .init_resource::<crate::render::ear::PendingEarParts>()
             .insert_resource(SceneVisit(1))
             .init_resource::<LastSceneKey>()
             .init_resource::<ThumbnailCapture>()
@@ -106,6 +108,7 @@ impl Plugin for TreeViewPlugin {
                         center::refresh_displays,
                     )
                         .chain(),
+                    scene::refresh_file_details,
                     update_ears,
                     shell::update,
                     fade_scenes,
@@ -383,7 +386,7 @@ fn setup(
     let folder_images = FolderImages::default();
 
     let (pos, scale) = fit(layouts[FileTree::ROOT].frame, &window);
-    let theme = UiThemeAssets::load(&mut images);
+    let theme = UiThemeAssets::load(&mut images, &mut meshes);
     if let Some(image) = &theme.background {
         background::spawn(&mut commands, image);
     }

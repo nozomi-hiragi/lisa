@@ -11,6 +11,7 @@
 //! 今開いているフォルダとその外側、一覧に見えている子の耳は、毎フレーム大きさを合わせる
 //! （`LiveEar`）。キャッシュの画像の中の耳は、一覧の中の大きさで焼く。
 
+use bevy::ecs::{lifecycle::HookContext, world::DeferredWorld};
 use bevy::math::Rect;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
@@ -28,7 +29,7 @@ const TEXT_RATIO: f32 = 0.55;
 const MIN_TEXT_PX: f32 = 4.0;
 
 /// 耳の大きさを決める値。
-#[derive(Resource, Clone, Copy)]
+#[derive(Resource, Clone, Copy, PartialEq)]
 pub struct EarSizes {
     pub viewport: Vec2,
     /// 開いたフォルダの本体を画面に収めたときの幅（論理ピクセル）。
@@ -170,6 +171,7 @@ pub fn body_group(painter: &mut Painter, slot: Slot, size: Size) -> Entity {
 
 /// ズームに合わせて縮む本体の入れ物。
 #[derive(Component)]
+#[component(on_add = queue_ear_part)]
 pub struct YieldBody {
     slot: Slot,
     of: EarOf,
@@ -257,6 +259,7 @@ pub fn draw_folder_overlay(
 }
 
 #[derive(Component)]
+#[component(on_add = queue_ear_part)]
 pub struct LiveSlice {
     slot: Slot,
     of: EarOf,
@@ -488,6 +491,7 @@ fn draw_part(
 
 /// ズームに合わせて大きさを変える部品（フォルダの耳と、ファイルの名前）。
 #[derive(Component)]
+#[component(on_add = queue_ear_part)]
 pub struct LiveEar {
     slot: Slot,
     of: EarOf,
@@ -582,49 +586,160 @@ fn part_transform(
 }
 
 /// カメラの倍率に合わせて、耳の大きさと、それに譲る本体の大きさを直す（描くフレームごと）。
-pub fn update_ears(
+/// Added フィルタは既存の部品も走査するため、追加されたエンティティの ID を控える。
+#[derive(Resource, Default)]
+pub(crate) struct PendingEarParts(Vec<Entity>);
+
+fn queue_ear_part(mut world: DeferredWorld, context: HookContext) {
+    if let Some(mut pending) = world.get_resource_mut::<PendingEarParts>() {
+        pending.0.push(context.entity);
+    }
+}
+
+type EarParts<'a> = (&'a LiveEar, &'a mut Transform, &'a mut Visibility);
+type BodyParts<'a> = (&'a YieldBody, &'a mut Transform);
+type SliceParts<'a> = (
+    &'a LiveSlice,
+    &'a mut Sprite,
+    &'a mut Transform,
+    &'a mut Visibility,
+);
+type EarFilter = (Without<YieldBody>, Without<LiveSlice>);
+type BodyFilter = (Without<LiveEar>, Without<LiveSlice>);
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn update_ears(
     camera: Single<&Projection, With<MainCamera>>,
     sizes: Res<EarSizes>,
-    mut ears: Query<
-        (&LiveEar, &mut Transform, &mut Visibility),
-        (Without<YieldBody>, Without<LiveSlice>),
-    >,
-    mut bodies: Query<(&YieldBody, &mut Transform), (Without<LiveEar>, Without<LiveSlice>)>,
-    mut slices: Query<(&LiveSlice, &mut Sprite, &mut Transform, &mut Visibility)>,
+    mut last: Local<Option<(u32, EarSizes)>>,
+    mut pending: ResMut<PendingEarParts>,
+    mut ears: Query<EarParts, EarFilter>,
+    mut bodies: Query<BodyParts, BodyFilter>,
+    mut slices: Query<SliceParts>,
 ) {
     let Projection::Orthographic(ortho) = *camera else {
+        *last = None;
         return;
     };
-    for (ear, mut transform, mut visibility) in &mut ears {
-        let h = ear.of.height(&sizes, ortho.scale);
-        let (next, shown) =
-            part_transform(ear.slot, ear.em, ear.z, ear.part, ear.px, h, ortho.scale);
-        *transform = next;
-        let next_visibility = if shown {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
+    let scale = ortho.scale;
+    let state = (scale.to_bits(), *sizes);
+    let unchanged = last.replace(state) == Some(state);
+
+    let update_ear =
+        |(ear, mut transform, mut visibility): (&LiveEar, Mut<Transform>, Mut<Visibility>)| {
+            let h = ear.of.height(&sizes, scale);
+            let (next, shown) = part_transform(ear.slot, ear.em, ear.z, ear.part, ear.px, h, scale);
+            transform.set_if_neq(next);
+            visibility.set_if_neq(if shown {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            });
         };
-        visibility.set_if_neq(next_visibility);
-    }
-    for (slice, mut sprite, mut transform, mut visibility) in &mut slices {
-        let h = slice.of.height(&sizes, ortho.scale);
-        let geometry = HudGeometry::new(slice.slot, slice.em, h, ortho.scale);
+    let update_slice = |(slice, sprite, transform, visibility): (
+        &LiveSlice,
+        Mut<Sprite>,
+        Mut<Transform>,
+        Mut<Visibility>,
+    )| {
+        let h = slice.of.height(&sizes, scale);
+        let geometry = HudGeometry::new(slice.slot, slice.em, h, scale);
         let place = match slice.part {
             SlicePart::Ear(_) | SlicePart::EarFallback => geometry.ear(slice.part, slice.z),
             _ => geometry.frame(slice.part, slice.z),
         };
-        place.apply(&mut sprite, &mut transform, &mut visibility);
-    }
-    for (body, mut transform) in &mut bodies {
-        let h = body.of.height(&sizes, ortho.scale);
-        *transform = body.slot.body_transform(h);
+        place.apply(sprite, transform, visibility);
+    };
+    let update_body = |(body, mut transform): (&YieldBody, Mut<Transform>)| {
+        let h = body.of.height(&sizes, scale);
+        transform.set_if_neq(body.slot.body_transform(h));
+    };
+
+    if unchanged {
+        if !pending.0.is_empty() {
+            for entity in pending.0.drain(..) {
+                if let Ok(part) = ears.get_mut(entity) {
+                    update_ear(part);
+                } else if let Ok(part) = slices.get_mut(entity) {
+                    update_slice(part);
+                } else if let Ok(part) = bodies.get_mut(entity) {
+                    update_body(part);
+                }
+            }
+        }
+    } else {
+        ears.iter_mut().for_each(update_ear);
+        slices.iter_mut().for_each(update_slice);
+        bodies.iter_mut().for_each(update_body);
+        if !pending.0.is_empty() {
+            pending.0.clear();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_scale_only_updates_new_ear_parts() {
+        let mut app = App::new();
+        let sizes = EarSizes {
+            viewport: Vec2::new(800.0, 600.0),
+            fitted_width: 800.0,
+            selected_px: 28.0,
+            preview_px: 16.0,
+        };
+        let mut projection = OrthographicProjection::default_2d();
+        projection.scale = 1.0;
+        let camera = app
+            .world_mut()
+            .spawn((MainCamera, Projection::Orthographic(projection)))
+            .id();
+        app.insert_resource(sizes)
+            .init_resource::<PendingEarParts>()
+            .add_systems(Update, update_ears);
+        let slot = Slot {
+            cell: Rect::new(0.0, 0.0, 800.0, 600.0),
+            body: Rect::new(0.0, 0.0, 800.0, 600.0),
+            name_below: false,
+        };
+        let of = EarOf {
+            size_width: 800.0,
+            selected_fit: None,
+            selected_height: 600.0,
+            parent_width: 1600.0,
+            in_list: 12.0,
+        };
+        let uninitialized = Transform::from_xyz(50.0, 50.0, 10.0);
+        let first = app
+            .world_mut()
+            .spawn((YieldBody { slot, of }, uninitialized))
+            .id();
+        app.update();
+        let expected = slot.body_transform(of.height(&sizes, 1.0));
+        assert_eq!(*app.world().get::<Transform>(first).unwrap(), expected);
+
+        app.world_mut().entity_mut(first).insert(uninitialized);
+        let added = app
+            .world_mut()
+            .spawn((YieldBody { slot, of }, uninitialized))
+            .id();
+        app.update();
+        assert_eq!(*app.world().get::<Transform>(first).unwrap(), uninitialized);
+        assert_eq!(*app.world().get::<Transform>(added).unwrap(), expected);
+
+        let mut projection = app.world_mut().get_mut::<Projection>(camera).unwrap();
+        let Projection::Orthographic(projection) = &mut *projection else {
+            unreachable!()
+        };
+        projection.scale = 2.0;
+        app.update();
+        let expected = slot.body_transform(of.height(&sizes, 2.0));
+        for entity in [first, added] {
+            assert_eq!(*app.world().get::<Transform>(entity).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn hud_slope_crops_and_the_right_corner_rises_without_a_jump() {

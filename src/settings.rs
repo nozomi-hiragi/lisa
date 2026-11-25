@@ -32,6 +32,9 @@ pub struct Settings {
     pub rest_disk_mb_per_sec: f32,
     /// LAN の他の PC にこの端末の DB を公開する（1 なら公開する、0 なら公開しない）。
     pub lan_share: f32,
+    /// Windows の描画方式。
+    #[cfg(any(windows, test))]
+    pub windows_backend: String,
     /// カタログを読むフォルダを足す（後のものほど優先。`docs/catalog.md`）。ポップアップには出さない。
     pub catalog_dirs: Vec<String>,
     /// この型（ID）の中は、重複の一覧に出さない。ポップアップには出さない。
@@ -48,6 +51,8 @@ impl Default for Settings {
             rest_cpu_percent: 80.0,
             rest_disk_mb_per_sec: 100.0,
             lan_share: 0.0,
+            #[cfg(any(windows, test))]
+            windows_backend: "auto".into(),
             catalog_dirs: Vec::new(),
             catalog_hide_duplicates: Vec::new(),
         }
@@ -57,7 +62,11 @@ impl Default for Settings {
 impl Settings {
     /// 範囲の外の値を直す（手で書き換えた settings.json などのため）。
     fn sanitized(mut self) -> Self {
-        for item in Item::ALL {
+        #[cfg(any(windows, test))]
+        if !matches!(self.windows_backend.as_str(), "auto" | "vulkan" | "gl") {
+            self.windows_backend = "auto".into();
+        }
+        for &item in Item::ALL {
             let value = item.get(&self);
             item.set(&mut self, value);
         }
@@ -75,10 +84,12 @@ enum Item {
     RestCpu,
     RestDisk,
     LanShare,
+    #[cfg(windows)]
+    WindowsBackend,
 }
 
 impl Item {
-    const ALL: [Item; 7] = [
+    const ALL: &[Item] = &[
         Item::EarSelected,
         Item::EarPreview,
         Item::BackgroundSpeed,
@@ -86,6 +97,8 @@ impl Item {
         Item::RestCpu,
         Item::RestDisk,
         Item::LanShare,
+        #[cfg(windows)]
+        Item::WindowsBackend,
     ];
 
     fn label(self) -> &'static str {
@@ -97,6 +110,8 @@ impl Item {
             Item::RestCpu => "CPU が混んだら裏で読まない",
             Item::RestDisk => "ディスクが混んだら裏で読まない",
             Item::LanShare => "LAN に公開",
+            #[cfg(windows)]
+            Item::WindowsBackend => "描画方式（再起動で反映）",
         }
     }
 
@@ -110,6 +125,8 @@ impl Item {
             Item::RestCpu => (20.0, 100.0, 10.0),
             Item::RestDisk => (0.0, 1000.0, 25.0),
             Item::LanShare => (0.0, 1.0, 1.0),
+            #[cfg(windows)]
+            Item::WindowsBackend => (0.0, 2.0, 1.0),
         }
     }
 
@@ -122,6 +139,12 @@ impl Item {
             Item::RestCpu => settings.rest_cpu_percent,
             Item::RestDisk => settings.rest_disk_mb_per_sec,
             Item::LanShare => settings.lan_share,
+            #[cfg(windows)]
+            Item::WindowsBackend => match settings.windows_backend.as_str() {
+                "vulkan" => 1.0,
+                "gl" => 2.0,
+                _ => 0.0,
+            },
         }
     }
 
@@ -136,6 +159,10 @@ impl Item {
             Item::RestCpu => settings.rest_cpu_percent = value,
             Item::RestDisk => settings.rest_disk_mb_per_sec = value,
             Item::LanShare => settings.lan_share = value.round(),
+            #[cfg(windows)]
+            Item::WindowsBackend => {
+                settings.windows_backend = ["auto", "vulkan", "gl"][value.round() as usize].into()
+            }
         }
     }
 
@@ -153,6 +180,13 @@ impl Item {
             Item::RestDisk => format!("{} MB/秒超", settings.rest_disk_mb_per_sec),
             Item::LanShare if settings.lan_share >= 0.5 => "公開する".into(),
             Item::LanShare => "しない".into(),
+            #[cfg(windows)]
+            Item::WindowsBackend => match settings.windows_backend.as_str() {
+                "vulkan" => "Vulkan",
+                "gl" => "OpenGL",
+                _ => "自動 (Vulkan優先)",
+            }
+            .into(),
         }
     }
 
@@ -168,11 +202,16 @@ impl Item {
     }
 }
 
-pub struct SettingsPlugin;
+pub struct SettingsPlugin(pub Settings, #[cfg(windows)] pub bool);
 
 impl Plugin for SettingsPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(load())
+        #[cfg(windows)]
+        app.insert_resource(SavedWindowsBackend {
+            backend: self.0.windows_backend.clone(),
+            env_override: self.1,
+        });
+        app.insert_resource(self.0.clone())
             .add_systems(PostStartup, spawn_settings_ui.after(spawn_menu))
             .add_systems(Update, (save_on_change, show_values));
     }
@@ -197,7 +236,29 @@ pub fn load() -> Settings {
         .sanitized()
 }
 
-fn save_on_change(settings: Res<Settings>) {
+#[cfg(any(windows, test))]
+#[derive(Resource)]
+struct SavedWindowsBackend {
+    backend: String,
+    env_override: bool,
+}
+
+#[cfg(any(windows, test))]
+impl SavedWindowsBackend {
+    fn on_saved(&mut self, backend: &str, data_dir: Option<&std::path::Path>) {
+        if self.backend == backend {
+            return;
+        }
+        self.backend = backend.into();
+        if !self.env_override
+            && let Some(dir) = data_dir
+        {
+            crate::windows_backend::clear_markers(dir);
+        }
+    }
+}
+
+fn save_on_change(settings: Res<Settings>, #[cfg(windows)] mut saved: ResMut<SavedWindowsBackend>) {
     if !settings.is_changed() || settings.is_added() {
         return;
     }
@@ -211,8 +272,15 @@ fn save_on_change(settings: Res<Settings>) {
             let text = serde_json::to_string_pretty(&*settings).map_err(std::io::Error::other)?;
             fs::write(&path, text)
         });
-    if let Err(error) = result {
+    if let Err(error) = &result {
         warn!("設定を保存できませんでした（{}）: {error}", path.display());
+    }
+    #[cfg(windows)]
+    if result.is_ok() {
+        saved.on_saved(
+            &settings.windows_backend,
+            crate::scan::data_dir().as_deref(),
+        );
     }
 }
 
@@ -242,7 +310,7 @@ fn spawn_settings_ui(
     };
 
     commands.entity(*body).with_children(|body| {
-        for item in Item::ALL {
+        for &item in Item::ALL {
             body.spawn(Node {
                 align_items: AlignItems::Center,
                 column_gap: Val::Px(8.0),
@@ -270,7 +338,11 @@ fn spawn_settings_ui(
                     text_font.clone(),
                     TextColor(TEXT_COLOR),
                     Node {
-                        width: Val::Px(88.0),
+                        width: Val::Px(match item {
+                            #[cfg(windows)]
+                            Item::WindowsBackend => 144.0,
+                            _ => 88.0,
+                        }),
                         justify_content: JustifyContent::Center,
                         ..default()
                     },
@@ -305,6 +377,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn saving_backend_with_environment_override_preserves_markers() {
+        let dir = std::env::temp_dir().join(format!("lisa-backend-save-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let paths =
+            ["gpu-backend-probe.json", "gpu-backend-fallback.json"].map(|name| dir.join(name));
+        for path in &paths {
+            fs::write(path, b"existing").unwrap();
+        }
+        let mut saved = SavedWindowsBackend {
+            backend: "auto".into(),
+            env_override: true,
+        };
+        saved.on_saved("gl", Some(&dir));
+        assert_eq!(saved.backend, "gl");
+        for path in &paths {
+            assert_eq!(fs::read(path).unwrap(), b"existing");
+        }
+        saved.env_override = false;
+        saved.on_saved("auto", Some(&dir));
+        assert!(paths.iter().all(|path| !path.exists()));
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn old_settings_file_still_loads() {
         // 今は使わない項目（行の高さ、しきい値など）が入った古い settings.json。
         // 足りない項目は既定値になる。
@@ -317,6 +413,20 @@ mod tests {
             settings.ear_selected_px,
             Settings::default().ear_selected_px
         );
+    }
+
+    #[test]
+    fn windows_backend_defaults_and_normalizes_unknown_values() {
+        assert_eq!(Settings::default().windows_backend, "auto");
+        for expected in ["auto", "vulkan", "gl"] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "windows_backend": expected
+            }))
+            .unwrap();
+            assert_eq!(settings.sanitized().windows_backend, expected);
+        }
+        let settings: Settings = serde_json::from_str(r#"{"windows_backend":"dx12"}"#).unwrap();
+        assert_eq!(settings.sanitized().windows_backend, "auto");
     }
 
     #[test]

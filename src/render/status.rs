@@ -55,6 +55,7 @@ pub fn draw_file(
     z: f32,
     live: bool,
     loaded: Option<crate::preview::Preview>,
+    simple: bool,
 ) {
     match state {
         LoadState::Unloaded => {
@@ -67,10 +68,16 @@ pub fn draw_file(
                 spinner(painter, frame, z + 0.1);
             }
         }
-        LoadState::Loaded => preview::draw(previews, painter, name, frame, background, z, loaded),
+        LoadState::Loaded => preview::draw(
+            previews, painter, name, frame, background, z, loaded, simple,
+        ),
         LoadState::Stale => {
-            preview::draw(previews, painter, name, frame, background, z, loaded);
-            dim(painter, frame, z + 0.1);
+            preview::draw(
+                previews, painter, name, frame, background, z, loaded, simple,
+            );
+            if !simple {
+                dim(painter, frame, z + 0.1);
+            }
         }
         LoadState::Failed => failed(painter, frame, background, z),
     }

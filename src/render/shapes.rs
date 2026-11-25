@@ -1,5 +1,7 @@
 //! 四角・三角・円・画像・文字を、ひとつの場面（シーン）の子として描く道具。
 
+use std::collections::HashMap;
+
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::math::Rect;
 use bevy::prelude::*;
@@ -19,12 +21,14 @@ pub struct BaseAlpha(pub f32);
 #[derive(Resource)]
 pub struct UiThemeAssets {
     pub background: Option<Handle<Image>>,
+    unit_circle: Handle<Mesh>,
+    unit_right_triangle: Handle<Mesh>,
     frame: Option<Handle<Image>>,
     ear: Option<Handle<Image>>,
 }
 
 impl UiThemeAssets {
-    pub fn load(images: &mut Assets<Image>) -> Self {
+    pub fn load(images: &mut Assets<Image>, meshes: &mut Assets<Mesh>) -> Self {
         let mut load = |bytes: &[u8]| match image::load_from_memory_with_format(
             bytes,
             image::ImageFormat::Png,
@@ -51,6 +55,8 @@ impl UiThemeAssets {
         }
         Self {
             background,
+            unit_circle: meshes.add(Circle::new(1.0)),
+            unit_right_triangle: meshes.add(Triangle2d::new(Vec2::Y, Vec2::ZERO, Vec2::X)),
             frame,
             ear,
         }
@@ -79,20 +85,29 @@ pub struct SlicePlacement {
 impl SlicePlacement {
     pub fn apply(
         self,
-        sprite: &mut Sprite,
-        transform: &mut Transform,
-        visibility: &mut Visibility,
+        mut sprite: impl std::ops::DerefMut<Target = Sprite>,
+        mut transform: impl std::ops::DerefMut<Target = Transform>,
+        mut visibility: impl std::ops::DerefMut<Target = Visibility>,
     ) {
-        if let Some(uv) = self.uv {
-            sprite.rect = Some(uv);
+        if self.uv.is_some() && sprite.rect != self.uv {
+            sprite.rect = self.uv;
         }
-        sprite.custom_size = Some(self.rect.size().max(Vec2::ZERO));
-        *transform = Transform::from_translation(self.rect.center().extend(self.z));
-        *visibility = if self.rect.width().min(self.rect.height()) >= MIN_SHAPE_PX * self.scale {
+        let size = Some(self.rect.size().max(Vec2::ZERO));
+        if sprite.custom_size != size {
+            sprite.custom_size = size;
+        }
+        let next = Transform::from_translation(self.rect.center().extend(self.z));
+        if *transform != next {
+            *transform = next;
+        }
+        let next = if self.rect.width().min(self.rect.height()) >= MIN_SHAPE_PX * self.scale {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
+        if *visibility != next {
+            *visibility = next;
+        }
     }
 }
 
@@ -117,6 +132,7 @@ const EAR_UVS: [[f32; 4]; 3] = [
 pub struct Painter<'a, 'w, 's> {
     pub commands: &'a mut Commands<'w, 's>,
     pub meshes: &'a mut Assets<Mesh>,
+    pub material_cache: HashMap<[u32; 4], Handle<ColorMaterial>>,
     pub materials: &'a mut Assets<ColorMaterial>,
     /// 描いたものをぶら下げる場面の根。
     pub parent: Entity,
@@ -265,27 +281,49 @@ impl Painter<'_, '_, '_> {
         let mesh = self
             .meshes
             .add(Triangle2d::new(points[0], points[1], points[2]));
-        self.mesh(mesh, size.x.min(size.y), Vec2::ZERO, color, z);
+        self.mesh(
+            mesh,
+            size.min_element(),
+            color,
+            Transform::from_xyz(0.0, 0.0, z),
+        );
+    }
+
+    pub fn right_triangle(&mut self, origin: Vec2, size: f32, color: Color, z: f32) {
+        self.mesh(
+            self.theme.unit_right_triangle.clone(),
+            size,
+            color,
+            Transform::from_translation(origin.extend(z)).with_scale(Vec3::new(size, size, 1.0)),
+        );
     }
 
     pub fn circle(&mut self, center: Vec2, radius: f32, color: Color, z: f32) {
-        let mesh = self.meshes.add(Circle::new(radius));
-        self.mesh(mesh, radius * 2.0, center, color, z);
+        self.mesh(
+            self.theme.unit_circle.clone(),
+            radius * 2.0,
+            color,
+            Transform::from_translation(center.extend(z))
+                .with_scale(Vec3::new(radius, radius, 1.0)),
+        );
     }
 
-    fn mesh(&mut self, mesh: Handle<Mesh>, min_size: f32, at: Vec2, color: Color, z: f32) {
-        let material = self.materials.add(ColorMaterial {
-            color,
-            alpha_mode: AlphaMode2d::Blend,
-            ..default()
-        });
+    fn mesh(&mut self, mesh: Handle<Mesh>, min_size: f32, color: Color, transform: Transform) {
+        let linear = color.to_linear();
+        let key = [linear.red, linear.green, linear.blue, linear.alpha].map(f32::to_bits);
+        let material = self
+            .material_cache
+            .entry(key)
+            .or_insert_with(|| {
+                self.materials.add(ColorMaterial {
+                    color,
+                    alpha_mode: AlphaMode2d::Blend,
+                    ..default()
+                })
+            })
+            .clone();
         let common = self.common(color, self.visibility(min_size, MIN_SHAPE_PX));
-        self.spawn_part((
-            common,
-            Mesh2d(mesh),
-            MeshMaterial2d(material),
-            Transform::from_translation(at.extend(z)),
-        ));
+        self.spawn_part((common, Mesh2d(mesh), MeshMaterial2d(material), transform));
     }
 
     /// 1行の文字。`height` と `width` はワールド座標での大きさの上限。
@@ -350,4 +388,66 @@ pub fn over(base: Color, over: Color, t: f32) -> Color {
         a.green + (b.green - a.green) * t,
         a.blue + (b.blue - a.blue) * t,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_shapes_share_meshes_and_only_share_materials_within_a_painter() {
+        let mut world = World::new();
+        let mut meshes = Assets::default();
+        let mut materials = Assets::default();
+        let theme = UiThemeAssets::load(&mut Assets::default(), &mut meshes);
+        let first = world.spawn_empty().id();
+        let second = world.spawn_empty().id();
+
+        for parent in [first, second] {
+            let mut painter = Painter {
+                commands: &mut world.commands(),
+                meshes: &mut meshes,
+                materials: &mut materials,
+                material_cache: default(),
+                parent,
+                layer: RenderLayers::layer(0),
+                scale: 1.0,
+                font: default(),
+                theme: &theme,
+                no_cull: false,
+            };
+            let blue = Color::srgb(0.0, 0.4, 0.8);
+            painter.circle(Vec2::ZERO, 2.0, blue, 0.0);
+            painter.circle(Vec2::X, 3.0, blue, 0.0);
+            painter.right_triangle(Vec2::ZERO, 2.0, blue, 0.0);
+            painter.right_triangle(Vec2::Y, 3.0, blue.with_alpha(0.5), 0.0);
+        }
+        world.flush();
+
+        let parts = |root| {
+            world
+                .get::<Children>(root)
+                .unwrap()
+                .iter()
+                .map(|part| {
+                    let mesh = world.get::<Mesh2d>(part).unwrap().0.id();
+                    let material = world
+                        .get::<MeshMaterial2d<ColorMaterial>>(part)
+                        .unwrap()
+                        .0
+                        .id();
+                    (mesh, material)
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = parts(first);
+        let second = parts(second);
+        assert_eq!(first[0], first[1]);
+        assert_eq!(first[0].0, second[0].0);
+        assert_eq!(first[2].0, first[3].0);
+        assert_eq!(first[2].0, second[2].0);
+        assert_eq!(first[0].1, first[2].1);
+        assert_ne!(first[0].1, first[3].1);
+        assert_ne!(first[0].1, second[0].1);
+    }
 }
