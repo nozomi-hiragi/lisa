@@ -3,6 +3,7 @@
 //! 画面に出す本物の描画にも、キャッシュの画像を焼くときにも、同じ場面を使う。
 
 use bevy::camera::visibility::RenderLayers;
+use bevy::ecs::{lifecycle::HookContext, system::SystemParam, world::DeferredWorld};
 use bevy::prelude::*;
 use bevy::sprite_render::ColorMaterial;
 
@@ -15,6 +16,9 @@ use crate::render::palette;
 use crate::render::shapes::{Painter, UiThemeAssets, over};
 use crate::render::status::{self, FolderBodyState};
 use crate::render::tag;
+
+const DENSE_CHILDREN_THRESHOLD: usize = 256;
+const SIMPLE_FILE_PX: f32 = 24.0;
 
 pub const BACKGROUND: Color = palette::BASE_200;
 
@@ -155,6 +159,101 @@ pub struct SceneSource<'a> {
 }
 
 /// フォルダ `folder` の場面を作る。`scale` はこの倍率で見たときにくっきり見えるように作る。
+#[derive(Component)]
+#[component(on_add = queue_dense_file)]
+pub(crate) struct DenseFile {
+    name: Box<str>,
+    state: crate::model::tree::LoadState,
+    frame: Rect,
+    background: Color,
+    z: f32,
+    no_cull: bool,
+    simple: bool,
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct PendingDenseFiles(Vec<Entity>);
+
+fn queue_dense_file(mut world: DeferredWorld, context: HookContext) {
+    if let Some(mut pending) = world.get_resource_mut::<PendingDenseFiles>() {
+        pending.0.push(context.entity);
+    }
+}
+
+#[derive(SystemParam)]
+pub(crate) struct DenseFileAssets<'w> {
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<ColorMaterial>>,
+    previews: Res<'w, PreviewRegistry>,
+    theme: Res<'w, UiThemeAssets>,
+    font: Res<'w, LabelFont>,
+}
+
+/// カメラが動いたフレームに、境目を越えたファイルの紙だけを差し替える。
+/// 操作中の場面、耳、選択、カメラの状態はそのまま使う。
+pub(crate) fn refresh_file_details(
+    mut commands: Commands,
+    camera: Single<&Projection, With<crate::view::MainCamera>>,
+    mut pending: ResMut<PendingDenseFiles>,
+    mut last_scale: Local<Option<u32>>,
+    mut files: Query<(Entity, &ChildOf, &RenderLayers, &mut DenseFile)>,
+    mut assets: DenseFileAssets,
+) {
+    let Projection::Orthographic(ortho) = *camera else {
+        *last_scale = None;
+        return;
+    };
+    let scale = ortho.scale;
+    let mut materials_by_parent = bevy::platform::collections::HashMap::new();
+    let mut refresh =
+        |(entity, parent, layer, mut file): (Entity, &ChildOf, &RenderLayers, Mut<DenseFile>)| {
+            let simple = file.frame.size().min_element() / scale < SIMPLE_FILE_PX;
+            if file.simple == simple {
+                return;
+            }
+            file.simple = simple;
+            commands.entity(entity).despawn_children();
+            let cache = materials_by_parent.entry(parent.parent()).or_default();
+            let mut painter = Painter {
+                material_cache: std::mem::take(cache),
+                commands: &mut commands,
+                meshes: &mut assets.meshes,
+                materials: &mut assets.materials,
+                parent: entity,
+                layer: layer.clone(),
+                scale,
+                font: assets.font.0.clone(),
+                theme: &assets.theme,
+                no_cull: file.no_cull,
+            };
+            status::draw_file(
+                &mut painter,
+                &assets.previews,
+                file.state,
+                &file.name,
+                file.frame,
+                file.background,
+                file.z,
+                true,
+                None,
+                simple,
+            );
+            *cache = painter.material_cache;
+        };
+    if last_scale.replace(scale.to_bits()) != Some(scale.to_bits()) {
+        files.iter_mut().for_each(refresh);
+        if !pending.0.is_empty() {
+            pending.0.clear();
+        }
+    } else if !pending.0.is_empty() {
+        for entity in pending.0.drain(..) {
+            if let Ok(file) = files.get_mut(entity) {
+                refresh(file);
+            }
+        }
+    }
+}
+
 /// `live` は画面に出す本物の場面か（耳をズームに合わせて変える）、画像に焼くためのものか。
 /// `ancestors` は外側のフォルダ。枠の外に見える背景として描く。
 /// `focus` は開いている子（この場面を親として下に敷くとき）。その子と周りの 8 つは、動かしている
@@ -182,6 +281,7 @@ pub fn spawn(
         ))
         .id();
     let mut painter = Painter {
+        material_cache: default(),
         commands,
         meshes,
         materials,
@@ -269,6 +369,7 @@ pub(crate) fn draw_contents(
     live_body: bool,
 ) {
     let mut painter = Painter {
+        material_cache: default(),
         commands,
         meshes,
         materials,
@@ -300,6 +401,7 @@ fn draw_children(
     let tree = source.tree;
     let node = &tree.nodes[folder];
     let background = over(BACKGROUND, folder_color(tree, folder), 0.08);
+    let dense = node.children.len() > DENSE_CHILDREN_THRESHOLD;
     let grid = source.layouts[folder].grid;
     let columns = grid.columns.max(1) as i64;
     let at = |i: usize| ((i as i64) % columns, (i as i64) / columns);
@@ -345,7 +447,10 @@ fn draw_children(
                     });
                 }
                 painter.parent = appearance;
+                // フォルダのプレビューは場面全体とは別にフェードする。
+                let scene_materials = std::mem::take(&mut painter.material_cache);
                 draw_folder(painter, source, child, &body, true);
+                painter.material_cache = scene_materials;
                 painter.parent = tile;
             } else {
                 draw_folder(painter, source, child, &body, false);
@@ -360,7 +465,26 @@ fn draw_children(
             } else {
                 None
             };
+            let can_simplify = dense
+                && loaded.is_none()
+                && matches!(
+                    child_node.state,
+                    crate::model::tree::LoadState::Loaded | crate::model::tree::LoadState::Stale
+                );
+            let edge = l.frame.size().min_element();
+            let simple = can_simplify && edge / painter.scale < SIMPLE_FILE_PX;
             in_group(painter, slot, size, |painter| {
+                if live && can_simplify {
+                    painter.commands.entity(painter.parent).insert(DenseFile {
+                        name: child_node.name.as_str().into(),
+                        state: child_node.state,
+                        frame: l.frame,
+                        background,
+                        z,
+                        no_cull: painter.no_cull,
+                        simple,
+                    });
+                }
                 status::draw_file(
                     painter,
                     source.previews,
@@ -371,6 +495,7 @@ fn draw_children(
                     z,
                     live,
                     loaded,
+                    simple,
                 );
             });
             // 名前はプレビューの下に、同じフォルダの中のフォルダの耳の名前と同じ大きさで書く。
@@ -421,9 +546,13 @@ fn mark_catalog(
     let prev_layer = painter.layer.clone();
     painter.layer = RenderLayers::layer(OVERLAY_LAYER);
     let frame = source.layouts[id].frame;
-    in_group(painter, slot, size, |painter| {
-        tag::draw_body_marks(painter, marks, id, frame, z);
-    });
+    let has_body_mark =
+        marks.dim.contains(&id) || marks.selected.is_some_and(|(selected, _)| selected == id);
+    if has_body_mark {
+        in_group(painter, slot, size, |painter| {
+            tag::draw_body_marks(painter, marks, id, frame, z);
+        });
+    }
     if source.tree.nodes[id].is_dir {
         tag::draw_tag(
             painter,
@@ -567,6 +696,120 @@ pub struct LabelFont(pub Handle<Font>);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_file_crosses_detail_threshold_while_view_is_busy() {
+        let mut app = App::new();
+        let mut meshes = Assets::default();
+        let theme = UiThemeAssets::load(&mut Assets::default(), &mut meshes);
+        app.insert_resource(meshes)
+            .init_resource::<Assets<ColorMaterial>>()
+            .init_resource::<PreviewRegistry>()
+            .insert_resource(theme)
+            .insert_resource(LabelFont(Handle::default()))
+            .init_resource::<PendingDenseFiles>()
+            .insert_resource(crate::view::Busy(true))
+            .add_systems(Update, refresh_file_details);
+        let mut ortho = OrthographicProjection::default_2d();
+        ortho.scale = 2.0;
+        let camera = app
+            .world_mut()
+            .spawn((crate::view::MainCamera, Projection::Orthographic(ortho)))
+            .id();
+        let parent = app.world_mut().spawn_empty().id();
+        let file = app
+            .world_mut()
+            .spawn((
+                DenseFile {
+                    name: "sample.txt".into(),
+                    state: crate::model::tree::LoadState::Loaded,
+                    frame: Rect::new(0.0, 0.0, 24.0, 24.0),
+                    background: BACKGROUND,
+                    z: 0.0,
+                    no_cull: true,
+                    simple: false,
+                },
+                ChildOf(parent),
+                RenderLayers::layer(CONTENT_LAYER),
+            ))
+            .id();
+        app.update();
+        assert_eq!(app.world().get::<Children>(file).unwrap().len(), 1);
+        for (scale, simple) in [(1.0, false), (2.0, true)] {
+            let mut camera = app.world_mut().get_mut::<Projection>(camera).unwrap();
+            let Projection::Orthographic(ortho) = &mut *camera else {
+                unreachable!()
+            };
+            ortho.scale = scale;
+            app.update();
+            assert!(app.world().resource::<crate::view::Busy>().0);
+            assert_eq!(app.world().get::<DenseFile>(file).unwrap().simple, simple);
+            assert_eq!(
+                app.world().get::<Children>(file).unwrap().len() == 1,
+                simple
+            );
+        }
+    }
+
+    #[test]
+    fn unmarked_catalog_node_does_not_spawn_a_body_group() {
+        let tree = FileTree::deep(4);
+        let (spec, ears) = crate::view::ear_spec_for_view(
+            &crate::settings::Settings::default(),
+            Vec2::new(800.0, 600.0),
+        );
+        let layouts =
+            crate::layout::layout(&tree, FileTree::ROOT, crate::layout::anchor_body(), spec);
+        let mut world = World::new();
+        let root = world.spawn_empty().id();
+        let mut meshes = Assets::default();
+        let mut materials = Assets::default();
+        let theme = UiThemeAssets::load(&mut Assets::default(), &mut meshes);
+        let id = tree.nodes[FileTree::ROOT].children[0];
+        let mut marks = crate::catalog::CatalogMarks::default();
+        for marked in [false, true] {
+            if marked {
+                marks.dim.insert(id);
+            }
+            let source = SceneSource {
+                tree: &tree,
+                layouts: &layouts,
+                images: &FolderImages::default(),
+                previews: &PreviewRegistry::default(),
+                font: &Handle::default(),
+                ears: &ears,
+                theme: &theme,
+                highlight: None,
+                catalog: Some(&marks),
+            };
+            mark_catalog(
+                &mut Painter {
+                    commands: &mut world.commands(),
+                    meshes: &mut meshes,
+                    materials: &mut materials,
+                    material_cache: default(),
+                    parent: root,
+                    layer: RenderLayers::layer(CONTENT_LAYER),
+                    scale: 1.0,
+                    font: Handle::default(),
+                    theme: &theme,
+                    no_cull: true,
+                },
+                &source,
+                id,
+                slot_of(&tree, &layouts, id),
+                size_of(&tree, &layouts, &ears, id, true),
+                0.0,
+            );
+            world.flush();
+            assert_eq!(
+                world
+                    .get::<Children>(root)
+                    .map_or(0, |children| children.len()),
+                usize::from(marked)
+            );
+        }
+    }
 
     #[test]
     fn fitted_folder_uses_the_exact_same_body_at_every_window_size() {

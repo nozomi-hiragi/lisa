@@ -31,16 +31,30 @@ fn main() {
     if open_marker::forward_to_running(&open_marker::marker_args()) {
         return;
     }
-    if settings::load().lan_share >= 0.5 {
+    let settings = settings::load();
+    if settings.lan_share >= 0.5 {
         lan::ensure_sidecar();
     }
     let (present_mode, present_label, bad_present) =
         parse_present_mode(std::env::var("LISA_PRESENT_MODE").ok().as_deref());
     let (_, update_label, _) =
         view::parse_update_mode(std::env::var("LISA_UPDATE_MODE").ok().as_deref());
-    let backend_label =
-        describe_wgpu_backend(std::env::var("WGPU_BACKEND").ok().as_deref(), cfg!(windows));
     let mut app = App::new();
+    app.add_plugins(LogPlugin {
+        // ICU4X の改行位置データを同梱していないため、その警告を止める。
+        filter: format!("{DEFAULT_FILTER},icu_provider=off"),
+        custom_layer: file_log_layer,
+        ..default()
+    });
+    let backend_env = std::env::var_os("WGPU_BACKEND");
+    #[cfg(windows)]
+    let backend = windows_backend::choose(
+        backend_env.as_deref(),
+        &settings.windows_backend,
+        scan::data_dir().as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        windows_backend::has_vulkan_adapter,
+    );
     let mut primary = Window {
         title: "Lisa — Root".into(),
         present_mode,
@@ -54,18 +68,14 @@ fn main() {
             primary_window: Some(primary),
             ..default()
         })
-        .set(LogPlugin {
-            // TODO: 日本語・中国語の改行位置データ（ICU4X のセグメンテーションモデル）を同梱して
-            // いないため、その警告（icu_provider::error）を止めている。ラベルを折り返すように
-            // なったら、Bevy の `complex_script_segmentation` 機能でデータを入れ、この絞り込みと
-            // Cargo.toml の icu_provider の logging 機能を外す（README の「既知の課題」を参照）。
-            filter: format!("{DEFAULT_FILTER},icu_provider=off"),
-            custom_layer: file_log_layer,
-            ..default()
-        })
+        .disable::<LogPlugin>()
         // 音とゲームパッドは使わない。どちらも作るときに OS の機器を開くので、Windows で
         // 起動の途中で止まることがあった（GPU の情報のあとで止まり、Lisa の処理まで来なかった）。
-        .set(render_plugin())
+        .set(render_plugin(
+            backend_env.as_deref(),
+            #[cfg(windows)]
+            backend.backends,
+        ))
         .disable::<bevy::audio::AudioPlugin>()
         .disable::<bevy::gilrs::GilrsPlugin>();
     // macOS では wgpu-hal 30.0.2（src/metal/surface.rs）が acquire_texture の中で
@@ -79,7 +89,11 @@ fn main() {
     info!("Bevy の準備ができました");
     app.add_plugins(preview::PreviewPlugin);
     app.add_plugins((
-        settings::SettingsPlugin,
+        settings::SettingsPlugin(
+            settings,
+            #[cfg(windows)]
+            backend_env.as_ref().is_some_and(|value| !value.is_empty()),
+        ),
         scan::ScanPlugin,
         lan::LanPlugin,
         view::TreeViewPlugin,
@@ -103,7 +117,25 @@ fn main() {
     if let Some(bad) = bad_present {
         warn!("知らない LISA_PRESENT_MODE={bad:?}（auto_vsync を使います）");
     }
-    log_startup(&backend_label, present_label, update_label);
+    #[cfg(windows)]
+    if let Some(path) = backend.probe {
+        windows_backend::clear_after_rendering(&mut app, path);
+    }
+    #[cfg(windows)]
+    app.add_systems(
+        Startup,
+        move |adapter: Option<Res<bevy::render::renderer::RenderAdapterInfo>>| {
+            let label =
+                describe_wgpu_backend(backend_env.as_deref(), &backend.reason, adapter.as_deref());
+            log_startup(&label, present_label, update_label);
+        },
+    );
+    #[cfg(not(windows))]
+    log_startup(
+        &describe_wgpu_backend(backend_env.as_deref()),
+        present_label,
+        update_label,
+    );
     app.run();
 }
 
@@ -225,32 +257,75 @@ fn parse_present_mode(raw: Option<&str>) -> (PresentMode, &'static str, Option<S
     }
 }
 
-/// 起動ログに出す backend の表示（環境変数 `WGPU_BACKEND` の値か、既定のどちらか）。
-fn describe_wgpu_backend(raw: Option<&str>, is_windows: bool) -> String {
-    if let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) {
-        format!("{s} (env)")
-    } else if is_windows {
-        "gl (default)".into()
-    } else {
-        "auto (default)".into()
+/// 起動ログに出す backend と選定理由。
+fn describe_wgpu_backend(
+    raw: Option<&std::ffi::OsStr>,
+    #[cfg(windows)] reason: &str,
+    #[cfg(windows)] adapter: Option<&bevy::render::renderer::RenderAdapterInfo>,
+) -> String {
+    #[cfg(windows)]
+    if let Some(adapter) = adapter {
+        return format!(
+            "{} ({reason})",
+            format!("{:?}", adapter.backend).to_ascii_lowercase()
+        );
     }
+    let requested = raw
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    #[cfg(windows)]
+    return format!("{} ({reason})", requested.unwrap_or("auto"));
+    #[cfg(not(windows))]
+    requested.map_or_else(|| "auto (default)".into(), |value| format!("{value} (env)"))
 }
 
-/// 描き方の設定。Windows は、`WGPU_BACKEND` が無ければ（または空文字列なら）OpenGL で描く。
-/// Intel Iris Graphics 550 の PC で、Vulkan だと GPU の情報を出した直後に、panic もなく
-/// プロセスごと落ち（ドライバーの中で落ちていると見ている）、DirectX 12 だと画面がちらつき、
-/// しばらくすると GPU を見失って落ちた（`material uniform data 0` が invalid）ため。
-fn render_plugin() -> bevy::render::RenderPlugin {
-    use bevy::render::settings::{Backends, RenderCreation, WgpuSettings};
+fn render_plugin(
+    env: Option<&std::ffi::OsStr>,
+    #[cfg(windows)] chosen: Option<wgpu::Backends>,
+) -> bevy::render::RenderPlugin {
+    use bevy::render::settings::{RenderCreation, WgpuSettings};
     let mut settings = WgpuSettings::default();
-    let env = std::env::var_os("WGPU_BACKEND");
-    let default_gl = cfg!(windows) && is_unset(env.as_deref());
-    if default_gl {
-        settings.backends = Some(Backends::GL);
+    #[cfg(windows)]
+    if let Some(chosen) = chosen {
+        settings.backends = Some(chosen);
     }
-    if default_gl || is_gl_backend(env.as_deref()) {
-        // OpenGL では、Bevy が組み込む SSAO の compute shader（textureGatherOffset）が作れずに落ちる。
-        // Lisa は SSAO を使わないので、SSAO が「使えない GPU」と判断して組み込みを飛ばす値まで下げる。
+    #[cfg(windows)]
+    let gl = {
+        use bevy::render::renderer::initialize_renderer;
+        use wgpu::{Backend, Backends};
+
+        if let Some(candidates) = settings.backends
+            && candidates.contains(Backends::GL)
+            && candidates != Backends::GL
+        {
+            // 複数候補を指定した場合は Bevy と同じ選定を行い、GL だったときだけ制限付きで開き直す。
+            // この時点では Winit のイベントループ開始前で、通常の自動初期化にもウィンドウのハンドルはない。
+            let resources = bevy::tasks::block_on(initialize_renderer(candidates, None, &settings));
+            if resources.2.backend != Backend::Gl {
+                return bevy::render::RenderPlugin {
+                    render_creation: resources.into(),
+                    ..default()
+                };
+            }
+            drop(resources);
+            settings.backends = Some(Backends::GL);
+        }
+        settings.backends == Some(Backends::GL)
+    };
+    #[cfg(not(windows))]
+    let gl = env.and_then(|v| v.to_str()).is_some_and(|v| {
+        v.split(',').any(|b| {
+            matches!(
+                b.trim().to_ascii_lowercase().as_str(),
+                "gl" | "gles" | "opengl"
+            )
+        })
+    });
+    #[cfg(windows)]
+    let _ = env;
+    if gl {
+        // Lisa で使わない SSAO の compute shader は OpenGL で組み込まない。
         settings.constrained_limits = Some(bevy::render::settings::WgpuLimits {
             max_storage_textures_per_shader_stage: 4,
             ..bevy::render::settings::WgpuLimits::unlimited()
@@ -262,19 +337,215 @@ fn render_plugin() -> bevy::render::RenderPlugin {
     }
 }
 
-fn is_gl_backend(wgpu_backend: Option<&std::ffi::OsStr>) -> bool {
-    wgpu_backend.and_then(|v| v.to_str()).is_some_and(|v| {
-        v.split(',').any(|b| {
-            matches!(
-                b.trim().to_ascii_lowercase().as_str(),
-                "gl" | "gles" | "opengl"
-            )
-        })
-    })
-}
+#[cfg(any(windows, test))]
+mod windows_backend {
+    use bevy::prelude::*;
+    use bevy::render::settings::Backends;
+    use serde::{Deserialize, Serialize};
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-fn is_unset(wgpu_backend: Option<&std::ffi::OsStr>) -> bool {
-    wgpu_backend.filter(|v| !v.is_empty()).is_none()
+    const FALLBACK: &str = "gpu-backend-fallback.json";
+    const PROBE: &str = "gpu-backend-probe.json";
+    const INCOMPLETE: &str = "previous_vulkan_probe_incomplete";
+
+    #[derive(Deserialize, Serialize)]
+    struct Marker {
+        backend: String,
+        version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    }
+
+    enum ReadMarker {
+        Present(Marker),
+        Broken,
+        Unavailable,
+    }
+
+    fn read_marker(path: &Path, backend: &str) -> ReadMarker {
+        let text = match fs::read(path) {
+            Ok(text) => text,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "描画方式の記録を読めませんでした（{}）: {error}",
+                        path.display()
+                    );
+                }
+                return ReadMarker::Unavailable;
+            }
+        };
+        match serde_json::from_slice::<Marker>(&text) {
+            Ok(marker) if marker.backend == backend => ReadMarker::Present(marker),
+            _ => {
+                warn!("描画方式の記録が壊れています（{}）", path.display());
+                ReadMarker::Broken
+            }
+        }
+    }
+
+    fn write_marker(path: &Path, backend: &str, version: &str, reason: Option<&str>) -> bool {
+        let marker = Marker {
+            backend: backend.into(),
+            version: version.into(),
+            reason: reason.map(str::to_owned),
+        };
+        let result = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|_| serde_json::to_vec(&marker).map_err(std::io::Error::other))
+            .and_then(|text| fs::write(path, text));
+        if let Err(error) = result {
+            warn!(
+                "描画方式を記録できませんでした（{}）: {error}",
+                path.display()
+            );
+            return false;
+        }
+        true
+    }
+
+    fn remove_marker(path: &Path) {
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                "描画方式の記録を消せませんでした（{}）: {error}",
+                path.display()
+            );
+        }
+    }
+
+    pub(crate) fn clear_markers(dir: &Path) {
+        remove_marker(&dir.join(FALLBACK));
+        remove_marker(&dir.join(PROBE));
+    }
+
+    pub(super) struct Selection {
+        pub backends: Option<Backends>,
+        pub reason: String,
+        pub probe: Option<PathBuf>,
+    }
+
+    pub(super) fn choose(
+        env: Option<&OsStr>,
+        setting: &str,
+        dir: Option<&Path>,
+        version: &str,
+        has_vulkan_adapter: impl FnOnce() -> bool,
+    ) -> Selection {
+        let select = |backends, reason: &str| Selection {
+            backends,
+            reason: reason.into(),
+            probe: None,
+        };
+        if env.is_some_and(|value| !value.is_empty()) {
+            return select(None, "env");
+        }
+        match setting {
+            "vulkan" => return select(Some(Backends::VULKAN), "setting"),
+            "gl" => return select(Some(Backends::GL), "setting"),
+            _ => {}
+        }
+        let mut probe = None;
+        if let Some(dir) = dir {
+            let fallback = dir.join(FALLBACK);
+            match read_marker(&fallback, "gl") {
+                ReadMarker::Present(marker) if marker.version == version => {
+                    let reason = marker.reason.as_deref().unwrap_or(INCOMPLETE);
+                    return select(Some(Backends::GL), &format!("fallback: {reason}"));
+                }
+                ReadMarker::Present(_) | ReadMarker::Broken => remove_marker(&fallback),
+                ReadMarker::Unavailable => {}
+            }
+            let path = dir.join(PROBE);
+            match read_marker(&path, "vulkan") {
+                ReadMarker::Present(Marker {
+                    version: previous, ..
+                }) if previous != version => {
+                    remove_marker(&path);
+                }
+                ReadMarker::Present(_) | ReadMarker::Broken => {
+                    warn!("前回の Vulkan 描画が安定する前に終了したため OpenGL で起動します");
+                    write_marker(&fallback, "gl", version, Some(INCOMPLETE));
+                    remove_marker(&path);
+                    return select(Some(Backends::GL), &format!("fallback: {INCOMPLETE}"));
+                }
+                ReadMarker::Unavailable => {}
+            }
+            if write_marker(&path, "vulkan", version, None) {
+                probe = Some(path);
+            }
+        }
+
+        // 列挙自体でドライバーが異常終了しても次回は OpenGL に切り替える。
+        if !has_vulkan_adapter() {
+            if let Some(path) = probe {
+                remove_marker(&path);
+            }
+            return select(Some(Backends::GL), "fallback: no_vulkan_adapter");
+        }
+
+        Selection {
+            probe,
+            ..select(Some(Backends::VULKAN), "auto")
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn has_vulkan_adapter() -> bool {
+        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = Backends::VULKAN;
+        let instance = wgpu::Instance::new(descriptor);
+        !bevy::tasks::block_on(instance.enumerate_adapters(Backends::VULKAN)).is_empty()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn clear_after_rendering(app: &mut App, path: PathBuf) {
+        use bevy::render::{Render, RenderApp, RenderSystems, view::ExtractedWindow};
+        use bevy::window::{PrimaryWindow, RequestRedraw};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+        let probing = Arc::new(AtomicBool::new(true));
+        let rendering = probing.clone();
+        let mut path = Some(path);
+        let mut frames = 0;
+        render_app.add_systems(
+            Render,
+            (move |window: Option<Single<&ExtractedWindow, With<PrimaryWindow>>>| {
+                if path.is_none() {
+                    return;
+                }
+                // 描画後に取得済みのテクスチャが取り外されていれば present を通った。
+                if window.is_some_and(|win| {
+                    win.swap_chain_texture_view.is_some() && win.swap_chain_texture.is_none()
+                }) {
+                    frames += 1;
+                    if frames == 5
+                        && let Some(path) = path.take()
+                    {
+                        remove_marker(&path);
+                        rendering.store(false, Ordering::Relaxed);
+                    }
+                }
+            })
+            .after(RenderSystems::Render)
+            .before(RenderSystems::Cleanup),
+        );
+        app.add_systems(Update, move |mut redraw: MessageWriter<RequestRedraw>| {
+            if probing.load(Ordering::Relaxed) {
+                redraw.write(RequestRedraw);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -282,20 +553,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gl_default_handles_unset_and_empty_wgpu_backend() {
-        assert!(is_gl_backend(Some(std::ffi::OsStr::new("gl"))));
-        assert!(is_gl_backend(Some(std::ffi::OsStr::new("dx12,GL"))));
-        assert!(!is_gl_backend(Some(std::ffi::OsStr::new("dx12"))));
-        assert!(!is_gl_backend(None));
-
-        assert!(is_unset(None));
-        assert!(is_unset(Some(std::ffi::OsStr::new(""))));
-        assert!(!is_unset(Some(std::ffi::OsStr::new("vulkan"))));
-        assert!(!is_unset(Some(std::ffi::OsStr::new("dx12"))));
-
-        assert_eq!(describe_wgpu_backend(None, true), "gl (default)");
-        assert_eq!(describe_wgpu_backend(Some(""), false), "auto (default)");
-        assert_eq!(describe_wgpu_backend(Some("vulkan"), true), "vulkan (env)");
+    fn windows_backend_auto_probe_and_version() {
+        use bevy::render::settings::Backends;
+        use windows_backend::choose;
+        let dir = std::env::temp_dir().join(format!("lisa-backend-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = Some(dir.as_path());
+        let probe = dir.join("gpu-backend-probe.json");
+        let fallback = dir.join("gpu-backend-fallback.json");
+        std::fs::write(&probe, "{").unwrap();
+        assert_eq!(
+            choose(
+                Some(std::ffi::OsStr::new("vulkan")),
+                "gl",
+                data,
+                "1",
+                || panic!()
+            )
+            .reason,
+            "env"
+        );
+        for (setting, expected) in [("gl", Backends::GL), ("vulkan", Backends::VULKAN)] {
+            assert_eq!(
+                choose(None, setting, data, "1", || panic!()).backends,
+                Some(expected)
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&probe).unwrap(), "{");
+        assert_eq!(
+            choose(None, "auto", data, "1", || panic!()).backends,
+            Some(Backends::GL)
+        );
+        assert!(!probe.exists());
+        assert!(fallback.exists());
+        assert_eq!(
+            choose(None, "auto", data, "1", || panic!()).backends,
+            Some(Backends::GL)
+        );
+        let retried = choose(None, "auto", data, "2", || true);
+        assert_eq!(retried.backends, Some(Backends::VULKAN));
+        assert_eq!(retried.probe, Some(probe.clone()));
+        assert!(!fallback.exists());
+        assert_eq!(
+            choose(None, "auto", data, "2", || panic!()).backends,
+            Some(Backends::GL)
+        );
+        std::fs::write(&fallback, "{").unwrap();
+        let missing = choose(None, "auto", data, "2", || false);
+        assert_eq!(missing.backends, Some(Backends::GL));
+        assert_eq!(missing.reason, "fallback: no_vulkan_adapter");
+        assert!(!fallback.exists());
+        assert!(!probe.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -429,6 +429,7 @@ pub(super) fn refresh_displays(
         display.body = body;
         display.load_state = load_state;
         let mut painter = Painter {
+            material_cache: default(),
             commands: &mut maker.commands,
             meshes: &mut maker.meshes,
             materials: &mut maker.materials,

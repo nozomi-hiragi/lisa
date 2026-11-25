@@ -1994,6 +1994,7 @@ pub const ALLOWED_APP_ENV_KEYS: &[&str] = &[
     "LISA_PRESENT_MODE",
     "LISA_UPDATE_MODE",
     "RUST_LOG",
+    "LISA_RENDER_DIAG",
 ];
 /// 検証用ビルドだけ、アプリの制御口の検証用の頼み（`LISA_DEBUG_REMOTE`）を開けられる。
 fn verify_env_key(key: &str) -> bool {
@@ -4726,4 +4727,10 @@ mod tests {
                 .contains("4 枚から 2 枚に減らしました")
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn render_diagnostics_env_is_allowed() {
+    assert!(ALLOWED_APP_ENV_KEYS.contains(&"LISA_RENDER_DIAG"));
 }
