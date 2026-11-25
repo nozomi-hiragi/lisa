@@ -190,7 +190,17 @@ impl Device {
     }
 
     fn ask_keep(&self, target: &Device, keeper: &str, files: &[&str]) -> i64 {
-        let keep = self.reference(keeper);
+        self.ask_keep_on(self, target, keeper, files)
+    }
+
+    fn ask_keep_on(
+        &self,
+        keeper_device: &Device,
+        target: &Device,
+        keeper: &str,
+        files: &[&str],
+    ) -> i64 {
+        let keep = keeper_device.reference(keeper);
         let target_endpoint = peer(&self.dir, &target.id).unwrap();
         let request = uuid::Uuid::new_v4().to_string();
         let issuer = Server {
@@ -304,6 +314,182 @@ fn over_http_marker_sync_keeps_reservation_until_ack_and_retries_terminal_genera
     assert!(links::sources(&keeper, &marker.target).unwrap().is_empty());
     assert!(links::permits(&keeper).unwrap()[0].revoked);
     assert!(links::pending(&db).unwrap().is_empty());
+}
+
+#[test]
+fn over_http_moves_target_and_source_through_a_separate_relay() {
+    use lisa_core::merged::{self, links};
+    use organize::OpInput;
+
+    let (relay, source) = fixtures();
+    let target = Device::create(relay.root.parent().unwrap(), "target");
+    target.pair(&relay, "target-to-relay", "relay-to-target");
+    fs::write(
+        target
+            .dir
+            .join(organize::remote_keep::relay::DISCOVERY_FILE),
+        json!({relay.id.clone(): {"address": format!("127.0.0.1:{}", relay.port),
+                                  "seen_at": lisa_core::db::now_ms()}})
+        .to_string(),
+    )
+    .unwrap();
+    let peers_path = relay.dir.join("peers.json");
+    let mut peers: Vec<Value> = serde_json::from_slice(&fs::read(&peers_path).unwrap()).unwrap();
+    peers.push(json!({
+        "device_id": target.id, "addr": "127.0.0.1", "port": target.port, "key": "relay-to-target",
+    }));
+    let online_peers = serde_json::to_vec(&peers).unwrap();
+    fs::write(&peers_path, &online_peers).unwrap();
+
+    let merge = relay.ask_keep_on(&target, &source, "0.txt", &["1.txt"]);
+    assert_eq!(execute(&source, merge).unwrap().done, 1);
+    let mut source_db = source.reopen();
+    let mut source_ctx = Context::with_builtin(source.dir.clone());
+    source_ctx.link_client = Some(super::link_relay_client);
+    organize::flush_links(&mut source_db, &source_ctx).unwrap();
+    let source_path = source.mount.join("1.txt.lmf");
+    let before = merged::read(&source_path).unwrap();
+
+    let mut target_db = target.reopen();
+    let mut target_ctx = Context::with_builtin(target.dir.clone());
+    target_ctx.relocation_client = Some(super::relocation_client);
+    let destination = target.mount.join("retargeted.txt");
+    let move_plan = |db: &mut Db, ctx: &Context, from: PathBuf, to: PathBuf| {
+        let created =
+            organize::create_plan(db, ctx, "test", None, &[OpInput::Move { from, to }], false)
+                .unwrap();
+        let id = created.id.unwrap_or_else(|| panic!("{:?}", created.checks));
+        organize::approve_plan(db, id, false).unwrap();
+        assert_eq!(organize::execute_plan(db, ctx, id).unwrap().done, 1);
+        id
+    };
+    // 中継から目印を持つ端末にだけ届かない状態を再現する。
+    peers.retain(|peer| peer["device_id"] != source.id);
+    fs::write(&peers_path, serde_json::to_vec(&peers).unwrap()).unwrap();
+    let id = move_plan(
+        &mut target_db,
+        &target_ctx,
+        target.mount.join("0.txt"),
+        destination.clone(),
+    );
+    assert_eq!(merged::read(&source_path).unwrap(), before);
+    assert_eq!(
+        links::status(&target_db, &before.link_id)
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+    assert!(
+        organize::plan_ops(&target_db, id).unwrap()[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("自動追従")
+    );
+    let postponed = organize::undo_plan(&mut target_db, &target_ctx, id).unwrap();
+    assert_eq!(postponed.undone, 0);
+    assert_eq!(postponed.state, PlanState::Done);
+    assert!(destination.is_file());
+    assert!(merged::resolve_target(&target_db, &before).is_err());
+    fs::write(&peers_path, online_peers).unwrap();
+    organize::flush_links(&mut target_db, &target_ctx).unwrap();
+    let after = merged::read(&source_path).unwrap();
+    assert_eq!(after.target.relative_path, ["retargeted.txt"]);
+    assert!(merged::resolve_target(&target_db, &after).is_ok());
+    assert_eq!(links::permits(&relay.reopen()).unwrap()[0].generation, 3);
+    assert_eq!(
+        links::status(&target_db, &before.link_id)
+            .unwrap()
+            .as_deref(),
+        Some("confirmed")
+    );
+
+    assert_eq!(
+        organize::undo_plan(&mut target_db, &target_ctx, id)
+            .unwrap()
+            .undone,
+        1
+    );
+    assert_eq!(merged::read(&source_path).unwrap(), before);
+    assert_eq!(links::permits(&relay.reopen()).unwrap()[0].generation, 4);
+
+    source_db
+        .save_listing(
+            "fixture-drive",
+            &source.mount,
+            &source.mount,
+            &listing::read_dir(&source.mount).map_err(|error| error.to_string()),
+        )
+        .unwrap();
+    let new_source = source.mount.join("relocated.lmf");
+    move_plan(&mut source_db, &source_ctx, source_path, new_source.clone());
+    organize::flush_links(&mut source_db, &source_ctx).unwrap();
+    let moved_marker = merged::read(&new_source).unwrap();
+    assert_eq!(moved_marker.source.relative_path, ["relocated"]);
+    assert_eq!(
+        links::sources(&target_db, &before.target).unwrap()[0].marker,
+        moved_marker
+    );
+    assert_eq!(links::permits(&relay.reopen()).unwrap()[0].generation, 5);
+
+    let offline_peers: Vec<_> = peers
+        .into_iter()
+        .filter(|peer| peer["device_id"] != target.id)
+        .collect();
+    let connected_peers = fs::read(&peers_path).unwrap();
+    fs::write(&peers_path, serde_json::to_vec(&offline_peers).unwrap()).unwrap();
+    let final_target = target.mount.join("combined.txt");
+    let final_source = source.mount.join("combined.lmf");
+    move_plan(
+        &mut target_db,
+        &target_ctx,
+        target.mount.join("0.txt"),
+        final_target,
+    );
+    move_plan(
+        &mut source_db,
+        &source_ctx,
+        new_source,
+        final_source.clone(),
+    );
+    assert_eq!(
+        links::status(&target_db, &before.link_id)
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+    assert_eq!(
+        links::status(&source_db, &before.link_id)
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+    fs::write(&peers_path, connected_peers).unwrap();
+    // 実体側の保留中に目印側から先に再送しても、双方の変更が中継で合流する。
+    organize::flush_links(&mut source_db, &source_ctx).unwrap();
+    organize::flush_links(&mut target_db, &target_ctx).unwrap();
+    organize::flush_links(&mut source_db, &source_ctx).unwrap();
+    let combined = merged::read(&final_source).unwrap();
+    assert_eq!(combined.source.relative_path, ["combined"]);
+    assert_eq!(combined.target.relative_path, ["combined.txt"]);
+    assert!(merged::resolve_target(&target_db, &combined).is_ok());
+    assert_eq!(
+        links::sources(&target_db, &combined.target).unwrap()[0].marker,
+        combined
+    );
+    assert_eq!(links::permits(&relay.reopen()).unwrap()[0].generation, 7);
+    assert_eq!(
+        links::status(&source_db, &before.link_id)
+            .unwrap()
+            .as_deref(),
+        Some("confirmed")
+    );
+    assert_eq!(
+        links::status(&target_db, &before.link_id)
+            .unwrap()
+            .as_deref(),
+        Some("confirmed")
+    );
 }
 
 #[test]

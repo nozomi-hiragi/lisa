@@ -63,8 +63,18 @@ impl Server {
         };
         if tool == "lisa_merged_receive_transfer" {
             let request = serde_json::from_value(args["request"].clone()).map_err(err)?;
-            let reply =
-                lisa_core::organize::receive_transfer(&mut self.db()?, device_id, &request)?;
+            let (reply, touched) = lisa_core::organize::receive_transfer(
+                &mut self.db()?,
+                &self.data_dir,
+                device_id,
+                &request,
+            )?;
+            if let Some(path) = touched {
+                let _ = lisa_core::remote::send(
+                    &self.data_dir,
+                    lisa_core::remote::Command::Rescan { path },
+                );
+            }
             return serde_json::to_value(reply).map_err(err);
         }
         if tool == "lisa_merged_link_update" {

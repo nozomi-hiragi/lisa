@@ -1270,6 +1270,7 @@ fn row_to_match_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MatchRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1555,11 +1556,25 @@ path = "package.json"
             db.conn().execute(sql, args).unwrap();
         };
 
-        // フォルダを別の親へ動かす（旧い親と新しい親の両方を当て直す）。
-        exec(
-            &db,
-            "UPDATE entry SET parent_id = ?1 WHERE id = ?2",
-            &[&archive_id, &game_id],
+        // 整理がフォルダを移動すると旧親、新親、フォルダ自身が再評価に入る。
+        let moved = one.0.join("Archive").join(game.file_name().unwrap());
+        fs::rename(&game, &moved).unwrap();
+        db.move_entry("test:1", &one.0, &game, &moved).unwrap();
+        let dirty: BTreeSet<i64> = db
+            .conn()
+            .prepare("SELECT id FROM catalog_dirty")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            dirty,
+            BTreeSet::from([
+                game_id,
+                archive_id,
+                db.drive_root("test:1").unwrap().unwrap().id
+            ])
         );
         check(&db, 3);
         // 当たりの目印のファイルの名前を変える。

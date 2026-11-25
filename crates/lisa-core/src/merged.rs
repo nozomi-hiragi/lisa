@@ -27,12 +27,35 @@ pub struct Location {
 
 impl Location {
     pub(crate) fn local(db: &crate::db::Db, volume_id: &str, path: &Path) -> Option<Self> {
-        let device_id = db.meta("this_device").ok()??;
-        let (device_name, _) = crate::query::this_device(db).ok()??;
         let drive = crate::query::drives(db)
             .ok()?
             .into_iter()
             .find(|drive| drive.id == volume_id)?;
+        Self::from_drive(db, drive, path)
+    }
+
+    /// DB にまだ行がない移動先も、記録済みのマウントから所在を組み立てられる。
+    pub(crate) fn local_for_path(db: &crate::db::Db, path: &Path) -> Option<Self> {
+        let drive = crate::query::drives(db)
+            .ok()?
+            .into_iter()
+            .filter(|drive| {
+                drive
+                    .mount
+                    .as_ref()
+                    .is_some_and(|mount| path.starts_with(mount))
+            })
+            .max_by_key(|drive| drive.mount.as_ref().map(|mount| mount.components().count()))?;
+        let mount = drive.mount.as_ref()?;
+        let actual = crate::db::stored_components(mount, path)?
+            .iter()
+            .fold(mount.clone(), |path, name| path.join(name));
+        Self::from_drive(db, drive, &actual)
+    }
+
+    fn from_drive(db: &crate::db::Db, drive: crate::query::Drive, path: &Path) -> Option<Self> {
+        let device_id = db.meta("this_device").ok()??;
+        let (device_name, _) = crate::query::this_device(db).ok()??;
         let mount = drive.mount.as_ref()?;
         // 名前の無いボリューム（Windows の C: など）は、マウント先で呼ぶ。
         let volume_name = if drive.label.trim().is_empty() {

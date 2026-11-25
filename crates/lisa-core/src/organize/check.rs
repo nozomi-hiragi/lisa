@@ -530,6 +530,10 @@ fn check_single_op(
                 Err(reason) => return Ok(refused(item, reason)),
             };
 
+            if let Err(reason) = super::linked_move::check(db, &item.src, &dst) {
+                return Ok(refused(item, reason));
+            }
+
             // 行き先が無い（上書きしない）。
             match super::move_destination_exists(&item.src, &dst) {
                 Ok(false) => {}
@@ -911,6 +915,7 @@ pub(crate) fn recheck_op_before_apply(db: &Db, ctx: &Context, op: &PlanOp) -> Re
                 .ok_or_else(|| "元が DB にありません".to_string())?;
             let verified = check_db_and_disk_source(db, &loc)?;
             check_matches_recorded(op, &verified)?;
+            super::linked_move::check(db, &op.src, dst)?;
 
             if super::move_destination_exists(&op.src, dst)
                 .map_err(|e| format!("行き先を確かめられません: {e}"))?

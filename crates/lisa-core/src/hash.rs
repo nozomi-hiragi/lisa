@@ -217,7 +217,7 @@ pub(crate) fn tree_bytes_with_markers(
 }
 
 /// 子の保存済みハッシュがそろっていれば、ファイルを開かずにフォルダの中身を作る。
-pub(crate) fn ready_tree_bytes(children: &[Stored]) -> Option<Vec<u8>> {
+pub(crate) fn ready_tree_bytes(children: &mut [Stored]) -> Option<Vec<u8>> {
     if children.iter().any(|child| {
         child.hash.is_none()
             && child.error.is_none()
@@ -227,6 +227,10 @@ pub(crate) fn ready_tree_bytes(children: &[Stored]) -> Option<Vec<u8>> {
     }) {
         return None;
     }
+    // 整理が先に DB を更新した場合、一覧を読み直すまでは pos が仮の順序。
+    children.sort_by(|a, b| {
+        crate::name::hash_order(&a.name_nfc, &a.name_raw, &b.name_nfc, &b.name_raw)
+    });
     Some(stored_tree_bytes(children))
 }
 
@@ -285,10 +289,19 @@ pub fn hash_drive(
     on: &mut dyn FnMut(Event),
     pace: &Pace,
 ) -> db::Result<()> {
+    let move_version = db.entry_move_version()?;
     let Some(root) = db.drive_root(drive_id)? else {
         return Ok(());
     };
-    walk(db, threads, on, pace, &root, mount.to_path_buf())
+    walk(
+        db,
+        threads,
+        on,
+        pace,
+        &root,
+        mount.to_path_buf(),
+        move_version,
+    )
 }
 
 /// フォルダ `path`（ドライブ `drive_id` の `mount` の下）とその下だけをハッシュする（見ているところを
@@ -302,13 +315,22 @@ pub fn hash_folder(
     on: &mut dyn FnMut(Event),
     pace: &Pace,
 ) -> db::Result<()> {
+    let move_version = db.entry_move_version()?;
     let Some(id) = db.find_folder(drive_id, mount, path)? else {
         return Ok(());
     };
     let Some(folder) = db.entry(id)? else {
         return Ok(());
     };
-    walk(db, threads, on, pace, &folder, path.to_path_buf())
+    walk(
+        db,
+        threads,
+        on,
+        pace,
+        &folder,
+        path.to_path_buf(),
+        move_version,
+    )
 }
 
 fn walk(
@@ -318,6 +340,7 @@ fn walk(
     pace: &Pace,
     folder: &Stored,
     path: PathBuf,
+    move_version: i64,
 ) -> db::Result<()> {
     pace.apply_priority();
     let mut walker = Walker {
@@ -326,6 +349,7 @@ fn walk(
         on,
         pace,
         last_commit: Instant::now(),
+        move_version,
     };
     let result = walker.visit(folder, path);
     let committed = walker.db.commit();
@@ -343,6 +367,7 @@ struct Walker<'a> {
     on: &'a mut dyn for<'p> FnMut(Event<'p>),
     pace: &'a Pace<'a>,
     last_commit: Instant,
+    move_version: i64,
 }
 
 impl Walker<'_> {
@@ -355,6 +380,10 @@ impl Walker<'_> {
             return Ok(None);
         }
         let mut children = self.db.children(folder.id)?;
+        // 整理直後は `pos` が仮の順序なので、走査を待たず Merkle の順序に揃える。
+        children.sort_by(|a, b| {
+            crate::name::hash_order(&a.name_nfc, &a.name_raw, &b.name_nfc, &b.name_raw)
+        });
         let mut complete = true;
         // 先に子のフォルダ（名前順）。
         for child in children.iter_mut() {
@@ -388,7 +417,9 @@ impl Walker<'_> {
             // つなぎ（名前の変更や lisa-mcp）が `busy_timeout` を超えて待たされ、失敗する。
             self.db.commit()?;
             let results = self.hash_files(&children, &files, &path);
-            self.db.begin()?;
+            if !self.begin_current_write()? {
+                return Ok(None);
+            }
             for (i, result) in files.into_iter().zip(results) {
                 let child = &mut children[i];
                 match result {
@@ -415,12 +446,20 @@ impl Walker<'_> {
         }
         let entries = stored_tree_bytes(&children);
         let hash = *blake3::hash(&entries).as_bytes();
-        self.db.begin()?;
+        if !self.begin_current_write()? {
+            return Ok(None);
+        }
         self.db.set_hash(folder.id, &hash, 0, folder.mtime)?;
         self.db.save_tree(&hash, &entries)?;
         (self.on)(Event::FolderDone(&path));
         self.maybe_commit()?;
         Ok(Some(hash))
+    }
+
+    fn begin_current_write(&mut self) -> db::Result<bool> {
+        self.db.begin()?;
+        // 別のつなぎで移動が確定したら、古いパスから作ったハッシュを保存しない。
+        Ok(self.db.entry_move_version()? == self.move_version)
     }
 
     fn hash_files(
