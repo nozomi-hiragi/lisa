@@ -13,7 +13,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FileIdInfo, FileRenameInfo, GetFileInformationByHandleEx, SetFileInformationByHandle,
 };
 
-use super::{KeepReference, MAX_PROTECTED_ENTRIES, display};
+use super::{InspectRole, KeepReference, MAX_PROTECTED_ENTRIES, display};
 use crate::{
     db::Db,
     hash::{self, Hash},
@@ -50,9 +50,14 @@ pub(super) struct Protected {
 }
 
 impl Protected {
-    pub(super) fn open(db: &Db, keep: &KeepReference, path: &Path) -> Result<Self, String> {
-        let mount = local_mount(db, keep)?;
-        let (opened, root, listings) = protect(&mount, keep, path, Role::Keep)?;
+    pub(super) fn open(
+        db: &Db,
+        keep: &KeepReference,
+        path: &Path,
+        inspect: InspectRole,
+    ) -> Result<Self, String> {
+        let mount = local_mount(db, keep, inspect)?;
+        let (opened, root, listings) = protect(&mount, keep, path, Role::Keep, inspect)?;
         Ok(Self {
             mount,
             opened,
@@ -62,8 +67,9 @@ impl Protected {
     }
 
     pub(super) fn source(db: &Db, item: &KeepReference, path: &Path) -> Result<Self, String> {
-        let mount = local_mount(db, item)?;
-        let (opened, root, listings) = protect(&mount, item, path, Role::Source)?;
+        let mount = local_mount(db, item, InspectRole::Source)?;
+        let (opened, root, listings) =
+            protect(&mount, item, path, Role::Source, InspectRole::Source)?;
         Ok(Self {
             mount,
             opened,
@@ -131,7 +137,8 @@ impl Protected {
     }
 
     pub(super) fn verify(&mut self, keep: &KeepReference, path: &Path) -> Result<(), String> {
-        let (opened, _, listings) = protect(&self.mount, keep, path, Role::Keep)?;
+        let (opened, _, listings) =
+            protect(&self.mount, keep, path, Role::Keep, InspectRole::Keep)?;
         self.opened = opened;
         self.listings = listings;
         Ok(())
@@ -142,14 +149,16 @@ impl Protected {
     pub(super) fn verify_held(&mut self, keep: &KeepReference, path: &Path) -> Result<(), String> {
         let changed = || "残す項目が変更されました。重複を再取得して確認してください".to_string();
         let root = self.opened.get(self.root).ok_or_else(changed)?;
-        if identity(root)? != keep.identity || identify(&self.mount, path)? != keep.identity {
+        if identity(root)? != keep.identity
+            || identify(&self.mount, path, InspectRole::Keep)? != keep.identity
+        {
             return Err(changed());
         }
         for file in &self.opened {
             identity(file)?;
         }
         for (directory, listed) in &self.listings {
-            if *listed != entries_of(directory, 0)? {
+            if *listed != entries_of(directory, 0, InspectRole::Keep)? {
                 return Err(
                     "残すフォルダの子孫が変わりました。重複を再取得して確認してください".into(),
                 );
@@ -159,13 +168,17 @@ impl Protected {
     }
 }
 
-pub(super) fn local_mount(db: &Db, keep: &KeepReference) -> Result<PathBuf, String> {
+pub(super) fn local_mount(
+    db: &Db,
+    keep: &KeepReference,
+    inspect: InspectRole,
+) -> Result<PathBuf, String> {
     let mount = query::drives(db)
         .map_err(display)?
         .into_iter()
         .find(|drive| drive.id == keep.drive_id)
         .and_then(|drive| drive.mount)
-        .ok_or("残す側のボリュームが見つかりません")?;
+        .ok_or_else(|| format!("{}のボリュームが見つかりません", inspect.side()))?;
     let local_ntfs = volumes::list().map_err(display)?.iter().any(|volume| {
         !volume.network
             && !volume.removable
@@ -174,9 +187,10 @@ pub(super) fn local_mount(db: &Db, keep: &KeepReference) -> Result<PathBuf, Stri
             && volume.mount_path == mount
     });
     if !local_ntfs {
-        return Err(
-            "残す側がローカル NTFS ではないため、整理は依頼できません。比較表示のみ".into(),
-        );
+        return Err(format!(
+            "{}がローカル NTFS ではないため、整理は依頼できません。比較表示のみ",
+            inspect.side()
+        ));
     }
     Ok(mount)
 }
@@ -186,13 +200,14 @@ fn protect(
     keep: &KeepReference,
     path: &Path,
     role: Role,
+    inspect: InspectRole,
 ) -> Result<(Vec<File>, usize, Vec<Listing>), String> {
     let relative = path.strip_prefix(mount).map_err(display)?;
     let mut handles = Vec::new();
     let mut current = mount.to_path_buf();
     for part in relative.components() {
         let std::path::Component::Normal(part) = part else {
-            return Err("残す項目のパスを確認できません".into());
+            return Err(format!("{}のパスを確認できません", inspect.item()));
         };
         open(
             &current,
@@ -200,6 +215,7 @@ fn protect(
             keep.identity[0],
             &mut handles,
             Role::Keep,
+            inspect,
         )?;
         current.push(part);
     }
@@ -216,10 +232,14 @@ fn protect(
         keep.identity[0],
         &mut handles,
         role,
+        inspect,
         &mut listings,
     )?;
     if identity != keep.identity || size != keep.key.size || hash != keep.key.hash {
-        return Err("残す項目が変更されました。重複を再取得して確認してください".into());
+        return Err(format!(
+            "{}が変更されました。重複を再取得して確認してください",
+            inspect.item()
+        ));
     }
     Ok((handles, root, listings))
 }
@@ -230,10 +250,12 @@ fn open(
     volume: u64,
     handles: &mut Vec<File>,
     role: Role,
+    inspect: InspectRole,
 ) -> Result<[u64; 2], String> {
     if handles.len() >= MAX_PROTECTED_ENTRIES {
         return Err(format!(
-            "残す項目の保護上限（{MAX_PROTECTED_ENTRIES} 件）を超えました"
+            "{}の保護上限（{MAX_PROTECTED_ENTRIES} 件）を超えました",
+            inspect.item()
         ));
     }
     let mut options = File::options();
@@ -245,30 +267,40 @@ fn open(
         .share_mode(role.share())
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .map_err(|e| format!("残す項目を安定して開けません: {e}"))?;
+        .map_err(|e| format!("{}を安定して開けません: {e}", inspect.item()))?;
     let metadata = file.metadata().map_err(display)?;
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
         || listing::cloud_only(&metadata)
         || (kind == Kind::Dir && !metadata.is_dir())
         || (kind == Kind::File && !metadata.is_file())
     {
-        return Err("残す項目の種別が変わったか、リンク・クラウド項目を含みます".into());
+        return Err(format!(
+            "{}の種別が変わったか、リンク・クラウド項目を含みます",
+            inspect.item()
+        ));
     }
     let id = identity(&file)?;
     if id[0] != volume {
-        return Err("残す項目とボリュームの同一性を確認できません".into());
+        return Err(format!(
+            "{}とボリュームの同一性を確認できません",
+            inspect.item()
+        ));
     }
     handles.push(file);
     Ok(id)
 }
 
-pub(super) fn identify(mount: &Path, path: &Path) -> Result<[u64; 2], String> {
+pub(super) fn identify(
+    mount: &Path,
+    path: &Path,
+    inspect: InspectRole,
+) -> Result<[u64; 2], String> {
     let relative = path.strip_prefix(mount).map_err(display)?;
     let mut current = mount.to_path_buf();
     let mut ancestors = Vec::new();
     for component in relative.components() {
         let std::path::Component::Normal(component) = component else {
-            return Err("残す項目のパスを確認できません".into());
+            return Err(format!("{}のパスを確認できません", inspect.item()));
         };
         let dir = File::options()
             .read(true)
@@ -281,7 +313,7 @@ pub(super) fn identify(mount: &Path, path: &Path) -> Result<[u64; 2], String> {
             || info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || listing::cloud_only(&info)
         {
-            return Err("残す項目の親フォルダを保護できません".into());
+            return Err(format!("{}の親フォルダを保護できません", inspect.item()));
         }
         ancestors.push(dir);
         current.push(component);
@@ -294,7 +326,7 @@ pub(super) fn identify(mount: &Path, path: &Path) -> Result<[u64; 2], String> {
         .map_err(display)?;
     let info = file.metadata().map_err(display)?;
     if info.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || listing::cloud_only(&info) {
-        return Err("残す項目がリンクまたはクラウド項目です".into());
+        return Err(format!("{}がリンクまたはクラウド項目です", inspect.item()));
     }
     identity(&file)
 }
@@ -355,9 +387,10 @@ fn snapshot(
     volume: u64,
     handles: &mut Vec<File>,
     role: Role,
+    inspect: InspectRole,
     listings: &mut Vec<Listing>,
 ) -> Result<([u64; 2], u64, Hash), String> {
-    let id = open(path, kind, volume, handles, role)?;
+    let id = open(path, kind, volume, handles, role, inspect)?;
     if kind == Kind::File {
         let file = handles.last_mut().expect("open 直後");
         let size = file.metadata().map_err(display)?.len();
@@ -373,7 +406,7 @@ fn snapshot(
         }
         return Ok((id, size, *hasher.finalize().as_bytes()));
     }
-    let entries = entries_of(path, handles.len())?;
+    let entries = entries_of(path, handles.len(), inspect)?;
     let mut observed = Vec::new();
     let mut total = 0u64;
     let descendant = match role {
@@ -381,15 +414,19 @@ fn snapshot(
         Role::Source | Role::SourceDescendant => Role::SourceDescendant,
     };
     for (name, _, child, kind) in &entries {
-        let (_, size, hash) = snapshot(child, *kind, volume, handles, descendant, listings)?;
+        let (_, size, hash) =
+            snapshot(child, *kind, volume, handles, descendant, inspect, listings)?;
         total = total
             .checked_add(size)
-            .ok_or("残すフォルダのサイズが大きすぎます")?;
+            .ok_or_else(|| format!("{}のサイズが大きすぎます", inspect.folder()))?;
         observed.push((name, *kind, size, hash));
     }
     // 配下の既存ハンドルを保持していても、新規項目の作成は別の操作なので一覧を再確認する。
-    if entries != entries_of(path, 0)? {
-        return Err("残すフォルダの子孫が変わりました。重複を再取得して確認してください".into());
+    if entries != entries_of(path, 0, inspect)? {
+        return Err(format!(
+            "{}の子孫が変わりました。重複を再取得して確認してください",
+            inspect.folder()
+        ));
     }
     let children: Vec<_> = observed
         .iter()
@@ -409,7 +446,7 @@ fn snapshot(
 
 type Entry = (String, Vec<u8>, PathBuf, Kind);
 
-fn entries_of(path: &Path, held: usize) -> Result<Vec<Entry>, String> {
+fn entries_of(path: &Path, held: usize, inspect: InspectRole) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(path).map_err(display)? {
         let entry = entry.map_err(display)?;
@@ -419,7 +456,8 @@ fn entries_of(path: &Path, held: usize) -> Result<Vec<Entry>, String> {
         }
         if entries.len() + held >= MAX_PROTECTED_ENTRIES {
             return Err(format!(
-                "残す項目の保護上限（{MAX_PROTECTED_ENTRIES} 件）を超えました"
+                "{}の保護上限（{MAX_PROTECTED_ENTRIES} 件）を超えました",
+                inspect.item()
             ));
         }
         let typ = entry.file_type().map_err(display)?;
@@ -428,7 +466,10 @@ fn entries_of(path: &Path, held: usize) -> Result<Vec<Entry>, String> {
         } else if typ.is_file() {
             Kind::File
         } else {
-            return Err("残すフォルダに保護できない項目が含まれています".into());
+            return Err(format!(
+                "{}に保護できない項目が含まれています",
+                inspect.folder()
+            ));
         };
         entries.push((
             name::nfc(&raw_name),

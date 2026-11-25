@@ -114,10 +114,69 @@ pub(crate) struct Quote {
     pub result: Result<(), String>,
 }
 
+enum QueuedAction {
+    Submit {
+        keep: Item,
+        sources: Vec<Item>,
+        revision: u64,
+        preview: bool,
+    },
+    Discard(String),
+    Undo(String),
+}
+
+const LOCAL_PLAN_NOTICE: &str = "整理計画を作りました。上のポップアップから許可してください";
+const REMOTE_PLAN_NOTICE: &str = "対象端末での許可を待っています";
+
+#[derive(Default, PartialEq, Eq)]
+struct NoticeContext {
+    revision: u64,
+    refresh: u64,
+    selected: Option<usize>,
+    open: bool,
+}
+
+impl From<&super::Dups> for NoticeContext {
+    fn from(dups: &super::Dups) -> Self {
+        Self {
+            revision: dups.revision,
+            refresh: dups.refresh,
+            selected: dups.selected,
+            open: dups.open,
+        }
+    }
+}
+
+impl NoticeContext {
+    fn should_clear(&self, current: &Self) -> bool {
+        self.revision != current.revision
+            || self.refresh != current.refresh
+            || self.selected != current.selected
+            || (self.open && !current.open)
+    }
+}
+
+struct LocalPlanNotice {
+    created: Instant,
+    pending: usize,
+}
+
+impl LocalPlanNotice {
+    fn should_clear(&mut self, pending: usize, now: Instant) -> bool {
+        let previous = std::mem::replace(&mut self.pending, pending);
+        pending < previous
+            || (pending == 0
+                && now.duration_since(self.created) >= crate::organize::NOTICE_DURATION)
+    }
+}
+
 #[derive(Resource, Default)]
 pub(crate) struct Requests {
     pub entries: Vec<Request>,
     pub notice: Option<String>,
+    local_plan_notice: Option<LocalPlanNotice>,
+    notice_context: NoticeContext,
+    queued: Option<QueuedAction>,
     pending: Option<Mutex<mpsc::Receiver<Update>>>,
     next_poll: Option<Instant>,
     loaded: bool,
@@ -132,6 +191,7 @@ struct Update {
     refresh: Vec<String>,
     quote: Option<Quote>,
     submitted_revision: Option<u64>,
+    local_plan_created: bool,
 }
 
 fn persist(dir: &Path, entries: &[Request]) -> Result<(), String> {
@@ -228,7 +288,8 @@ impl Submission {
             return Err("この端末が隔離対象の端末間整理は比較表示のみです".into());
         }
 
-        let db = super::remote::open_db()?;
+        let db =
+            lisa_core::db::Db::open(&self.dir.join("lisa.db")).map_err(|err| err.to_string())?;
         let own_id = db
             .meta("this_device")
             .map_err(|err| err.to_string())?
@@ -405,7 +466,69 @@ fn created(value: Value) -> Result<(), String> {
 
 impl Requests {
     pub fn busy(&self) -> bool {
-        self.pending.is_some() && !self.polling
+        !self.loaded || (self.pending.is_some() && !self.polling) || self.queued.is_some()
+    }
+
+    fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
+        self.local_plan_notice = None;
+    }
+
+    fn update_notice(&mut self, dups: &super::Dups, pending: usize, now: Instant) -> bool {
+        if self.busy() {
+            return false;
+        }
+        let context = NoticeContext::from(dups);
+        let context_changed = self.notice_context.should_clear(&context);
+        self.notice_context = context;
+        let expired = self
+            .local_plan_notice
+            .as_mut()
+            .is_some_and(|notice| notice.should_clear(pending, now));
+        let cleared = expired || (context_changed && self.local_plan_notice.is_some());
+        if cleared {
+            self.set_notice(None);
+        }
+        cleared
+    }
+
+    fn submit_notice(target: Option<&SavedPeer>, outcome: Result<(), String>) -> String {
+        match outcome {
+            Ok(()) if target.is_none() => LOCAL_PLAN_NOTICE.into(),
+            Ok(()) => REMOTE_PLAN_NOTICE.into(),
+            Err(err) => err,
+        }
+    }
+
+    fn dispatch_queued(
+        &mut self,
+        dir: Option<std::path::PathBuf>,
+        saved_peer: impl Fn(&str) -> Option<SavedPeer>,
+        port: Option<u16>,
+        refresh: u64,
+    ) {
+        let Some(action) = self.queued.take() else {
+            return;
+        };
+        self.set_notice(None);
+        match action {
+            QueuedAction::Submit {
+                keep,
+                sources,
+                revision,
+                preview,
+            } => {
+                if refresh == revision {
+                    self.submit_in(dir, saved_peer, port, keep, sources, revision, preview);
+                } else {
+                    self.set_notice(Some(
+                        "一覧が更新されたため操作を中断しました。もう一度確認してください".into(),
+                    ));
+                }
+            }
+            QueuedAction::Discard(id) => self.discard_in(dir, &id),
+            QueuedAction::Undo(id) => self.undo(saved_peer, &id),
+        }
     }
 
     fn run(&mut self, work: impl FnOnce(Vec<Request>) -> Update + Send + 'static) {
@@ -425,30 +548,57 @@ impl Requests {
         revision: u64,
         preview: bool,
     ) {
-        if self.pending.is_some() || !self.loaded || sources.is_empty() {
+        self.submit_in(
+            crate::scan::data_dir(),
+            |id| lan.and_then(|lan| lan.saved_peer(id)),
+            lan.and_then(LanState::relay_port),
+            keep,
+            sources,
+            revision,
+            preview,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_in(
+        &mut self,
+        dir: Option<std::path::PathBuf>,
+        saved_peer: impl Fn(&str) -> Option<SavedPeer>,
+        port: Option<u16>,
+        keep: Item,
+        sources: Vec<Item>,
+        revision: u64,
+        preview: bool,
+    ) {
+        if self.busy() || sources.is_empty() {
             return;
         }
         if sources
             .iter()
             .any(|source| source.device != sources[0].device)
         {
-            self.notice = Some("整理対象は一つの端末から選んでください".into());
+            self.set_notice(Some("整理対象は一つの端末から選んでください".into()));
             return;
         }
-        let Some(dir) = crate::scan::data_dir() else {
+        let Some(dir) = dir else {
             return;
         };
-        let target = sources[0]
-            .device
-            .as_ref()
-            .and_then(|id| lan.and_then(|lan| lan.saved_peer(id)));
+        let target = sources[0].device.as_deref().and_then(saved_peer);
         if sources[0].device.is_some() && target.is_none() {
-            self.notice = Some("対象端末のペアリングを確認してください".into());
+            self.set_notice(Some("対象端末のペアリングを確認してください".into()));
             return;
         }
-        let port = lan.and_then(LanState::relay_port);
         self.quote = None;
-        self.notice = Some("整理計画を確認中…".into());
+        self.set_notice(Some("整理計画を確認中…".into()));
+        if self.polling {
+            self.queued = Some(QueuedAction::Submit {
+                keep,
+                sources,
+                revision,
+                preview,
+            });
+            return;
+        }
         let submission = Submission {
             dir,
             target,
@@ -473,26 +623,30 @@ impl Requests {
                     refresh: Vec::new(),
                     quote: Some(quote),
                     submitted_revision: None,
+                    local_plan_created: false,
                 };
             }
             let submitted_revision = outcome.is_ok().then_some(submission.revision);
-            let notice = match outcome {
-                Ok(()) => "対象端末での許可を待っています".into(),
-                Err(err) => err,
-            };
+            let local_plan_created = submitted_revision.is_some() && submission.target.is_none();
+            let notice = Self::submit_notice(submission.target.as_ref(), outcome);
             Update {
                 entries,
                 notice: Some(notice),
                 refresh: Vec::new(),
                 quote: None,
                 submitted_revision,
+                local_plan_created,
             }
         });
     }
 
     /// 未到達と確認した依頼を手元の追跡から外す。
     pub fn discard(&mut self, id: &str) {
-        if self.pending.is_some() {
+        self.discard_in(crate::scan::data_dir(), id);
+    }
+
+    fn discard_in(&mut self, dir: Option<std::path::PathBuf>, id: &str) {
+        if self.busy() {
             return;
         }
         let Some(entry) = self
@@ -503,9 +657,14 @@ impl Requests {
             return;
         };
         let (target, id) = (entry.target.clone(), entry.id.clone());
-        let Some(dir) = crate::scan::data_dir() else {
+        let Some(dir) = dir else {
             return;
         };
+        self.set_notice(Some("未到達の依頼を破棄中…".into()));
+        if self.polling {
+            self.queued = Some(QueuedAction::Discard(id));
+            return;
+        }
         self.run(move |mut entries| {
             entries.retain(|entry| entry.id != id);
             revoke_grant(&dir, &target, &id);
@@ -518,12 +677,13 @@ impl Requests {
                 refresh: Vec::new(),
                 quote: None,
                 submitted_revision: None,
+                local_plan_created: false,
             }
         });
     }
 
-    pub fn undo(&mut self, lan: Option<&LanState>, id: &str) {
-        if self.pending.is_some() {
+    pub fn undo(&mut self, saved_peer: impl Fn(&str) -> Option<SavedPeer>, id: &str) {
+        if self.busy() {
             return;
         }
         let Some(entry) = self
@@ -533,11 +693,16 @@ impl Requests {
         else {
             return;
         };
-        let Some(peer) = lan.and_then(|lan| lan.saved_peer(&entry.target)) else {
-            self.notice = Some("対象端末のペアリングを確認してください".into());
+        let Some(peer) = saved_peer(&entry.target) else {
+            self.set_notice(Some("対象端末のペアリングを確認してください".into()));
             return;
         };
         let id = id.to_owned();
+        self.set_notice(Some("取り消しを依頼中…".into()));
+        if self.polling {
+            self.queued = Some(QueuedAction::Undo(id));
+            return;
+        }
         self.run(move |mut entries| {
             let result = call(&peer, "lisa_plan_request_undo", json!({"request_id": id}));
             let notice = match result {
@@ -555,6 +720,7 @@ impl Requests {
                 refresh: Vec::new(),
                 quote: None,
                 submitted_revision: None,
+                local_plan_created: false,
             }
         });
     }
@@ -568,6 +734,14 @@ pub(crate) fn update(
     mut remote_refresh: ResMut<crate::lan::RemoteRefresh>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
+    let now = Instant::now();
+    let context_changed = requests
+        .notice_context
+        .should_clear(&NoticeContext::from(&*dups));
+    // 整理側のお知らせと同じく、reactive モードの定期更新で期限を確認する。
+    if requests.update_notice(&dups, menus.pending.len(), now) {
+        redraw.write(RequestRedraw);
+    }
     if let Some(receiver) = &requests.pending {
         let update = receiver.lock().ok().and_then(|r| match r.try_recv() {
             Ok(update) => Some(update),
@@ -577,6 +751,7 @@ pub(crate) fn update(
                 refresh: Vec::new(),
                 quote: None,
                 submitted_revision: None,
+                local_plan_created: false,
             }),
             Err(mpsc::TryRecvError::Empty) => None,
         });
@@ -591,10 +766,20 @@ pub(crate) fn update(
             }
             if let Some(quote) = update.quote {
                 requests.quote = Some(quote);
-                requests.notice = None;
+                requests.set_notice(None);
             }
             if update.notice.is_some() || !update.refresh.is_empty() {
-                requests.notice = update.notice;
+                if update.local_plan_created && context_changed {
+                    requests.set_notice(None);
+                } else {
+                    requests.set_notice(update.notice);
+                    if update.local_plan_created {
+                        requests.local_plan_notice = Some(LocalPlanNotice {
+                            created: now,
+                            pending: menus.pending.len(),
+                        });
+                    }
+                }
             }
             if !update.refresh.is_empty() {
                 if update.refresh.iter().any(|device| {
@@ -605,7 +790,16 @@ pub(crate) fn update(
                 }
                 remote_refresh.0.extend(update.refresh);
             }
+            // 照会が反映した一覧で操作を再検証し、DB・履歴への書き込みは直列に保つ。
+            requests.notice_context = NoticeContext::from(&*dups);
+            requests.dispatch_queued(
+                crate::scan::data_dir(),
+                |id| lan.as_ref().and_then(|lan| lan.saved_peer(id)),
+                lan.as_deref().and_then(LanState::relay_port),
+                dups.refresh,
+            );
         }
+        // reactive 描画でもワーカーの応答と、開始した次の操作を取り出す。
         redraw.write(RequestRedraw);
         return;
     }
@@ -623,6 +817,7 @@ pub(crate) fn update(
                         refresh: Vec::new(),
                         quote: None,
                         submitted_revision: None,
+                        local_plan_created: false,
                     },
                     Err(err) => Update {
                         entries,
@@ -630,6 +825,7 @@ pub(crate) fn update(
                         refresh: Vec::new(),
                         quote: None,
                         submitted_revision: None,
+                        local_plan_created: false,
                     },
                 },
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Update {
@@ -638,6 +834,7 @@ pub(crate) fn update(
                     refresh: Vec::new(),
                     quote: None,
                     submitted_revision: None,
+                    local_plan_created: false,
                 },
                 Err(err) => Update {
                     entries,
@@ -645,6 +842,7 @@ pub(crate) fn update(
                     refresh: Vec::new(),
                     quote: None,
                     submitted_revision: None,
+                    local_plan_created: false,
                 },
             },
         );
@@ -726,7 +924,382 @@ pub(crate) fn update(
             refresh,
             quote: None,
             submitted_revision: None,
+            local_plan_created: false,
         }
     });
     redraw.write(RequestRedraw);
+}
+
+#[cfg(test)]
+impl Requests {
+    pub(crate) fn polling_for_test(quote: Option<Quote>) -> Self {
+        let (_, receiver) = mpsc::channel();
+        Self {
+            loaded: true,
+            polling: true,
+            pending: Some(Mutex::new(receiver)),
+            quote,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn queued_preview_for_test(&self) -> Option<bool> {
+        match self.queued.as_ref() {
+            Some(QueuedAction::Submit { preview, .. }) => Some(*preview),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("lisa-requests-{}", lisa_mcp::new_uuid()));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn polling(entries: Vec<Request>) -> (Requests, mpsc::Sender<Update>) {
+        let (sender, receiver) = mpsc::channel();
+        let requests = Requests {
+            entries,
+            loaded: true,
+            polling: true,
+            pending: Some(Mutex::new(receiver)),
+            ..Default::default()
+        };
+        assert!(!requests.busy());
+        (requests, sender)
+    }
+
+    fn finish_poll(
+        requests: &mut Requests,
+        entries: Vec<Request>,
+        dir: Option<PathBuf>,
+        saved_peer: impl Fn(&str) -> Option<SavedPeer>,
+        refresh: u64,
+    ) {
+        requests.pending = None;
+        requests.polling = false;
+        requests.entries = entries;
+        requests.dispatch_queued(dir, saved_peer, None, refresh);
+    }
+
+    fn completed(requests: &Requests) -> Update {
+        requests
+            .pending
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+    }
+
+    fn item(label: &str) -> Item {
+        Item {
+            device: None,
+            path: label.into(),
+            local_path: None,
+            reference: KeepReference {
+                device_id: "synthetic".into(),
+                drive_id: "synthetic".into(),
+                chain: vec![1, 2],
+                format: lisa_core::dups::COMPARISON_FORMAT,
+                key: lisa_core::dups::ContentKey {
+                    directory: false,
+                    size: 1,
+                    hash: [0; 32],
+                },
+                identity: [0; 2],
+            },
+        }
+    }
+
+    fn request() -> Request {
+        Request {
+            id: "request".into(),
+            target: "peer".into(),
+            device: "peer".into(),
+            paths: vec![],
+            result: None,
+            undo_requested: false,
+            connection_error: None,
+            created_ms: None,
+            unreached: true,
+        }
+    }
+
+    #[test]
+    fn submit_during_poll_starts_once_after_poll() {
+        let dir = TestDir::new();
+        let (mut requests, _poll) = polling(vec![]);
+        assert!(Requests::default().busy());
+        requests.submit_in(
+            Some(dir.0.clone()),
+            |_| None,
+            None,
+            item("keep"),
+            vec![item("source")],
+            7,
+            true,
+        );
+        assert!(matches!(
+            requests.queued,
+            Some(QueuedAction::Submit { revision: 7, .. })
+        ));
+        assert!(requests.busy());
+        assert_eq!(requests.notice.as_deref(), Some("整理計画を確認中…"));
+
+        requests.submit_in(
+            Some(dir.0.clone()),
+            |_| None,
+            None,
+            item("other"),
+            vec![item("source")],
+            8,
+            true,
+        );
+        assert!(matches!(
+            requests.queued,
+            Some(QueuedAction::Submit { revision: 7, .. })
+        ));
+        finish_poll(
+            &mut requests,
+            vec![request()],
+            Some(dir.0.clone()),
+            |_| None,
+            7,
+        );
+        assert!(requests.queued.is_none());
+        let update = completed(&requests);
+        assert_eq!(update.entries[0].id, "request");
+        let quote = update.quote.unwrap();
+        assert_eq!(quote.keep.path, "keep");
+        assert_eq!(quote.revision, 7);
+    }
+
+    #[test]
+    fn stale_submit_is_cancelled_when_poll_completes() {
+        let dir = TestDir::new();
+        let (mut requests, poll) = polling(vec![]);
+        requests.submit_in(
+            Some(dir.0.clone()),
+            |_| None,
+            None,
+            item("keep"),
+            vec![item("source")],
+            7,
+            true,
+        );
+        let mut app = App::new();
+        app.insert_resource(requests)
+            .insert_resource(super::super::Dups {
+                refresh: 8,
+                ..Default::default()
+            })
+            .init_resource::<crate::organize::OrganizeState>()
+            .init_resource::<crate::lan::RemoteRefresh>()
+            .add_message::<RequestRedraw>()
+            .add_systems(bevy::prelude::Update, update);
+        app.update();
+        assert!(app.world().resource::<Requests>().busy());
+
+        poll.send(Update {
+            entries: vec![request()],
+            notice: None,
+            refresh: vec![],
+            quote: None,
+            submitted_revision: None,
+            local_plan_created: false,
+        })
+        .unwrap();
+        app.update();
+        let requests = app.world().resource::<Requests>();
+        assert_eq!(requests.entries[0].id, "request");
+        assert!(!requests.busy());
+        assert_eq!(
+            requests.notice.as_deref(),
+            Some("一覧が更新されたため操作を中断しました。もう一度確認してください")
+        );
+    }
+
+    #[test]
+    fn discard_during_poll_rechecks_the_latest_entries() {
+        let dir = TestDir::new();
+        for reached in [false, true] {
+            let (mut requests, _poll) = polling(vec![request()]);
+            requests.discard_in(Some(dir.0.clone()), "request");
+            assert!(matches!(requests.queued, Some(QueuedAction::Discard(_))));
+            assert!(requests.busy());
+
+            let mut latest = request();
+            latest.unreached = !reached;
+            finish_poll(
+                &mut requests,
+                vec![latest],
+                Some(dir.0.clone()),
+                |_| None,
+                0,
+            );
+            if reached {
+                assert!(!requests.busy());
+                assert!(requests.notice.is_none());
+                assert_eq!(requests.entries.len(), 1);
+            } else {
+                assert!(completed(&requests).entries.is_empty());
+                assert_eq!(
+                    std::fs::read_to_string(dir.0.join("duplicate-requests.json")).unwrap(),
+                    "[]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn undo_during_poll_rechecks_the_latest_entries() {
+        let peer = SavedPeer {
+            device_id: "peer".into(),
+            name: "peer".into(),
+            key: "test-key".into(),
+            addr: "127.0.0.1".into(),
+            port: 0,
+            mcp_port: None,
+        };
+        let saved_peer = |id: &str| (id == peer.device_id).then(|| peer.clone());
+        for restored in [false, true] {
+            let mut entry = request();
+            entry.unreached = false;
+            entry.result = Some(json!({"plan": {"state": "done"}, "ops": [{"state": "done"}]}));
+            let (mut requests, _poll) = polling(vec![entry.clone()]);
+            requests.undo(saved_peer, "request");
+            assert!(matches!(requests.queued, Some(QueuedAction::Undo(_))));
+            assert!(requests.busy());
+            if restored {
+                entry.result = Some(json!({"plan": {"state": "undone"}}));
+            }
+            finish_poll(&mut requests, vec![entry], None, saved_peer, 0);
+            if restored {
+                assert!(!requests.busy());
+                assert!(requests.notice.is_none());
+            } else {
+                // 合成の接続先（ポート 0）なので、照会のあとに起動した通信は失敗する。
+                assert!(requests.pending.is_some());
+                let update = completed(&requests);
+                assert!(update.notice.is_some());
+                assert!(!update.entries[0].undo_requested);
+            }
+        }
+    }
+
+    fn local_notice(dups: &super::super::Dups, now: Instant) -> Requests {
+        Requests {
+            loaded: true,
+            notice: Some(Requests::submit_notice(None, Ok(()))),
+            notice_context: NoticeContext::from(dups),
+            local_plan_notice: Some(LocalPlanNotice {
+                created: now,
+                pending: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn local_plan_notice_clears_when_approval_queue_shrinks_or_timeout_passes() {
+        let dups = super::super::Dups::default();
+        let now = Instant::now();
+        let mut requests = local_notice(&dups, now);
+        assert_eq!(
+            requests.notice.as_deref(),
+            Some("整理計画を作りました。上のポップアップから許可してください")
+        );
+        assert!(!requests.update_notice(&dups, 0, now + Duration::from_secs(7)));
+        assert!(requests.update_notice(&dups, 0, now + Duration::from_secs(8)));
+        assert!(requests.notice.is_none());
+
+        for (before, after) in [(1, 0), (2, 1)] {
+            // 許可・拒否のどちらも、許可待ちが減ったことで通知を消す。
+            let mut requests = local_notice(&dups, now);
+            assert!(!requests.update_notice(&dups, before, now + Duration::from_secs(8)));
+            assert!(requests.update_notice(&dups, after, now + Duration::from_secs(9)));
+            assert!(requests.notice.is_none());
+        }
+    }
+
+    #[test]
+    fn local_plan_notice_clears_when_duplicate_context_changes() {
+        let now = Instant::now();
+        let changes: [fn(&mut super::super::Dups); 4] = [
+            |dups| dups.revision += 1,
+            |dups| dups.set_scope(Default::default()),
+            |dups| dups.select_group(1),
+            |dups| dups.open = false,
+        ];
+        for change in changes {
+            let mut dups = super::super::Dups {
+                open: true,
+                ..Default::default()
+            };
+            let mut requests = local_notice(&dups, now);
+            change(&mut dups);
+            assert!(requests.update_notice(&dups, 0, now));
+            assert!(requests.notice.is_none());
+        }
+    }
+
+    #[test]
+    fn changing_panels_or_groups_only_clears_local_plan_notices() {
+        let now = Instant::now();
+        let changes: [fn(&mut super::super::Dups); 2] =
+            [|dups| dups.open = false, |dups| dups.select_group(1)];
+        for change in changes {
+            let mut dups = super::super::Dups {
+                open: true,
+                ..Default::default()
+            };
+            let mut local = local_notice(&dups, now);
+            let mut remote = local_notice(&dups, now);
+            let mut connection_error = local_notice(&dups, now);
+            remote.set_notice(Some(REMOTE_PLAN_NOTICE.into()));
+            connection_error.set_notice(Some("対象端末との通信に失敗しました".into()));
+
+            change(&mut dups);
+            assert!(local.update_notice(&dups, 0, now));
+            assert!(local.notice.is_none());
+            assert!(!remote.update_notice(&dups, 0, now));
+            assert_eq!(remote.notice.as_deref(), Some(REMOTE_PLAN_NOTICE));
+            assert!(!connection_error.update_notice(&dups, 0, now));
+            assert_eq!(
+                connection_error.notice.as_deref(),
+                Some("対象端末との通信に失敗しました")
+            );
+        }
+    }
+
+    #[test]
+    fn in_progress_notice_survives_context_changes() {
+        let mut dups = super::super::Dups::default();
+        let now = Instant::now();
+        let mut requests = local_notice(&dups, now);
+        let (_send, receive) = mpsc::channel();
+        requests.pending = Some(Mutex::new(receive));
+        requests.set_notice(Some("整理計画を確認中…".into()));
+        dups.invalidate();
+        assert!(!requests.update_notice(&dups, 0, now));
+        assert_eq!(requests.notice.as_deref(), Some("整理計画を確認中…"));
+    }
 }

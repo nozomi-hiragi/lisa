@@ -8,7 +8,9 @@ use std::{
 };
 
 use lisa_core::merged::links;
-use lisa_core::organize::remote_keep::{self, KEEP_LEASE_MS, KeepReference, ProtectedKeep};
+use lisa_core::organize::remote_keep::{
+    self, InspectRole, KEEP_LEASE_MS, KeepReference, ProtectedKeep,
+};
 use serde_json::{Value, json};
 
 use super::{Auth, Server, err};
@@ -92,7 +94,7 @@ impl Server {
         let db = self.db()?;
         if tool == "lisa_keep_inspect" {
             let reference = parse_reference(args)?;
-            let reference = ProtectedKeep::inspect(&db, reference)?;
+            let reference = ProtectedKeep::inspect_for(&db, reference, InspectRole::Keep)?;
             return Ok(json!(reference));
         }
         if tool == "lisa_keep_reserve" {
