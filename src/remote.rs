@@ -252,6 +252,9 @@ fn handle(
             processed += 1;
         }
         let result: Result<(), String> = match command {
+            Command::InvalidateFilePreviews { .. } => {
+                Err("画像キャッシュの専用制御口に送ってください".into())
+            }
             Command::State => Ok(()),
             Command::Quit => continue,
             Command::OpenMarker { path } => {

@@ -1,10 +1,13 @@
 //! ファイルのプレビューを「カートリッジ」として差し替え・追加できる仕組み。
 
 pub mod cartridges;
+mod disk;
+#[cfg(test)]
+pub(crate) use disk::tests::Temp as TestTemp;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -124,6 +127,13 @@ pub struct PreviewRegistry {
 }
 
 impl PreviewRegistry {
+    pub(crate) fn moved(&mut self, from: &Path, to: &Path, is_dir: bool) {
+        let name = to.file_name().map(|name| name.to_string_lossy());
+        let cartridge = name.as_deref().map(|name| self.pick(name).id());
+        self.images
+            .moved_with_cartridge(from, to, is_dir, cartridge);
+    }
+
     /// カートリッジを追加する。同じ拡張子なら優先度の高い方（同点なら先に追加した方）が選ばれる。
     pub fn add(&mut self, c: impl Cartridge) {
         let idx = self.cartridges.len();
@@ -300,7 +310,12 @@ pub struct PreviewPlugin;
 
 impl Plugin for PreviewPlugin {
     fn build(&self, app: &mut App) {
-        let mut registry = PreviewRegistry::default();
+        let dir = crate::scan::cache_dir().map(|dir| dir.join("file-previews").join("v1"));
+        let disk = dir.clone().and_then(disk::Disk::open);
+        let mut registry = PreviewRegistry {
+            images: PreviewImages::new(disk, dir),
+            ..Default::default()
+        };
         cartridges::register(&mut registry);
         app.insert_resource(registry);
     }
@@ -318,6 +333,15 @@ pub fn update_previews(
     mut last: Local<Option<(usize, u64, u64)>>,
 ) {
     if registry.images.receive(&mut assets) {
+        sync.request_redraw();
+    }
+    let notices = registry
+        .images
+        .disk
+        .as_ref()
+        .map_or_else(Vec::new, |disk| disk.notices());
+    for (path, scope) in notices {
+        registry.images.clear_paths(&path, scope);
         sync.request_redraw();
     }
     let folder = crate::view::scene_path(&nav, &tree)
@@ -378,17 +402,124 @@ impl PreviewRegistry {
                 self.images.requested.contains_key(key) && !self.images.order.contains(key)
             })
     }
+
+    /// 開いたローカルフォルダの直下の指紋計算用データを集める（メインスレッドでは I/O しない）。
+    pub(crate) fn folder_fingerprint_input(
+        &self,
+        tree: &crate::model::tree::FileTree,
+        folder: usize,
+    ) -> FolderFingerprintInput {
+        let mut entries: Vec<_> = tree.nodes[folder]
+            .children
+            .iter()
+            .map(|&id| {
+                let node = &tree.nodes[id];
+                let path = crate::ui::tooltip::local_path(tree, id);
+                let raw_name = node
+                    .local_name
+                    .as_deref()
+                    .or_else(|| path.as_deref().and_then(Path::file_name))
+                    .map_or_else(
+                        || node.name.as_bytes().to_vec(),
+                        |name| name.as_encoded_bytes().to_vec(),
+                    );
+                let cartridge = if node.is_dir {
+                    ""
+                } else {
+                    self.pick(&node.name).id()
+                };
+                let preview_path = if !node.is_dir && self.pick(&node.name).can_load(&node.name) {
+                    path
+                } else {
+                    None
+                };
+                FingerprintEntry {
+                    raw_name,
+                    is_dir: node.is_dir,
+                    size: node.size,
+                    cartridge,
+                    preview_path,
+                }
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| {
+            a.raw_name
+                .cmp(&b.raw_name)
+                .then_with(|| a.is_dir.cmp(&b.is_dir))
+        });
+        FolderFingerprintInput { entries }
+    }
+}
+
+pub(crate) struct FolderFingerprintInput {
+    entries: Vec<FingerprintEntry>,
+}
+
+struct FingerprintEntry {
+    raw_name: Vec<u8>,
+    is_dir: bool,
+    size: u64,
+    cartridge: &'static str,
+    preview_path: Option<PathBuf>,
+}
+
+impl FolderFingerprintInput {
+    /// 裏スレッドで呼び、開いたローカルフォルダの直下だけの指紋を計算する。
+    pub(crate) fn compute(self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"lisa-folder-fingerprint-v1");
+        for entry in self.entries {
+            hash.update(&(entry.raw_name.len() as u64).to_le_bytes());
+            hash.update(&entry.raw_name);
+            hash.update(&[u8::from(entry.is_dir)]);
+            if !entry.is_dir {
+                hash.update(&entry.size.to_le_bytes());
+                hash.update(&(entry.cartridge.len() as u64).to_le_bytes());
+                hash.update(entry.cartridge.as_bytes());
+                match entry
+                    .preview_path
+                    .as_deref()
+                    .and_then(|path| source_key(path, entry.cartridge))
+                {
+                    Some(key) => {
+                        hash.update(&[1]);
+                        hash.update(&key.len.to_le_bytes());
+                        if let Some(mtime) = key.mtime {
+                            let (sign, delta) = match mtime.duration_since(SystemTime::UNIX_EPOCH) {
+                                Ok(delta) => (1, delta),
+                                Err(error) => (2, error.duration()),
+                            };
+                            hash.update(&[sign]);
+                            hash.update(&delta.as_secs().to_le_bytes());
+                            hash.update(&delta.subsec_nanos().to_le_bytes());
+                        } else {
+                            hash.update(&[0]);
+                        }
+                    }
+                    None => {
+                        hash.update(&[0]);
+                    }
+                }
+            }
+        }
+        *hash.finalize().as_bytes()
+    }
 }
 
 /// フォルダの直接の子のファイル（ノード・名前・大きさ）をまとめた値。読みを頼み直すかを決める。
-fn files_signature(tree: &crate::model::tree::FileTree, folder: usize) -> u64 {
+pub(crate) fn files_signature(tree: &crate::model::tree::FileTree, folder: usize) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for &c in &tree.nodes[folder].children {
         let node = &tree.nodes[c];
-        if !node.is_dir {
-            (c, &node.name, node.size).hash(&mut hasher);
-        }
+        (
+            c,
+            &node.name,
+            &node.local_name,
+            node.is_dir,
+            (!node.is_dir).then_some(node.size),
+        )
+            .hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -404,6 +535,18 @@ pub struct PreviewKey {
     path: PathBuf,
     len: u64,
     mtime: Option<SystemTime>,
+    cartridge: &'static str,
+}
+
+fn source_key(path: &Path, cartridge: &'static str) -> Option<PreviewKey> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    // クラウドにだけあるファイルは読まない（読むとダウンロードが始まる）。
+    (!lisa_core::listing::cloud_only(&meta) && meta.is_file()).then(|| PreviewKey {
+        path: path.to_path_buf(),
+        len: meta.len(),
+        mtime: meta.modified().ok(),
+        cartridge,
+    })
 }
 
 type PreviewFiles = Vec<(PathBuf, Arc<dyn Cartridge>)>;
@@ -430,17 +573,8 @@ fn resolve_files(job: MetadataJob, generations: &[AtomicU64; 2], done: &Sender<R
         if generations[job.scope as usize].load(Ordering::Relaxed) != job.generation {
             return;
         }
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        let Some(key) = source_key(&path, cartridge.id()) else {
             continue;
-        };
-        // クラウドにだけあるファイルは読まない（読むとダウンロードが始まる）。
-        if !meta.is_file() || lisa_core::listing::cloud_only(&meta) {
-            continue;
-        }
-        let key = PreviewKey {
-            path,
-            len: meta.len(),
-            mtime: meta.modified().ok(),
         };
         if done
             .send(Resolved::File(job.scope, job.generation, key, cartridge))
@@ -456,11 +590,12 @@ struct Job {
     scope: Scope,
     generation: u64,
     ticket: u64,
+    valid: Arc<AtomicBool>,
     key: PreviewKey,
     cartridge: Arc<dyn Cartridge>,
 }
 
-type Done = (u64, PreviewKey, Option<LoadedPreview>);
+type Done = (u64, PreviewKey, Option<Arc<LoadedPreview>>);
 
 /// カートリッジが裏で読んだ絵の置き場（メモリだけ）。開いたフォルダの子だけ `request` で読みを頼む。
 pub struct PreviewImages {
@@ -471,21 +606,31 @@ pub struct PreviewImages {
     /// 入れた順（上限を超えたら先頭から捨てる）。
     order: VecDeque<PreviewKey>,
     /// 読みを頼んだ鍵（読み中・読めなかったものも含む。捨てるまで頼み直さない）。
-    requested: HashMap<PreviewKey, u64>,
+    requested: HashMap<PreviewKey, (u64, Arc<AtomicBool>)>,
     ticket: u64,
     revision: u64,
     generations: Arc<[AtomicU64; 2]>,
     metadata: Sender<MetadataJob>,
     resolved: Mutex<Receiver<Resolved>>,
+    current_pending: bool,
+    current_invalidations: Vec<(PathBuf, disk::Scope)>,
     capture_pending: bool,
-    capture_invalidations: Vec<crate::scan::RefreshTarget>,
+    capture_invalidations: Vec<(PathBuf, disk::Scope)>,
     skipped: Mutex<Receiver<Job>>,
     jobs: Sender<Job>,
     done: Mutex<Receiver<Done>>,
+    disk: Option<Arc<disk::Disk>>,
+    disk_dir: Option<PathBuf>,
 }
 
 impl Default for PreviewImages {
     fn default() -> Self {
+        Self::new(None, None)
+    }
+}
+
+impl PreviewImages {
+    fn new(disk: Option<Arc<disk::Disk>>, disk_dir: Option<PathBuf>) -> Self {
         let (metadata, metadata_rx) = channel();
         let (resolved_tx, resolved) = channel();
         let generations = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
@@ -502,6 +647,7 @@ impl Default for PreviewImages {
         for _ in 0..WORKERS {
             let (job_rx, done_tx) = (job_rx.clone(), done_tx.clone());
             let (active, skipped_tx) = (generations.clone(), skipped_tx.clone());
+            let disk = disk.clone();
             std::thread::spawn(move || {
                 loop {
                     let job = match job_rx.lock() {
@@ -509,23 +655,45 @@ impl Default for PreviewImages {
                         Err(_) => return,
                     };
                     let Ok(job) = job else { return };
+                    if !job.valid.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if active[job.scope as usize].load(Ordering::Relaxed) != job.generation {
                         if skipped_tx.send(job).is_err() {
                             return;
                         }
                         continue;
                     }
-                    // macOS の読み込み（ImageIO・AVFoundation）が返す autorelease のものを、
-                    // 1 枚ごとに解放する（裏のスレッドには自前の autorelease pool が無い）。
-                    #[cfg(target_os = "macos")]
-                    let loaded = objc2::rc::autoreleasepool(|_| job.cartridge.load(&job.key.path));
-                    #[cfg(not(target_os = "macos"))]
-                    let loaded = job.cartridge.load(&job.key.path);
-                    if loaded.is_none() {
-                        warn!("プレビューを読めませんでした: {}", job.key.path.display());
-                    }
-                    if done_tx.send((job.ticket, job.key, loaded)).is_err() {
+                    let disk = disk.as_ref().filter(|_| disk::supported(job.key.cartridge));
+                    let cached = disk.and_then(|disk| disk.load(&job.key));
+                    let generated = cached.is_none();
+                    let loaded = cached
+                        .or_else(|| {
+                            // ImageIO・AVFoundation の autorelease を 1 枚ごとに解放する。
+                            #[cfg(target_os = "macos")]
+                            let loaded =
+                                objc2::rc::autoreleasepool(|_| job.cartridge.load(&job.key.path));
+                            #[cfg(not(target_os = "macos"))]
+                            let loaded = job.cartridge.load(&job.key.path);
+                            if loaded.is_none() {
+                                warn!("プレビューを読めませんでした: {}", job.key.path.display());
+                            }
+                            loaded
+                        })
+                        .map(Arc::new);
+                    if done_tx
+                        .send((job.ticket, job.key.clone(), loaded.clone()))
+                        .is_err()
+                    {
                         return;
+                    }
+                    if generated
+                        && let (Some(disk), Some(image)) = (disk, loaded)
+                        && matches!(&*image, LoadedPreview::Image { .. })
+                        && job.key.mtime.is_some()
+                        && source_key(&job.key.path, job.key.cartridge).as_ref() == Some(&job.key)
+                    {
+                        disk.save(job.key, image, job.valid);
                     }
                 }
             });
@@ -541,11 +709,15 @@ impl Default for PreviewImages {
             generations,
             metadata,
             resolved: Mutex::new(resolved),
+            current_pending: false,
+            current_invalidations: Vec::new(),
             capture_pending: false,
             capture_invalidations: Vec::new(),
             skipped: Mutex::new(skipped),
             jobs,
             done: Mutex::new(done),
+            disk,
+            disk_dir,
         }
     }
 }
@@ -558,13 +730,50 @@ impl PreviewImages {
             .cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) fn requests_issued(&self) -> u64 {
+        self.ticket
+    }
+
     /// `from` が `to` へ動いた（名前の変更・移動・取り消し）。読めた絵の鍵を付け替えて、読み直さずに
     /// 使う（中身は同じなので、大きさと更新日時は変わらない）。フォルダなら下のファイルも付け替える。
     /// 読み直し前の古い名前でも、読み直し後の新しい名前でも、同じ絵を引けるようにする。
-    pub fn moved(&mut self, from: &Path, to: &Path) {
+    #[cfg(test)]
+    fn moved(&mut self, from: &Path, to: &Path) {
+        self.moved_with_cartridge(from, to, false, None);
+    }
+
+    fn moved_with_cartridge(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        is_dir: bool,
+        cartridge: Option<&str>,
+    ) {
+        let is_dir = is_dir
+            || std::fs::symlink_metadata(to).is_ok_and(|meta| meta.is_dir())
+            || self
+                .images
+                .keys()
+                .any(|key| key.path.starts_with(from) && key.path != from);
+        let scope = if is_dir {
+            disk::Scope::Descendants
+        } else {
+            disk::Scope::File
+        };
+        let already_at_dest = self
+            .current
+            .keys()
+            .any(|path| disk::contains(to, scope, path));
+        self.remove_disk(from, scope);
+        self.clear_paths_only(to, scope, false);
+        self.remove_disk(to, scope);
         let rekey = |key: &PreviewKey| {
             let suffix = key.path.strip_prefix(from).ok()?;
             let path = if suffix.as_os_str().is_empty() {
+                if cartridge.is_some_and(|id| key.cartridge != id) {
+                    return None;
+                }
                 to.to_path_buf()
             } else {
                 to.join(suffix)
@@ -580,35 +789,85 @@ impl PreviewImages {
             .keys()
             .filter_map(|old| Some((old.clone(), rekey(old)?)))
             .collect();
+        let mut aliases = Vec::new();
         for (old, new) in moved {
             if let Some(preview) = self.images.remove(&old) {
                 self.images.insert(new.clone(), preview);
             }
-            if let Some(ticket) = self.requested.remove(&old) {
-                self.requested.insert(new.clone(), ticket);
+            if let Some((ticket, valid)) = self.requested.remove(&old) {
+                valid.store(false, Ordering::Release);
+                if self.disk.is_none() || !disk::supported(new.cartridge) {
+                    self.requested
+                        .insert(new.clone(), (ticket, Arc::new(AtomicBool::new(true))));
+                }
             }
             if let Some(slot) = self.order.iter_mut().find(|k| **k == old) {
                 *slot = new.clone();
             }
-            for key in self.current.values_mut().filter(|k| **k == old) {
-                *key = new.clone();
+            for keys in [&mut self.current, &mut self.capture] {
+                for (path, key) in keys.iter_mut().filter(|(_, key)| **key == old) {
+                    *key = new.clone();
+                    aliases.push((path.clone(), new.clone()));
+                }
             }
             self.current.insert(new.path.clone(), new);
         }
+        self.clear_paths_only(from, scope, false);
+        self.current.extend(aliases);
+        if already_at_dest {
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 
-    pub(crate) fn invalidate(&mut self, target: &crate::scan::RefreshTarget) {
-        self.revision = self.revision.wrapping_add(1);
-        self.generations[Scope::Current as usize].fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn invalidate(
+        &mut self,
+        target: &crate::scan::RefreshTarget,
+    ) -> Option<Receiver<bool>> {
+        let scope = if target.subtree {
+            disk::Scope::Children
+        } else {
+            disk::Scope::File
+        };
+        self.clear_paths(&target.path, scope);
+        self.remove_disk(&target.path, scope)
+    }
+
+    fn remove_disk(&self, path: &Path, scope: disk::Scope) -> Option<Receiver<bool>> {
+        if let Some(disk) = &self.disk {
+            return Some(disk.remove(path.to_path_buf(), scope));
+        }
+        Some(disk::remove_from_owner(self.disk_dir.clone()?, path, scope))
+    }
+
+    fn clear_paths(&mut self, path: &Path, scope: disk::Scope) {
+        self.clear_paths_only(path, scope, true);
+    }
+
+    fn clear_paths_only(&mut self, path: &Path, scope: disk::Scope, bump_revision: bool) {
+        if bump_revision {
+            self.revision = self.revision.wrapping_add(1);
+            self.generations[Scope::Current as usize].fetch_add(1, Ordering::Relaxed);
+            self.current_pending = false;
+            self.current_invalidations.clear();
+        } else if self.current_pending {
+            self.current_invalidations.push((path.to_path_buf(), scope));
+        }
         // 撮影用には、更新範囲外の解決・デコードを続ける。
         if self.capture_pending {
-            self.capture_invalidations.push(target.clone());
+            self.capture_invalidations.push((path.to_path_buf(), scope));
         }
-        self.current.retain(|path, _| !target.contains(path));
-        self.capture.retain(|path, _| !target.contains(path));
-        self.images.retain(|key, _| !target.contains(&key.path));
-        self.order.retain(|key| !target.contains(&key.path));
-        self.requested.retain(|key, _| !target.contains(&key.path));
+        let contains = |candidate: &Path| disk::contains(path, scope, candidate);
+        self.current.retain(|path, _| !contains(path));
+        self.capture.retain(|path, _| !contains(path));
+        self.images.retain(|key, _| !contains(&key.path));
+        self.order.retain(|key| !contains(&key.path));
+        self.requested.retain(|key, (_, valid)| {
+            let keep = !contains(&key.path);
+            if !keep {
+                valid.store(false, Ordering::Release);
+            }
+            keep
+        });
     }
 
     /// 開いたフォルダの直接の子を渡す。鍵を作り直し、まだ無いものは読みを頼む。
@@ -621,7 +880,11 @@ impl PreviewImages {
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
         match scope {
-            Scope::Current => self.current.clear(),
+            Scope::Current => {
+                self.current.clear();
+                self.current_invalidations.clear();
+                self.current_pending = !files.is_empty();
+            }
             Scope::Capture => {
                 self.capture.clear();
                 self.capture_invalidations.clear();
@@ -637,9 +900,11 @@ impl PreviewImages {
                     files,
                 })
                 .is_err()
-            && matches!(scope, Scope::Capture)
         {
-            self.capture_pending = false;
+            match scope {
+                Scope::Current => self.current_pending = false,
+                Scope::Capture => self.capture_pending = false,
+            }
         }
     }
 
@@ -657,35 +922,56 @@ impl PreviewImages {
                     continue;
                 }
                 let Resolved::File(_, _, key, cartridge) = result else {
-                    if matches!(scope, Scope::Capture) {
-                        self.capture_pending = false;
-                        self.capture_invalidations.clear();
+                    match scope {
+                        Scope::Current => {
+                            self.current_pending = false;
+                            self.current_invalidations.clear();
+                        }
+                        Scope::Capture => {
+                            self.capture_pending = false;
+                            self.capture_invalidations.clear();
+                        }
                     }
                     continue;
                 };
-                let keys = match scope {
-                    Scope::Current => &mut self.current,
-                    Scope::Capture => {
-                        if self
-                            .capture_invalidations
-                            .iter()
-                            .any(|target| target.contains(&key.path))
-                        {
-                            continue;
+                let keys =
+                    match scope {
+                        Scope::Current => {
+                            if self.current_invalidations.iter().any(|(path, inv_scope)| {
+                                disk::contains(path, *inv_scope, &key.path)
+                            }) {
+                                continue;
+                            }
+                            &mut self.current
                         }
-                        &mut self.capture
-                    }
-                };
+                        Scope::Capture => {
+                            if self.capture_invalidations.iter().any(|(path, inv_scope)| {
+                                disk::contains(path, *inv_scope, &key.path)
+                            }) {
+                                continue;
+                            }
+                            &mut self.capture
+                        }
+                    };
                 keys.insert(key.path.clone(), key.clone());
                 if self.images.contains_key(&key) {
                     changed = true;
-                } else if !self.requested.contains_key(&key) {
+                }
+                if !self.requested.contains_key(&key) {
                     self.ticket = self.ticket.wrapping_add(1);
-                    self.requested.insert(key.clone(), self.ticket);
+                    let valid = Arc::new(AtomicBool::new(true));
+                    if let Some(disk) = &self.disk
+                        && disk::supported(key.cartridge)
+                    {
+                        disk.track(&key, &valid);
+                    }
+                    self.requested
+                        .insert(key.clone(), (self.ticket, valid.clone()));
                     let _ = self.jobs.send(Job {
                         scope,
                         generation,
                         ticket: self.ticket,
+                        valid,
                         key,
                         cartridge,
                     });
@@ -695,7 +981,9 @@ impl PreviewImages {
         // 同じ鍵を別の依頼でも待っていれば、今の世代の仕事として戻す。
         if let Ok(rx) = self.skipped.get_mut() {
             for mut job in rx.try_iter() {
-                if self.requested.get(&job.key) != Some(&job.ticket) {
+                if !self.requested.get(&job.key).is_some_and(|(active, valid)| {
+                    *active == job.ticket && valid.load(Ordering::Acquire)
+                }) {
                     continue;
                 }
                 if self.current.get(&job.key.path) == Some(&job.key) {
@@ -715,34 +1003,39 @@ impl PreviewImages {
             done.extend(rx.try_iter());
         }
         for (ticket, key, loaded) in done {
-            if self.requested.get(&key) != Some(&ticket) {
+            if !self
+                .requested
+                .get(&key)
+                .is_some_and(|(active, valid)| *active == ticket && valid.load(Ordering::Acquire))
+            {
                 continue;
             }
+            self.order.retain(|old| *old != key);
             self.order.push_back(key.clone());
-            let preview = match loaded {
+            let preview = match loaded.as_deref() {
                 None => continue,
-                Some(LoadedPreview::Text { lines }) => Preview::Text(Arc::new(lines)),
+                Some(LoadedPreview::Text { lines }) => Preview::Text(Arc::new(lines.clone())),
                 Some(LoadedPreview::Image {
                     width,
                     height,
                     rgba,
                 }) => {
-                    if rgba.len() != (width * height * 4) as usize || width == 0 || height == 0 {
+                    if rgba.len() != (width * height * 4) as usize || *width == 0 || *height == 0 {
                         continue;
                     }
                     let mut image = Image::new(
                         Extent3d {
-                            width,
-                            height,
+                            width: *width,
+                            height: *height,
                             depth_or_array_layers: 1,
                         },
                         TextureDimension::D2,
-                        rgba,
+                        rgba.clone(),
                         TextureFormat::Rgba8UnormSrgb,
                         RenderAssetUsages::RENDER_WORLD,
                     );
                     image.texture_view_descriptor = None;
-                    Preview::Image(assets.add(image), UVec2::new(width, height))
+                    Preview::Image(assets.add(image), UVec2::new(*width, *height))
                 }
             };
             changed |= self.current.get(&key.path) == Some(&key)
@@ -760,8 +1053,752 @@ impl PreviewImages {
 }
 
 #[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum TestPreview {
+    Image(u32, u32, Vec<u8>),
+    Text(Vec<String>),
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    struct Counted {
+        inner: Arc<dyn Cartridge>,
+        generated: Arc<AtomicUsize>,
+    }
+
+    impl Cartridge for Counted {
+        fn id(&self) -> &'static str {
+            self.inner.id()
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            self.inner.extensions()
+        }
+
+        fn can_load(&self, name: &str) -> bool {
+            self.inner.can_load(name)
+        }
+
+        fn draw(&self, ctx: &mut DrawContext<'_, '_, '_, '_>) {
+            self.inner.draw(ctx);
+        }
+
+        fn load(&self, path: &Path) -> Option<LoadedPreview> {
+            self.generated.fetch_add(1, Ordering::Relaxed);
+            self.inner.load(path)
+        }
+    }
+
+    fn wait_previews(images: &mut PreviewImages, assets: &mut Assets<Image>) {
+        let start = Instant::now();
+        while images.current_pending
+            || images
+                .current
+                .values()
+                .any(|key| !images.order.contains(key))
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "画像を待ってタイムアウト"
+            );
+            images.receive(assets);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn snapshot_preview(
+        images: &PreviewImages,
+        assets: &Assets<Image>,
+        path: &Path,
+    ) -> TestPreview {
+        match images
+            .get(path)
+            .unwrap_or_else(|| panic!("画像を読めない: {}", path.display()))
+        {
+            Preview::Image(handle, size) => TestPreview::Image(
+                size.x,
+                size.y,
+                assets.get(&handle).unwrap().data.clone().unwrap(),
+            ),
+            Preview::Text(lines) => TestPreview::Text((*lines).clone()),
+        }
+    }
+
+    fn reopen(dir: &Path) -> Arc<disk::Disk> {
+        let start = Instant::now();
+        loop {
+            if let Some(disk) = disk::Disk::open(dir.to_path_buf()) {
+                return disk;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "前の保存係が終了しなかった"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_saved(disk: &disk::Disk, path: &Path, cartridge: &'static str) {
+        let key = source_key(path, cartridge).unwrap();
+        let start = Instant::now();
+        while disk.load(&key).is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "画像が保存されなかった: {path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn 実際のカートリッジは再起動後に画像を生成し直さない() {
+        let tmp = disk::tests::Temp::new();
+        let cache = tmp.0.join("cache");
+        let png = tmp.0.join("sample.png");
+        let png_image = ::image::RgbaImage::from_fn(31, 17, |x, y| {
+            ::image::Rgba([
+                80,
+                (x * 7) as u8,
+                (y * 9) as u8,
+                if x % 2 == 0 { 123 } else { 0 },
+            ])
+        });
+        png_image.save(&png).unwrap();
+        ::image::DynamicImage::ImageRgba8(png_image)
+            .to_rgb8()
+            .save(tmp.0.join("sample.jpg"))
+            .unwrap();
+        let text = tmp.0.join("sample.txt");
+        std::fs::write(&text, "sample document\n").unwrap();
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut paths = vec![png.clone(), tmp.0.join("sample.jpg"), text.clone()];
+        #[cfg(target_os = "macos")]
+        {
+            use std::process::Command;
+            let heic = tmp.0.join("sample.heic");
+            let heic_source = tmp.0.join("sample.jpg");
+            let converted = Command::new("sips")
+                .args(["-s", "format", "heic"])
+                .arg(&heic_source)
+                .arg("--out")
+                .arg(&heic)
+                .output();
+            match converted {
+                Ok(out) => {
+                    assert!(
+                        out.status.success(),
+                        "sips: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    paths.push(heic);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("sips が見つからないので HEIC を省略");
+                }
+                Err(error) => panic!("sips: {error}"),
+            }
+            let video = tmp.0.join("sample.mp4");
+            let produced = Command::new("ffmpeg")
+                .args([
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=320x180:rate=5:duration=2",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&video)
+                .output();
+            match produced {
+                Ok(out) => {
+                    assert!(
+                        out.status.success(),
+                        "ffmpeg: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    paths.push(video);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("ffmpeg が見つからないので動画を省略");
+                }
+                Err(error) => panic!("ffmpeg: {error}"),
+            }
+            let path = tmp.0.join("sample.pdf");
+            std::fs::write(&path, sample_pdf()).unwrap();
+            paths.push(path);
+        }
+        let mut registry = PreviewRegistry::default();
+        cartridges::register(&mut registry);
+        let image_calls = Arc::new(AtomicUsize::new(0));
+        let text_calls = Arc::new(AtomicUsize::new(0));
+        let requests: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let inner = registry
+                    .pick_arc(path.file_name().unwrap().to_str().unwrap())
+                    .unwrap()
+                    .clone();
+                assert!(inner.can_load(path.file_name().unwrap().to_str().unwrap()));
+                let generated = if path == &text {
+                    text_calls.clone()
+                } else {
+                    image_calls.clone()
+                };
+                (
+                    path.clone(),
+                    Arc::new(Counted { inner, generated }) as Arc<dyn Cartridge>,
+                )
+            })
+            .collect();
+        let disk = reopen(&cache);
+        let mut images = PreviewImages::new(Some(disk.clone()), Some(cache.clone()));
+        let mut assets = Assets::default();
+        images.request(requests.clone());
+        wait_previews(&mut images, &mut assets);
+        let first: Vec<_> = paths
+            .iter()
+            .map(|path| snapshot_preview(&images, &assets, path))
+            .collect();
+        for (path, cartridge) in &requests {
+            if disk::supported(cartridge.id()) {
+                wait_saved(&disk, path, cartridge.id());
+            }
+        }
+        assert_eq!(image_calls.load(Ordering::Relaxed), paths.len() - 1);
+        assert_eq!(text_calls.load(Ordering::Relaxed), 1);
+        drop(images);
+        drop(disk);
+        let fresh = reopen(&cache);
+        let mut images = PreviewImages::new(Some(fresh), Some(cache));
+        let mut assets = Assets::default();
+        images.request(requests);
+        wait_previews(&mut images, &mut assets);
+        let second: Vec<_> = paths
+            .iter()
+            .map(|path| snapshot_preview(&images, &assets, path))
+            .collect();
+        assert_eq!(second, first);
+        assert_eq!(image_calls.load(Ordering::Relaxed), paths.len() - 1);
+        assert_eq!(text_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sample_pdf() -> Vec<u8> {
+        use std::io::Write;
+
+        let drawing = "0.1 0.5 0.8 rg\n10 20 80 40 re f\n";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 80] /Contents 4 0 R >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{drawing}endstream",
+                drawing.len()
+            ),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            writeln!(pdf, "{} 0 obj\n{object}\nendobj", index + 1).unwrap();
+        }
+        let xref = pdf.len();
+        let size = offsets.len() + 1;
+        writeln!(pdf, "xref\n0 {size}\n0000000000 65535 f ").unwrap();
+        for offset in offsets {
+            writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        writeln!(
+            pdf,
+            "trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+        )
+        .unwrap();
+        pdf
+    }
+
+    fn system_world(
+        tree: crate::model::tree::FileTree,
+        folder: usize,
+        registry: PreviewRegistry,
+    ) -> World {
+        let mut world = World::new();
+        world.insert_resource(tree);
+        world.insert_resource(crate::view::Nav {
+            stack: vec![
+                crate::view::Level {
+                    node: crate::model::tree::FileTree::ROOT,
+                },
+                crate::view::Level { node: folder },
+            ],
+        });
+        world.insert_resource(registry);
+        world.insert_resource(Assets::<Image>::default());
+        world.insert_resource(crate::view::SyncRequest::default());
+        world
+    }
+
+    fn registry_with(
+        disk: Arc<disk::Disk>,
+        cache: &Path,
+        generated: &Arc<AtomicUsize>,
+    ) -> PreviewRegistry {
+        let mut real = PreviewRegistry::default();
+        cartridges::register(&mut real);
+        let inner = real.pick_arc("a.png").unwrap().clone();
+        let mut registry = PreviewRegistry {
+            images: PreviewImages::new(Some(disk), Some(cache.to_path_buf())),
+            ..Default::default()
+        };
+        registry.add(Counted {
+            inner,
+            generated: generated.clone(),
+        });
+        registry
+    }
+
+    fn run_until_shown(world: &mut World, schedule: &mut Schedule, want: usize) {
+        let start = Instant::now();
+        loop {
+            schedule.run(world);
+            let registry = world.resource::<PreviewRegistry>();
+            let images = &registry.images;
+            if !images.current_pending
+                && images.current.len() == want
+                && images
+                    .current
+                    .values()
+                    .all(|key| images.order.contains(key))
+            {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "画像を待ってタイムアウト"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn update_previews_は直下だけを要求し再起動後に生成しない() {
+        let tmp = disk::tests::Temp::new();
+        let cache = tmp.0.join("cache");
+        let mount = tmp.0.join("vol");
+        let folder_path = mount.join("d00");
+        let grand = folder_path.join("d01");
+        std::fs::create_dir_all(&grand).unwrap();
+        let image = ::image::RgbaImage::from_fn(20, 10, |x, y| {
+            ::image::Rgba([x as u8 * 9, y as u8 * 20, 7, if x < 5 { 0 } else { 255 }])
+        });
+        image.save(folder_path.join("p0.png")).unwrap();
+        ::image::DynamicImage::ImageRgba8(image.clone())
+            .to_rgb8()
+            .save(folder_path.join("p1.png"))
+            .unwrap();
+        image.save(grand.join("q0.png")).unwrap();
+        let build = || {
+            use crate::model::tree::FileTree;
+            let mut volume = crate::scan::root_volume();
+            volume.mount_path = mount.clone();
+            let mut tree = FileTree::this_device("test", &[volume]);
+            let drive = tree.nodes[FileTree::ROOT + 1].children[0];
+            let read = |path: &Path| lisa_core::listing::read_dir(path).map_err(|e| e.to_string());
+            tree.add_listing(drive, read(&mount));
+            let folder = tree.nodes[drive].children[0];
+            tree.add_listing(folder, read(&folder_path));
+            let sub = tree.nodes[folder]
+                .children
+                .iter()
+                .copied()
+                .find(|&c| tree.nodes[c].is_dir)
+                .unwrap();
+            tree.add_listing(sub, read(&grand));
+            (tree, folder)
+        };
+        let paths = [folder_path.join("p0.png"), folder_path.join("p1.png")];
+        let generated = Arc::new(AtomicUsize::new(0));
+        let mut shots = Vec::new();
+        for session in 0..2 {
+            let disk = reopen(&cache);
+            let (tree, folder) = build();
+            let mut world = system_world(
+                tree,
+                folder,
+                registry_with(disk.clone(), &cache, &generated),
+            );
+            let mut schedule = Schedule::default();
+            schedule.add_systems(update_previews);
+            run_until_shown(&mut world, &mut schedule, 2);
+            if session == 0 {
+                for path in &paths {
+                    wait_saved(&disk, path, "image");
+                }
+            }
+            let registry = world.resource::<PreviewRegistry>();
+            assert_eq!(registry.images.ticket, 2);
+            assert!(
+                registry
+                    .images
+                    .requested
+                    .keys()
+                    .all(|key| key.path.parent() == Some(folder_path.as_path())),
+                "孫階層は要求しない"
+            );
+            let assets = world.resource::<Assets<Image>>();
+            shots.push(
+                paths
+                    .iter()
+                    .map(|p| snapshot_preview(&registry.images, assets, p))
+                    .collect::<Vec<_>>(),
+            );
+            drop(world);
+        }
+        assert_eq!(generated.load(Ordering::Relaxed), 2, "再起動後は生成しない");
+        assert_eq!(shots[0], shots[1]);
+        assert!(matches!(&shots[0][0], TestPreview::Image(20, 10, rgba) if rgba[3] == 0));
+    }
+
+    /// 先頭バイトを色にする合成の画像カートリッジ。生成回数を数える。
+    struct Gen(Arc<AtomicUsize>);
+
+    impl Cartridge for Gen {
+        fn id(&self) -> &'static str {
+            "image"
+        }
+
+        fn extensions(&self) -> &'static [&'static str] {
+            &["png"]
+        }
+
+        fn draw(&self, _ctx: &mut DrawContext<'_, '_, '_, '_>) {}
+
+        fn load(&self, path: &Path) -> Option<LoadedPreview> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let c = *std::fs::read(path).ok()?.first()?;
+            Some(LoadedPreview::Image {
+                width: 2,
+                height: 1,
+                rgba: vec![c, 1, 2, 255, c, 3, 4, 0],
+            })
+        }
+    }
+
+    struct Session {
+        images: PreviewImages,
+        disk: Arc<disk::Disk>,
+        assets: Assets<Image>,
+    }
+
+    impl Session {
+        fn open(cache: &Path) -> Self {
+            let disk = reopen(cache);
+            let images = PreviewImages::new(Some(disk.clone()), Some(cache.to_path_buf()));
+            Self {
+                images,
+                disk,
+                assets: Assets::default(),
+            }
+        }
+
+        fn show(&mut self, calls: &Arc<AtomicUsize>, path: &Path) -> u8 {
+            let cartridge: Arc<dyn Cartridge> = Arc::new(Gen(calls.clone()));
+            self.images.request(vec![(path.to_path_buf(), cartridge)]);
+            wait_previews(&mut self.images, &mut self.assets);
+            match snapshot_preview(&self.images, &self.assets, path) {
+                TestPreview::Image(2, 1, rgba) => rgba[0],
+                other => panic!("想定外の画像: {other:?}"),
+            }
+        }
+
+        fn saved(&self, path: &Path) {
+            wait_saved(&self.disk, path, "image");
+        }
+
+        fn barrier(&self) {
+            let unrelated = std::env::temp_dir().join("lisa-barrier-unrelated");
+            assert_eq!(
+                self.disk
+                    .remove(unrelated, disk::Scope::File)
+                    .recv_timeout(Duration::from_secs(5)),
+                Ok(true)
+            );
+        }
+    }
+
+    fn calls(n: &Arc<AtomicUsize>) -> usize {
+        n.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn 属性の変化と手動更新は再起動後も新しい絵になる() {
+        let tmp = disk::tests::Temp::new();
+        let cache = tmp.0.join("cache");
+        let file = tmp.0.join("a.png");
+        let n = Arc::new(AtomicUsize::new(0));
+        std::fs::write(&file, [10u8]).unwrap();
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &file), 10);
+        s.saved(&file);
+        drop(s);
+        // 変化がなければ生成しない。
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &file), 10);
+        assert_eq!(calls(&n), 1);
+        drop(s);
+        // サイズ変更。
+        std::fs::write(&file, [20u8, 0]).unwrap();
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &file), 20);
+        s.saved(&file);
+        assert_eq!(calls(&n), 2);
+        drop(s);
+        // 同サイズで mtime だけ変更。
+        let old = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, [30u8, 0]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old + Duration::from_secs(5))
+            .unwrap();
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &file), 30);
+        s.saved(&file);
+        assert_eq!(calls(&n), 3);
+        drop(s);
+        // 同じ属性での上書きは通常は古い絵。手動更新で原本から作り直し、再起動後も戻らない。
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, [40u8, 0]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &file), 30);
+        let rx = s.images.invalidate(&crate::scan::RefreshTarget {
+            drive_id: "test".into(),
+            path: file.clone(),
+            subtree: false,
+        });
+        assert_eq!(rx.unwrap().recv_timeout(Duration::from_secs(5)), Ok(true));
+        assert_eq!(s.show(&n, &file), 40);
+        s.saved(&file);
+        assert_eq!(calls(&n), 4);
+        drop(s);
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &file), 40);
+        assert_eq!(calls(&n), 4);
+        // 削除したファイルの絵は復元されない（鍵が作れず要求されない）。
+        std::fs::remove_file(&file).unwrap();
+        s.images.request(vec![(
+            file.clone(),
+            Arc::new(Gen(n.clone())) as Arc<dyn Cartridge>,
+        )]);
+        assert!(s.images.current.is_empty());
+        assert_eq!(calls(&n), 4);
+    }
+
+    #[test]
+    fn 改名と大小文字改名とフォルダ移動とundoは旧記録を失効して再生成する() {
+        let tmp = disk::tests::Temp::new();
+        let cache = tmp.0.join("cache");
+        let dir = tmp.0.join("dir");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let (a, b) = (dir.join("a.png"), dir.join("sub/b.png"));
+        std::fs::write(&a, [1u8]).unwrap();
+        std::fs::write(&b, [2u8]).unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut s = Session::open(&cache);
+        s.show(&n, &a);
+        s.show(&n, &b);
+        s.saved(&a);
+        s.saved(&b);
+        let (key_a, key_b) = (
+            source_key(&a, "image").unwrap(),
+            source_key(&b, "image").unwrap(),
+        );
+        // 大小文字だけの改名。旧記録は新しい名前から引けず、旧パスの記録も失効する。
+        let upper = dir.join("A.png");
+        std::fs::rename(&a, &upper).unwrap();
+        s.images.moved(&a, &upper);
+        s.barrier();
+        assert!(s.disk.load(&key_a).is_none());
+        // メモリの絵は付け替えで使え、ディスクは新パスで要求し直す（旧パスの記録は無い）。
+        assert_eq!(s.show(&n, &upper), 1);
+        s.saved(&upper);
+        // Undo。
+        std::fs::rename(&upper, &a).unwrap();
+        s.images.moved(&upper, &a);
+        s.barrier();
+        assert!(s.disk.load(&source_key(&a, "image").unwrap()).is_none());
+        // フォルダ移動は祖先ダイジェストで配下の旧記録を失効する。
+        let moved = tmp.0.join("moved");
+        std::fs::rename(&dir, &moved).unwrap();
+        s.images.moved(&dir, &moved);
+        s.barrier();
+        assert!(s.disk.load(&key_b).is_none());
+        drop(s);
+        // 再起動後は、旧記録が失効した分だけ原本から作り直す。
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &moved.join("a.png")), 1);
+        assert_eq!(s.show(&n, &moved.join("sub/b.png")), 2);
+        // 初回 2 + 新パスの要求 1 + 再起動後の 2。
+        assert_eq!(calls(&n), 5);
+    }
+
+    #[test]
+    fn 大小文字改名直後にツリー更新前の旧パスでディスク記録が復活しない() {
+        let tmp = disk::tests::Temp::new();
+        let cache = tmp.0.join("cache");
+        let mount = tmp.0.join("vol");
+        let folder_path = mount.join("d00");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let old_path = folder_path.join("a.png");
+        let new_path = folder_path.join("A.png");
+        ::image::RgbaImage::from_fn(8, 8, |_, _| ::image::Rgba([20, 40, 200, 255]))
+            .save(&old_path)
+            .unwrap();
+
+        let build = || {
+            use crate::model::tree::FileTree;
+            let mut volume = crate::scan::root_volume();
+            volume.mount_path = mount.clone();
+            let mut tree = FileTree::this_device("test", &[volume]);
+            let drive = tree.nodes[FileTree::ROOT + 1].children[0];
+            let read = |path: &Path| lisa_core::listing::read_dir(path).map_err(|e| e.to_string());
+            tree.add_listing(drive, read(&mount));
+            let folder = tree.nodes[drive].children[0];
+            tree.add_listing(folder, read(&folder_path));
+            (tree, folder)
+        };
+
+        let generated = Arc::new(AtomicUsize::new(0));
+        let disk = reopen(&cache);
+        let (tree, folder) = build();
+        let mut world = system_world(
+            tree,
+            folder,
+            registry_with(disk.clone(), &cache, &generated),
+        );
+        let mut schedule = Schedule::default();
+        schedule.add_systems(update_previews);
+        run_until_shown(&mut world, &mut schedule, 1);
+        wait_saved(&disk, &old_path, "image");
+        let old_key = source_key(&old_path, "image").unwrap();
+        let rev_before = world.resource::<PreviewRegistry>().images.revision;
+
+        // 改名直後（FileTree はまだ旧名 "a.png" のまま）に moved を反映する。
+        std::fs::rename(&old_path, &new_path).unwrap();
+        world
+            .resource_mut::<PreviewRegistry>()
+            .moved(&old_path, &new_path, false);
+        assert_eq!(
+            world.resource::<PreviewRegistry>().images.revision,
+            rev_before,
+            "ツリー更新前に revision を進めない"
+        );
+        for _ in 0..5 {
+            schedule.run(&mut world);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            disk.remove(tmp.0.join("barrier"), disk::Scope::File)
+                .recv_timeout(Duration::from_secs(5)),
+            Ok(true)
+        );
+        assert!(
+            disk.load(&old_key).is_none(),
+            "旧パスのディスク記録が復活してはいけない"
+        );
+        assert!(
+            world
+                .resource::<PreviewRegistry>()
+                .images
+                .get(&old_path)
+                .is_some(),
+            "ツリー再一覧まで旧名のエイリアスでチラつかず表示できる"
+        );
+
+        // ツリーが新名へ更新されれば新パスで要求・保存される。
+        let (fresh_tree, fresh_folder) = build();
+        *world.resource_mut::<crate::model::tree::FileTree>() = fresh_tree;
+        world.resource_mut::<crate::view::Nav>().stack[1].node = fresh_folder;
+        run_until_shown(&mut world, &mut schedule, 1);
+        wait_saved(&disk, &new_path, "image");
+        assert!(disk.load(&old_key).is_none());
+    }
+
+    #[test]
+    fn 移動先が不在のフォルダ移動でも配下のディスク記録を失効する() {
+        let tmp = disk::tests::Temp::new();
+        let cache = tmp.0.join("cache");
+        let dir = tmp.0.join("dir");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("sub/b.png");
+        std::fs::write(&file, [7u8]).unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut s = Session::open(&cache);
+        assert_eq!(s.show(&n, &file), 7);
+        s.saved(&file);
+        let key_file = source_key(&file, "image").unwrap();
+
+        // 連鎖移動（dir -> mid -> final）で通知時に mid が既に不在の状況を再現する。
+        let mid = tmp.0.join("mid");
+        let final_dir = tmp.0.join("final");
+        std::fs::rename(&dir, &final_dir).unwrap();
+        assert!(!mid.exists());
+        // メモリから先に追い出された状態でも is_dir=true で Descendants 失効する。
+        s.images.images.clear();
+        s.images.moved_with_cartridge(&dir, &mid, true, None);
+        s.barrier();
+        assert!(s.disk.load(&key_file).is_none());
+    }
+
+    #[test]
+    fn 失効後に完了した古い生成は保存も表示もされない() {
+        let tmp = disk::tests::Temp::new();
+        let cache = tmp.0.join("cache");
+        let file = tmp.0.join("a.png");
+        std::fs::write(&file, [10u8]).unwrap();
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut s = Session::open(&cache);
+        let key = source_key(&file, "image").unwrap();
+        s.images
+            .requested
+            .insert(key.clone(), (1, Arc::new(AtomicBool::new(true))));
+        s.images.current.insert(file.clone(), key.clone());
+        s.images.invalidate(&crate::scan::RefreshTarget {
+            drive_id: "test".into(),
+            path: file.clone(),
+            subtree: false,
+        });
+        s.barrier();
+        // 失効前の世代の結果が手動更新のあとに届いても採用しない。
+        let stale = Arc::new(AtomicBool::new(false));
+        let loaded = Arc::new(LoadedPreview::Image {
+            width: 1,
+            height: 1,
+            rgba: vec![9, 9, 9, 9],
+        });
+        s.disk.save(key.clone(), loaded.clone(), stale);
+        let (sender, receiver) = channel();
+        let worker_done = std::mem::replace(&mut s.images.done, Mutex::new(receiver));
+        sender.send((1, key.clone(), Some(loaded))).unwrap();
+        assert!(!s.images.receive(&mut s.assets));
+        assert!(!s.images.images.contains_key(&key));
+        s.images.done = worker_done;
+        s.barrier();
+        assert!(s.disk.load(&key).is_none());
+        assert_eq!(s.show(&n, &file), 10);
+    }
 
     struct Dummy {
         id: &'static str,
@@ -913,6 +1950,7 @@ mod tests {
             path: path.clone(),
             len: 3,
             mtime: None,
+            cartridge: "text",
         };
         let sibling_key = PreviewKey {
             path: sibling.clone(),
@@ -931,7 +1969,10 @@ mod tests {
                 Preview::Text(Arc::new(vec!["same".into()])),
             )]),
             order: VecDeque::from([sibling_key.clone()]),
-            requested: HashMap::from([(key.clone(), 1), (sibling_key, 2)]),
+            requested: HashMap::from([
+                (key.clone(), (1, Arc::new(AtomicBool::new(true)))),
+                (sibling_key, (2, Arc::new(AtomicBool::new(true)))),
+            ]),
             ticket: 2,
             revision: 0,
             ..PreviewImages::default()
@@ -942,14 +1983,16 @@ mod tests {
             subtree: false,
         });
         images.current.insert(path.clone(), key.clone());
-        images.requested.insert(key.clone(), 3);
+        images
+            .requested
+            .insert(key.clone(), (3, Arc::new(AtomicBool::new(true))));
         sender
             .send((
                 1,
                 key.clone(),
-                Some(LoadedPreview::Text {
+                Some(Arc::new(LoadedPreview::Text {
                     lines: vec!["old".into()],
-                }),
+                })),
             ))
             .unwrap();
         let mut assets = Assets::default();
@@ -961,9 +2004,9 @@ mod tests {
             .send((
                 3,
                 key,
-                Some(LoadedPreview::Text {
+                Some(Arc::new(LoadedPreview::Text {
                     lines: vec!["new".into()],
-                }),
+                })),
             ))
             .unwrap();
         assert!(images.receive(&mut assets));

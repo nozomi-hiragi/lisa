@@ -57,6 +57,12 @@ pub enum Command {
     /// Finder・エクスプローラーから開かれたマージ済みの目印（`.lmf`／`.lmd`）を表示し、窓を前面に出す。
     /// 閲覧だけで、ファイルは動かさない。
     OpenMarker { path: PathBuf },
+    /// ファイルサムネイルの保存先を所有するアプリへ、失効の完了を問い合わせる。
+    /// パスは同一 OS のネイティブ表現（Windows では UTF-16LE）。
+    InvalidateFilePreviews {
+        path: Vec<u8>,
+        scope: FilePreviewScope,
+    },
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 描画・ナビ・場面・カメラの状態を返す。
     DebugState,
     /// 検証用（`LISA_DEBUG_REMOTE=1` のときのみ）: 指定フォルダを「読み直したら変わっていた」扱いにして
@@ -93,6 +99,14 @@ pub enum Command {
         #[serde(default)]
         screen_pos: Option<[f32; 2]>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilePreviewScope {
+    File,
+    Children,
+    Descendants,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
