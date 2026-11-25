@@ -80,7 +80,7 @@ impl Server {
     }
 
     pub(super) fn duplicate_sources(&self, args: &Value, auth: &Auth) -> Result<Value, String> {
-        use organize::remote_keep::{KeepReference, ProtectedKeep};
+        use organize::remote_keep::{InspectRole, KeepReference, ProtectedKeep};
         if !matches!(auth, Auth::Peer { .. }) {
             return Err("整理対象の確認にはペアリングが必要です".into());
         }
@@ -92,7 +92,7 @@ impl Server {
         let db = self.db()?;
         let sources = sources
             .into_iter()
-            .map(|source| ProtectedKeep::inspect(&db, source))
+            .map(|source| ProtectedKeep::inspect_for(&db, source, InspectRole::Source))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({"sources": sources}))
     }

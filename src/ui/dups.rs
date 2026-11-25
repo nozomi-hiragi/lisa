@@ -91,11 +91,19 @@ fn show_panel(
     dups: Res<Dups>,
     mut shown: Local<f32>,
     mut last: Local<Option<std::time::Instant>>,
-    mut panel: Single<&mut Node, With<Panel>>,
+    panel: Single<(&mut Node, &mut GlobalZIndex), With<Panel>>,
     mut list: Single<&mut SidePanelList, With<List>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    list.closing = !dups.open;
+    let (mut panel, mut z_index) = panel.into_inner();
+    let z = if dups.open { 7 } else { 6 };
+    if z_index.0 != z {
+        z_index.0 = z;
+        redraw.write(RequestRedraw);
+    }
+    if list.closing == dups.open {
+        list.closing = !dups.open;
+    }
     let target = if dups.open { 1.0 } else { 0.0 };
     let now = std::time::Instant::now();
     let dt = last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
@@ -667,22 +675,28 @@ fn confirmation(
     size: u64,
     font: &TextFont,
 ) {
-    let Some(keep) = dups
+    let keep = dups
         .selection
         .keep
         .and_then(|index| items.get(index))
-        .cloned()
-    else {
-        return;
-    };
+        .cloned();
     let sources = dups
         .selection
         .sources
         .iter()
         .filter_map(|index| items.get(*index).cloned())
         .collect::<Vec<_>>();
-    let Some(source) = sources.first() else {
-        return;
+    let (keep, source) = match (keep, sources.first()) {
+        (Some(keep), Some(source)) => (keep, source),
+        (keep, source) => {
+            let guidance = match (keep.is_some(), source.is_some()) {
+                (true, false) => "「整理対象」も 1 つ以上選ぶと、整理計画を確認できます",
+                (false, true) => "「残す」を 1 つ選ぶと、整理計画を確認できます",
+                _ => return,
+            };
+            list.spawn((Text::new(guidance), font.clone(), TextColor(DIM_COLOR)));
+            return;
+        }
     };
     let mut lines = vec![format!("残す　{}", keep.path)];
     lines.extend(sources.iter().map(|item| format!("隔離　{}", item.path)));
@@ -702,30 +716,33 @@ fn confirmation(
     let quote = requests.quote.as_ref().filter(|quote| {
         quote.revision == dups.refresh && quote.keep == keep && quote.sources == sources
     });
-    let reason = if keep.device != source.device && source.device.is_none() {
+    let blocked_reason = if keep.device != source.device && source.device.is_none() {
         Some("この端末が隔離対象の端末間整理は比較表示のみです")
     } else if keep.device != source.device
         && lan.and_then(crate::lan::LanState::relay_port).is_none()
     {
         Some("依頼元の LAN 公開を有効にしてください")
     } else {
-        quote
-            .and_then(|quote| quote.result.as_ref().err())
-            .map(String::as_str)
+        None
     };
+    let quote_error = quote
+        .and_then(|quote| quote.result.as_ref().err())
+        .map(String::as_str);
     let label = if source.device.is_some() {
         "対象PCに整理を依頼"
     } else {
         "整理計画を作る"
     };
-    if let Some(reason) = reason {
+    if let Some(reason) = blocked_reason.or(quote_error) {
         list.spawn((Text::new(reason), font.clone(), TextColor(DIM_COLOR)));
     }
-    let preview = quote.is_none();
+    let preview = quote.is_none() || quote_error.is_some();
     let revision = dups.refresh;
     let group = dups.selected;
-    if reason.is_none() && !requests.busy() {
-        let label = if preview {
+    if blocked_reason.is_none() && !requests.busy() {
+        let label = if quote_error.is_some() {
+            "もう一度確認"
+        } else if preview {
             "整理内容を確認"
         } else {
             label
@@ -741,7 +758,7 @@ fn confirmation(
                   mut requests: ResMut<Requests>,
                   lan: Option<Res<crate::lan::LanState>>,
                   dups: Res<Dups>| {
-                if dups.refresh == revision && dups.selected == group {
+                if dups.open && dups.refresh == revision && dups.selected == group {
                     requests.submit(
                         lan.as_deref(),
                         keep.clone(),
@@ -754,5 +771,179 @@ fn confirmation(
         );
     } else {
         list.spawn((Text::new(label), font.clone(), TextColor(DIM_COLOR)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dups::requests::Quote;
+    use bevy::ecs::system::RunSystemOnce;
+
+    fn item(name: &str, device: Option<&str>) -> Item {
+        Item {
+            device: device.map(String::from),
+            reference: lisa_core::organize::remote_keep::KeepReference {
+                device_id: device.unwrap_or("local").into(),
+                drive_id: "fixture".into(),
+                chain: vec![1, 2],
+                format: lisa_core::dups::COMPARISON_FORMAT,
+                key: lisa_core::dups::ContentKey {
+                    directory: false,
+                    size: 1,
+                    hash: [0; 32],
+                },
+                identity: [0; 2],
+            },
+            path: name.into(),
+            local_path: None,
+        }
+    }
+
+    fn confirmation_world(
+        keep: Option<usize>,
+        source: Option<usize>,
+        blocked: bool,
+        failed: bool,
+    ) -> World {
+        let items = [
+            item("keep", blocked.then_some("peer")),
+            item("source", None),
+        ];
+        let mut dups = Dups {
+            open: true,
+            ..Default::default()
+        };
+        dups.selection.keep = keep;
+        dups.selection.sources.extend(source);
+        let quote = failed.then(|| Quote {
+            revision: dups.refresh,
+            keep: items[0].clone(),
+            sources: vec![items[1].clone()],
+            result: Err("一時的な確認エラー".into()),
+        });
+
+        let mut world = World::new();
+        world.insert_resource(dups);
+        world.insert_resource(Requests::polling_for_test(quote));
+        world
+            .run_system_once(
+                move |mut commands: Commands, dups: Res<Dups>, requests: Res<Requests>| {
+                    commands.spawn_empty().with_children(|list| {
+                        confirmation(
+                            list,
+                            &dups,
+                            &requests,
+                            None,
+                            &items,
+                            1,
+                            &TextFont::default(),
+                        );
+                    });
+                },
+            )
+            .unwrap();
+        world
+    }
+
+    fn texts(world: &mut World) -> Vec<String> {
+        world
+            .query::<&Text>()
+            .iter(world)
+            .map(|text| text.0.clone())
+            .collect()
+    }
+
+    #[test]
+    fn confirmation_guidance_matches_all_four_selection_states() {
+        for (keep, source, guidance) in [
+            (None, None, None),
+            (
+                Some(0),
+                None,
+                Some("「整理対象」も 1 つ以上選ぶと、整理計画を確認できます"),
+            ),
+            (
+                None,
+                Some(1),
+                Some("「残す」を 1 つ選ぶと、整理計画を確認できます"),
+            ),
+            (Some(0), Some(1), None),
+        ] {
+            let mut world = confirmation_world(keep, source, false, false);
+            let labels = texts(&mut world);
+            match guidance {
+                Some(guidance) => assert_eq!(labels, [guidance]),
+                None if keep.is_some() => {
+                    assert!(labels.iter().any(|label| label == "整理内容を確認"));
+                    assert!(!labels.iter().any(|label| label.starts_with('「')));
+                }
+                None => assert!(labels.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_confirmation_does_not_offer_retry_even_with_a_quote_error() {
+        let mut world = confirmation_world(Some(0), Some(1), true, true);
+        let labels = texts(&mut world);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "この端末が隔離対象の端末間整理は比較表示のみです")
+        );
+        assert!(!labels.iter().any(|label| label == "もう一度確認"));
+        assert_eq!(world.query::<&DeviceButton>().iter(&world).count(), 0);
+    }
+
+    #[test]
+    fn retry_click_sends_preview_only_while_the_panel_is_open() {
+        use bevy::camera::NormalizedRenderTarget;
+        use bevy::picking::{
+            backend::HitData,
+            events::Pointer,
+            pointer::{Location, PointerId},
+        };
+
+        let mut world = confirmation_world(Some(0), Some(1), false, true);
+        assert!(
+            texts(&mut world)
+                .iter()
+                .any(|label| label == "一時的な確認エラー")
+        );
+        let button = world
+            .query::<(&Text, &ChildOf)>()
+            .iter(&world)
+            .find(|(text, _)| text.0 == "もう一度確認")
+            .unwrap()
+            .1
+            .parent();
+        let event = PointerClick {
+            entity: button,
+            pointer: Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target: NormalizedRenderTarget::None {
+                        width: 1,
+                        height: 1,
+                    },
+                    position: Vec2::ZERO,
+                },
+            ),
+            button: PointerButton::Primary,
+            hit: HitData::new(Entity::PLACEHOLDER, 0.0, None, None),
+            duration: std::time::Duration::ZERO,
+            count: 1,
+        };
+        world.resource_mut::<Dups>().open = false;
+        world.trigger(event.clone());
+        assert_eq!(world.resource::<Requests>().queued_preview_for_test(), None);
+
+        world.resource_mut::<Dups>().open = true;
+        world.trigger(event);
+        assert_eq!(
+            world.resource::<Requests>().queued_preview_for_test(),
+            Some(true)
+        );
     }
 }

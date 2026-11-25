@@ -34,7 +34,7 @@ const PURGE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// 履歴パネルに出す件数の上限。
 const HISTORY_LIMIT: usize = 50;
 /// 画面の一時的なお知らせを出しておく時間。
-const NOTICE_DURATION: Duration = Duration::from_secs(8);
+pub(crate) const NOTICE_DURATION: Duration = Duration::from_secs(8);
 
 pub struct OrganizePlugin;
 

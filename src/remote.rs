@@ -52,7 +52,13 @@ impl Plugin for RemotePlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, start)
             .add_systems(First, request_exit)
-            .add_systems(Update, (handle, select_pending).chain().after(ViewSystems))
+            .add_systems(
+                Update,
+                (handle, select_pending)
+                    .chain()
+                    .after(ViewSystems)
+                    .before(crate::ui::SidePanelSync),
+            )
             .add_systems(Update, clear_debug_click.after(ViewSystems).before(handle))
             .add_systems(Last, remove_on_exit);
     }

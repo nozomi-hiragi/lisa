@@ -142,26 +142,75 @@ pub(super) fn call(
     Ok(location)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectRole {
+    Keep,
+    Source,
+}
+
+impl InspectRole {
+    fn side(self) -> &'static str {
+        match self {
+            Self::Keep => "残す側",
+            Self::Source => "隔離側",
+        }
+    }
+
+    fn item(self) -> &'static str {
+        match self {
+            Self::Keep => "残す項目",
+            Self::Source => "隔離対象",
+        }
+    }
+
+    #[cfg(windows)]
+    fn folder(self) -> &'static str {
+        match self {
+            Self::Keep => "残すフォルダ",
+            Self::Source => "隔離フォルダ",
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn unsupported(self, os: &str) -> String {
+        format!(
+            "{}が {os} のため、整理は依頼できません。比較表示のみ",
+            self.side()
+        )
+    }
+}
+
 pub fn resolve(db: &Db, keep: &KeepReference) -> Result<PathBuf, String> {
+    resolve_for(db, keep, InspectRole::Keep)
+}
+
+pub(super) fn resolve_for(
+    db: &Db,
+    keep: &KeepReference,
+    role: InspectRole,
+) -> Result<PathBuf, String> {
+    let item = role.item();
     if keep.format != crate::dups::COMPARISON_FORMAT || keep.key.size == 0 {
-        return Err("残す項目のハッシュ方式またはサイズに対応していません".into());
+        return Err(format!(
+            "{item}のハッシュ方式またはサイズに対応していません"
+        ));
     }
     if db.meta("this_device").map_err(display)? != Some(keep.device_id.clone()) {
-        return Err("残す項目の端末 ID が一致しません".into());
+        return Err(format!("{item}の端末 ID が一致しません"));
     }
     let entry_id = keep
         .chain
         .last()
         .copied()
         .filter(|_| keep.chain.len() > 1)
-        .ok_or("ボリュームのルートは残す項目に指定できません")?;
+        .ok_or_else(|| format!("ボリュームのルートは{item}に指定できません"))?;
     let location = query::path_of(db, entry_id)
         .map_err(display)?
-        .ok_or("残す項目を DB から確認できません")?;
+        .ok_or_else(|| format!("{item}を DB から確認できません"))?;
     let entry = db
         .entry(entry_id)
         .map_err(display)?
-        .ok_or("残す項目が変更されました")?;
+        .ok_or_else(|| format!("{item}が変更されました"))?;
     let kind = if keep.key.directory {
         Kind::Dir
     } else {
@@ -176,7 +225,9 @@ pub fn resolve(db: &Db, keep: &KeepReference) -> Result<PathBuf, String> {
         || entry.error.is_some()
         || (kind == Kind::File && entry.size != keep.key.size)
     {
-        return Err("残す項目が変更されました。重複を再取得して確認してください".into());
+        return Err(format!(
+            "{item}が変更されました。重複を再取得して確認してください"
+        ));
     }
     Ok(location.path)
 }
@@ -200,32 +251,40 @@ struct Protected;
 
 impl Protected {
     #[cfg(all(unix, feature = "verify-remote-keep"))]
-    fn open(_db: &Db, keep: &KeepReference, path: &Path) -> Result<Self, String> {
-        fixture::verify(keep, path)?;
+    fn open(
+        _db: &Db,
+        keep: &KeepReference,
+        path: &Path,
+        role: InspectRole,
+    ) -> Result<Self, String> {
+        fixture::verify(keep, path, role)?;
         Ok(Self)
     }
 
     #[cfg(all(unix, feature = "verify-remote-keep"))]
     fn verify(&mut self, keep: &KeepReference, path: &Path) -> Result<(), String> {
-        fixture::verify(keep, path)
+        fixture::verify(keep, path, InspectRole::Keep)
     }
 
     // 合成アダプターには共有拒否の保護がないので、更新のたびに全体を検証する。
     #[cfg(all(unix, feature = "verify-remote-keep"))]
     fn verify_held(&mut self, keep: &KeepReference, path: &Path) -> Result<(), String> {
-        fixture::verify(keep, path)
+        fixture::verify(keep, path, InspectRole::Keep)
     }
 
     #[cfg(all(not(windows), not(all(unix, feature = "verify-remote-keep"))))]
-    fn open(_db: &Db, _keep: &KeepReference, _path: &Path) -> Result<Self, String> {
+    fn open(
+        _db: &Db,
+        _keep: &KeepReference,
+        _path: &Path,
+        role: InspectRole,
+    ) -> Result<Self, String> {
         let os = if cfg!(target_os = "macos") {
             "macOS"
         } else {
             std::env::consts::OS
         };
-        Err(format!(
-            "残す側が {os} のため、整理は依頼できません。比較表示のみ"
-        ))
+        Err(role.unsupported(os))
     }
 
     #[cfg(all(not(windows), not(all(unix, feature = "verify-remote-keep"))))]
@@ -246,32 +305,48 @@ pub struct ProtectedKeep {
 
 impl ProtectedKeep {
     pub fn inspect(db: &Db, keep: KeepReference) -> Result<KeepReference, String> {
+        Self::inspect_for(db, keep, InspectRole::Keep)
+    }
+
+    pub fn inspect_for(
+        db: &Db,
+        keep: KeepReference,
+        role: InspectRole,
+    ) -> Result<KeepReference, String> {
         #[cfg(windows)]
         let keep = {
             let mut keep = keep;
-            let path = resolve(db, &keep)?;
-            let mount = windows::local_mount(db, &keep)?;
-            keep.identity = windows::identify(&mount, &path)?;
+            let path = resolve_for(db, &keep, role)?;
+            let mount = windows::local_mount(db, &keep, role)?;
+            keep.identity = windows::identify(&mount, &path, role)?;
             keep
         };
         #[cfg(all(unix, feature = "verify-remote-keep"))]
         let keep = {
             let mut keep = keep;
-            keep.identity = fixture::identify(&resolve(db, &keep)?)?;
+            keep.identity = fixture::identify(&resolve_for(db, &keep, role)?, role)?;
             keep
         };
-        Self::open(db, &keep)?;
+        Self::open_for(db, &keep, role)?;
         Ok(keep)
     }
 
     pub fn open(db: &Db, keep: &KeepReference) -> Result<Self, String> {
+        Self::open_for(db, keep, InspectRole::Keep)
+    }
+
+    pub(super) fn open_for(
+        db: &Db,
+        keep: &KeepReference,
+        role: InspectRole,
+    ) -> Result<Self, String> {
         #[cfg(not(any(windows, all(unix, feature = "verify-remote-keep"))))]
         let path = Path::new("");
         #[cfg(any(windows, all(unix, feature = "verify-remote-keep")))]
-        let resolved = resolve(db, keep)?;
+        let resolved = resolve_for(db, keep, role)?;
         #[cfg(any(windows, all(unix, feature = "verify-remote-keep")))]
         let path = resolved.as_path();
-        let protected = Protected::open(db, keep, path)?;
+        let protected = Protected::open(db, keep, path, role)?;
         Ok(Self {
             protected,
             path: path.to_path_buf(),
@@ -311,14 +386,14 @@ pub(super) fn isolate_source(
     item: &KeepReference,
     pre_rename: impl FnOnce() -> Result<(), String>,
 ) -> Result<PathBuf, String> {
-    let path = resolve(db, item)?;
+    let path = resolve_for(db, item, InspectRole::Source)?;
     if path != op.src {
         return Err("隔離する項目の場所が変更されました".into());
     }
     #[cfg(windows)]
     {
         let protected = Protected::source(db, item, &path)?;
-        let mount = windows::local_mount(db, item)?;
+        let mount = windows::local_mount(db, item, InspectRole::Source)?;
         return super::quarantine::move_to_quarantine(
             op.plan_id,
             op.seq,
@@ -334,7 +409,7 @@ pub(super) fn isolate_source(
     }
     #[cfg(all(unix, feature = "verify-remote-keep"))]
     {
-        fixture::verify(item, &path)?;
+        fixture::verify(item, &path, InspectRole::Source)?;
         let mount = crate::query::drives(db)
             .map_err(display)?
             .into_iter()
@@ -466,6 +541,38 @@ mod tests {
         organize::{Context, OpInput, approve_plan, create_plan, execute_plan},
         volumes::Volume,
     };
+
+    #[cfg(all(not(windows), not(all(unix, feature = "verify-remote-keep"))))]
+    #[test]
+    fn inspect_uses_the_role_in_unsupported_platform_errors() {
+        let db = Db::open_in_memory().unwrap();
+        let item = KeepReference {
+            device_id: "synthetic".into(),
+            drive_id: "synthetic".into(),
+            chain: vec![1, 2],
+            format: crate::dups::COMPARISON_FORMAT,
+            key: ContentKey {
+                directory: false,
+                size: 1,
+                hash: [0; 32],
+            },
+            identity: [0; 2],
+        };
+        let os = if cfg!(target_os = "macos") {
+            "macOS"
+        } else {
+            std::env::consts::OS
+        };
+        for (role, subject) in [
+            (InspectRole::Keep, "残す側"),
+            (InspectRole::Source, "隔離側"),
+        ] {
+            assert_eq!(
+                ProtectedKeep::inspect_for(&db, item.clone(), role).unwrap_err(),
+                format!("{subject}が {os} のため、整理は依頼できません。比較表示のみ"),
+            );
+        }
+    }
 
     #[test]
     fn parent_and_child_reservations_block_all_shared_plan_entry_points_until_expiry() {

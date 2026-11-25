@@ -16,7 +16,6 @@ use bevy::window::RequestRedraw;
 use lisa_core::catalog::{Role, State};
 
 use crate::catalog::{CatalogView, Hit};
-use crate::dups::Dups;
 use crate::model::tree::FileTree;
 use crate::render::palette;
 use crate::render::scene::LabelFont;
@@ -45,12 +44,7 @@ impl Plugin for CatalogPanelPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PostStartup, spawn_panel).add_systems(
             Update,
-            (
-                only_one_panel.before(SidePanelLayout),
-                show_panel.in_set(SidePanelLayout),
-                fill_panel,
-            )
-                .chain(),
+            (show_panel.in_set(SidePanelLayout), fill_panel).chain(),
         );
     }
 }
@@ -95,25 +89,24 @@ fn spawn_panel(mut commands: Commands) {
         });
 }
 
-/// 重複の一覧とカタログのパネルは、後に開いた方だけを残す。
-fn only_one_panel(mut view: ResMut<CatalogView>, mut dups: ResMut<Dups>) {
-    if view.is_changed() && view.open && dups.open {
-        dups.open = false;
-    } else if dups.is_changed() && dups.open && view.open {
-        view.open = false;
-    }
-}
-
 /// 開け閉め。右からすべり出し、その幅の分だけ木を映す領域を狭める。
 fn show_panel(
     view: Res<CatalogView>,
     mut shown: Local<f32>,
     mut last: Local<Option<std::time::Instant>>,
-    mut panel: Single<&mut Node, With<Panel>>,
+    panel: Single<(&mut Node, &mut GlobalZIndex), With<Panel>>,
     mut list: Single<&mut SidePanelList, With<List>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    list.closing = !view.open;
+    let (mut panel, mut z_index) = panel.into_inner();
+    let z = if view.open { 7 } else { 6 };
+    if z_index.0 != z {
+        z_index.0 = z;
+        redraw.write(RequestRedraw);
+    }
+    if list.closing == view.open {
+        list.closing = !view.open;
+    }
     let target = if view.open { 1.0 } else { 0.0 };
     let now = std::time::Instant::now();
     let dt = last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());

@@ -8,17 +8,17 @@ use crate::{
     name,
 };
 
-use super::{KeepReference, MAX_PROTECTED_ENTRIES, display};
+use super::{InspectRole, KeepReference, MAX_PROTECTED_ENTRIES, display};
 
-pub(super) fn identify(path: &Path) -> Result<[u64; 2], String> {
-    fixture(path)?;
+pub(super) fn identify(path: &Path, role: InspectRole) -> Result<[u64; 2], String> {
+    fixture(path, role)?;
     let metadata = std::fs::symlink_metadata(path).map_err(display)?;
     Ok([metadata.dev(), metadata.ino()])
 }
 
-fn fixture(path: &Path) -> Result<(), String> {
-    let root = std::env::var_os("LISA_VERIFY_KEEP_ROOT")
-        .ok_or("残す側が macOS のため、整理は依頼できません。比較表示のみ")?;
+fn fixture(path: &Path, role: InspectRole) -> Result<(), String> {
+    let root =
+        std::env::var_os("LISA_VERIFY_KEEP_ROOT").ok_or_else(|| role.unsupported("macOS"))?;
     let root = std::fs::canonicalize(root).map_err(display)?;
     let temporary = std::fs::canonicalize(std::env::temp_dir()).map_err(display)?;
     if root.parent() != Some(temporary.as_path())
@@ -34,8 +34,8 @@ fn fixture(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn verify(item: &KeepReference, path: &Path) -> Result<(), String> {
-    let identity = identify(path)?;
+pub(super) fn verify(item: &KeepReference, path: &Path, role: InspectRole) -> Result<(), String> {
+    let identity = identify(path, role)?;
     let kind = if item.key.directory {
         Kind::Dir
     } else {

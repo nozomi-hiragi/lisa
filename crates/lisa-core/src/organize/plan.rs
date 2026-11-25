@@ -9,7 +9,7 @@ use crate::db::{self, Db};
 use crate::hash::Hash;
 
 use super::check::{self, PreparedOp};
-use super::remote_keep::{self, ProtectedKeep, RemotePlan, relay::RelayAction};
+use super::remote_keep::{self, InspectRole, ProtectedKeep, RemotePlan, relay::RelayAction};
 use super::{Context, PENDING_EXPIRE_MS};
 
 /// 計画に渡す 1 件の操作（入力の形）。
@@ -409,8 +409,8 @@ pub fn create_remote_keep_plan(
         {
             return Err("同じ中身で独立した実体だと確認できません".into());
         }
-        let path = remote_keep::resolve(db, source)?;
-        ProtectedKeep::open(db, source)?;
+        let path = remote_keep::resolve_for(db, source, InspectRole::Source)?;
+        ProtectedKeep::open_for(db, source, InspectRole::Source)?;
         ops.push(OpInput::Trash { path, keep: None });
     }
     remote_keep::call(ctx, &remote, RelayAction::Inspect)?;

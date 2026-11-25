@@ -201,8 +201,8 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                         menu_button(),
                         children![(Text::new("重複"), text_font.clone(), TextColor(TEXT_COLOR))],
                     ))
-                    .observe(|_: On<PointerClick>, mut dups: ResMut<crate::dups::Dups>| {
-                        dups.open = !dups.open;
+                    .observe(|_: On<PointerClick>, mut panels: super::SidePanels| {
+                        panels.toggle(super::SidePanel::Dups);
                     });
                 buttons
                     .spawn((
@@ -213,11 +213,9 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                             TextColor(TEXT_COLOR)
                         )],
                     ))
-                    .observe(
-                        |_: On<PointerClick>, mut view: ResMut<crate::catalog::CatalogView>| {
-                            view.open = !view.open;
-                        },
-                    );
+                    .observe(|_: On<PointerClick>, mut panels: super::SidePanels| {
+                        panels.toggle(super::SidePanel::Catalog);
+                    });
                 buttons
                     .spawn((
                         menu_button(),
@@ -228,12 +226,9 @@ pub fn spawn_menu(mut commands: Commands, font: Res<LabelFont>) {
                             TextColor(TEXT_COLOR)
                         )],
                     ))
-                    .observe(
-                        |_: On<PointerClick>,
-                         mut organize: ResMut<crate::organize::OrganizeState>| {
-                            organize.panel_open = !organize.panel_open;
-                        },
-                    );
+                    .observe(|_: On<PointerClick>, mut panels: super::SidePanels| {
+                        panels.toggle(super::SidePanel::Organize);
+                    });
                 buttons
                     .spawn((
                         menu_button(),

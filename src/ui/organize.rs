@@ -11,8 +11,6 @@ use bevy::ui::ScrollPosition;
 use bevy::window::RequestRedraw;
 use lisa_core::organize::{OpKind, OpState, Plan, PlanState};
 
-use crate::catalog::CatalogView;
-use crate::dups::Dups;
 use crate::lan::PairBanner;
 use crate::organize::{HistoryConfirmation, OrganizeState, PendingPlan, PlanDetails};
 use crate::render::palette;
@@ -57,7 +55,6 @@ impl Plugin for OrganizePanelPlugin {
         app.add_systems(PostStartup, spawn_ui).add_systems(
             Update,
             (
-                only_one_panel.before(SidePanelLayout),
                 show_panel.in_set(SidePanelLayout),
                 fill_panel,
                 update_banners,
@@ -205,36 +202,24 @@ fn spawn_ui(mut commands: Commands) {
         });
 }
 
-/// 重複・カタログ・整理の 3 つの右パネルは、同時に 1 つだけ開く。
-fn only_one_panel(
-    mut organize: ResMut<OrganizeState>,
-    mut catalog: ResMut<CatalogView>,
-    mut dups: ResMut<Dups>,
-) {
-    if organize.is_changed() && organize.panel_open {
-        if dups.open {
-            dups.open = false;
-        }
-        if catalog.open {
-            catalog.open = false;
-        }
-    } else if organize.panel_open
-        && ((catalog.is_changed() && catalog.open) || (dups.is_changed() && dups.open))
-    {
-        organize.panel_open = false;
-    }
-}
-
 /// 履歴パネルの開け閉め。右からすべり出し、その幅の分だけ木を映す領域を狭める。
 fn show_panel(
     organize: Res<OrganizeState>,
     mut shown: Local<f32>,
     mut last: Local<Option<std::time::Instant>>,
-    mut panel: Single<&mut Node, With<Panel>>,
+    panel: Single<(&mut Node, &mut GlobalZIndex), With<Panel>>,
     mut list: Single<&mut SidePanelList, With<List>>,
     mut redraw: MessageWriter<RequestRedraw>,
 ) {
-    list.closing = !organize.panel_open;
+    let (mut panel, mut z_index) = panel.into_inner();
+    let z = if organize.panel_open { 7 } else { 6 };
+    if z_index.0 != z {
+        z_index.0 = z;
+        redraw.write(RequestRedraw);
+    }
+    if list.closing == organize.panel_open {
+        list.closing = !organize.panel_open;
+    }
     let target = if organize.panel_open { 1.0 } else { 0.0 };
     let now = std::time::Instant::now();
     let dt = last.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
@@ -1375,7 +1360,7 @@ fn spawn_request_card(
                     move |_: On<PointerClick>,
                           mut requests: ResMut<crate::dups::requests::Requests>,
                           lan: Option<Res<crate::lan::LanState>>| {
-                        requests.undo(lan.as_deref(), &id);
+                        requests.undo(|device| lan.as_ref().and_then(|lan| lan.saved_peer(device)), &id);
                     },
                 );
             }

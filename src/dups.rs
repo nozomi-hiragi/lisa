@@ -33,7 +33,13 @@ impl Plugin for DupsPlugin {
             .init_resource::<requests::Requests>()
             .add_systems(
                 Update,
-                (requests::update, compute, compute_remote, update_highlight).chain(),
+                (
+                    requests::update.after(crate::ui::SidePanelSync),
+                    compute,
+                    compute_remote,
+                    update_highlight,
+                )
+                    .chain(),
             );
     }
 }
