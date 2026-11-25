@@ -217,6 +217,16 @@ pub struct DebugState {
     pub ui_text: Vec<(String, [f32; 2])>,
 }
 
+/// 接続中ドライブの永続ハッシュキューの状態。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HashQueueState {
+    pub ready: u64,
+    pub waiting: u64,
+    pub next_due_at: Option<i64>,
+    pub active: bool,
+    pub boosted: bool,
+}
+
 /// アプリの今の様子。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
@@ -241,6 +251,8 @@ pub struct State {
     pub bytes_hashed: u64,
     pub hashing: Option<PathBuf>,
     pub finished: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_queue: Option<HashQueueState>,
     /// 画面の処理を待たずに、直近に写した様子を返したとき、その写しが何ミリ秒前のものか。
     /// 大きければ画面の処理が止まっている（窓が隠れているなど）。画面の処理で返したときは無い。
     #[serde(default, skip_serializing_if = "Option::is_none")]

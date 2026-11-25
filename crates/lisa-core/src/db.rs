@@ -18,6 +18,12 @@ use crate::volumes::Volume;
 
 pub use rusqlite::{Error, ErrorCode};
 
+mod hash_queue;
+pub(crate) use hash_queue::retry_busy;
+pub use hash_queue::{
+    HASH_CHANGED, HASH_SCHEDULED, HASH_VISIBLE, HashQueueCounts, HashQueueItem, HashQueueSeed,
+};
+
 pub type Result<T> = rusqlite::Result<T>;
 
 const SCHEMA: &str = "
@@ -368,6 +374,7 @@ impl Db {
         )?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
+        conn.execute_batch(hash_queue::SCHEMA)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS entry_merged ON entry(id) WHERE merged IS NOT NULL;",
         )?;
@@ -505,8 +512,8 @@ impl Db {
         size: u64,
         mtime: Option<i64>,
     ) -> Result<()> {
-        self.conn
-            .prepare_cached(
+        self.finish_hash_job(id, |conn| {
+            conn.prepare_cached(
                 "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = ?4, hashed_mtime = ?5,
                      error = NULL WHERE id = ?1",
             )?
@@ -517,7 +524,8 @@ impl Db {
                 size as i64,
                 mtime
             ])?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// 別の接続が一覧を変えていなければ、読み直したハッシュと祖先の無効化を一緒に確定する。
@@ -527,70 +535,76 @@ impl Db {
         version: i64,
         result: std::result::Result<&crate::hash::Hash, &str>,
     ) -> Result<bool> {
-        let (hash, error) = match result {
-            Ok(hash) => (Some(hash), None),
-            Err(error) => (None, Some(error)),
-        };
-        let tx = self.conn.savepoint()?;
-        if listing_version(&tx)? != version {
-            return Ok(false);
-        }
-        if entry.hash.as_ref() != hash {
-            clear_hash_up(&tx, entry.id)?;
-        }
-        tx.execute(
-            "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = size, hashed_mtime = mtime,
-                error = ?4 WHERE id = ?1",
-            params![
-                entry.id,
-                hash.map(|hash| &hash[..]),
-                crate::hash::ALGO,
-                error
-            ],
-        )?;
-        tx.commit()?;
-        Ok(true)
+        retry_busy(|| {
+            let (hash, error) = match result {
+                Ok(hash) => (Some(hash), None),
+                Err(error) => (None, Some(error)),
+            };
+            let tx = self.conn.savepoint()?;
+            if listing_version(&tx)? != version {
+                return Ok(false);
+            }
+            if entry.hash.as_ref() != hash {
+                clear_hash_up(&tx, entry.id)?;
+            }
+            tx.execute(
+                "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = size, hashed_mtime = mtime,
+                    error = ?4 WHERE id = ?1",
+                params![
+                    entry.id,
+                    hash.map(|hash| &hash[..]),
+                    crate::hash::ALGO,
+                    error
+                ],
+            )?;
+            hash_queue::remove_job(&tx, entry.id)?;
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     /// 保存済みの子だけでフォルダを集約する。別の接続の書き込みと競合した場合は再試行できる。
     pub fn aggregate_refreshed_folder(&mut self, id: i64) -> Result<bool> {
-        let tx = self.conn.savepoint()?;
-        let Some(folder) = tx
-            .prepare_cached(&format!("SELECT {COLUMNS} FROM entry WHERE id = ?1"))?
-            .query_row([id], row_to_stored)
-            .optional()?
-        else {
-            return Ok(false);
-        };
-        if !folder.listed || folder.error.is_some() {
-            return Ok(false);
-        }
-        let children = {
-            let mut statement = tx.prepare_cached(&format!(
-                "SELECT {COLUMNS} FROM entry WHERE parent_id = ?1 ORDER BY pos"
-            ))?;
-            statement
-                .query_map([id], row_to_stored)?
-                .collect::<Result<Vec<_>>>()?
-        };
-        let Some(entries) = crate::hash::ready_tree_bytes(&children) else {
-            return Ok(false);
-        };
-        let hash = blake3::hash(&entries);
-        if folder.hash.as_ref() != Some(hash.as_bytes()) {
-            clear_hash_up(&tx, id)?;
-        }
-        tx.execute(
-            "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = 0, hashed_mtime = mtime
-             WHERE id = ?1",
-            params![id, &hash.as_bytes()[..], crate::hash::ALGO],
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO tree (hash, algo, entries) VALUES (?1, ?2, ?3)",
-            params![&hash.as_bytes()[..], crate::hash::ALGO, entries],
-        )?;
-        tx.commit()?;
-        Ok(true)
+        retry_busy(|| {
+            let tx = self.conn.savepoint()?;
+            let Some(folder) = tx
+                .prepare_cached(&format!("SELECT {COLUMNS} FROM entry WHERE id = ?1"))?
+                .query_row([id], row_to_stored)
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            if folder.kind != Kind::Dir || !folder.listed || folder.error.is_some() {
+                return Ok(false);
+            }
+            let children = {
+                let mut statement = tx.prepare_cached(&format!(
+                    "SELECT {COLUMNS} FROM entry WHERE parent_id = ?1 ORDER BY pos"
+                ))?;
+                statement
+                    .query_map([id], row_to_stored)?
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let Some(entries) = crate::hash::ready_tree_bytes(&children) else {
+                return Ok(false);
+            };
+            let hash = blake3::hash(&entries);
+            if folder.hash.as_ref() != Some(hash.as_bytes()) {
+                clear_hash_up(&tx, id)?;
+            }
+            tx.execute(
+                "UPDATE entry SET hash = ?2, algo = ?3, hashed_size = 0, hashed_mtime = mtime
+                 WHERE id = ?1",
+                params![id, &hash.as_bytes()[..], crate::hash::ALGO],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO tree (hash, algo, entries) VALUES (?1, ?2, ?3)",
+                params![&hash.as_bytes()[..], crate::hash::ALGO, entries],
+            )?;
+            hash_queue::remove_job(&tx, id)?;
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     /// 手動更新では長いビジー待ちを避け、短い仕事の切れ目で再試行する。
@@ -724,10 +738,11 @@ impl Db {
 
     /// ファイルをハッシュできなかった理由を書く。
     pub fn set_hash_error(&mut self, id: i64, error: &str) -> Result<()> {
-        self.conn
-            .prepare_cached("UPDATE entry SET error = ?2 WHERE id = ?1")?
-            .execute(params![id, error])?;
-        Ok(())
+        self.finish_hash_job(id, |conn| {
+            conn.prepare_cached("UPDATE entry SET error = ?2 WHERE id = ?1")?
+                .execute(params![id, error])?;
+            Ok(())
+        })
     }
 
     /// `find_folder` と同じだが、覚えている番号を使わず、書き換えもしない（`&self` で引ける）。
@@ -849,6 +864,17 @@ impl Db {
         result: &std::result::Result<Listing, String>,
         version: Option<i64>,
     ) -> Result<ListingSave> {
+        retry_busy(|| self.try_save_listing_at(drive_id, mount, path, result, version))
+    }
+
+    fn try_save_listing_at(
+        &mut self,
+        drive_id: &str,
+        mount: &Path,
+        path: &Path,
+        result: &std::result::Result<Listing, String>,
+        version: Option<i64>,
+    ) -> Result<ListingSave> {
         self.refresh_folder_cache()?;
         let tx = self.conn.savepoint()?;
         let Some(folder) = folder_id_at(&tx, drive_id, mount, path)? else {
@@ -885,9 +911,9 @@ impl Db {
         listings: impl IntoIterator<Item = (&'a Path, &'a std::result::Result<Listing, String>)>,
         budget: Duration,
     ) -> Result<Vec<ListingSave>> {
-        let mut tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut tx = retry_busy(|| {
+            rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+        })?;
         let started = Instant::now();
         let mut saved = Vec::new();
         if listing_version(&tx)? != version {
@@ -923,9 +949,9 @@ impl Db {
         read: impl FnOnce() -> std::result::Result<Listing, String>,
     ) -> Result<(ListingSave, std::result::Result<Listing, String>)> {
         self.refresh_folder_cache()?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = retry_busy(|| {
+            rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+        })?;
         let folder = folder_id_at(&tx, drive_id, mount, path)?;
         let listing = read();
         let mut folders = Vec::new();
@@ -1056,6 +1082,14 @@ fn apply_listing<'a>(
             if changed {
                 clear_hash_up(conn, folder)?;
             }
+            conn.prepare_cached("DELETE FROM hash_queue WHERE entry_id = ?1")?
+                .execute([folder])?;
+            let parent: Option<i64> = conn
+                .prepare_cached("SELECT parent_id FROM entry WHERE id = ?1")?
+                .query_row([folder], |row| row.get(0))?;
+            if let Some(parent) = parent {
+                hash_queue::enqueue(conn, parent, HASH_CHANGED, now_ms())?;
+            }
             return Ok(if !was_listed {
                 ListingSave::First
             } else {
@@ -1067,6 +1101,12 @@ fn apply_listing<'a>(
 
     let diff = ListingDiff::read(conn, folder, listing, folders)?;
     if was_listed && old_error.is_none() && diff.is_empty() {
+        if hash_queue::has_missing_child(conn, folder)? {
+            if !can_write()? {
+                return Ok(ListingSave::Retry);
+            }
+            hash_queue::reconcile_missing_children(conn, folder, now_ms())?;
+        }
         return Ok(ListingSave::Unchanged);
     }
     if !can_write()? {
@@ -1074,7 +1114,14 @@ fn apply_listing<'a>(
     }
 
     let invalidate_hash = old_error.is_some() || diff.hash_changed;
-    diff.write(conn, drive_id, folder, folders)?;
+    let now = now_ms();
+    let priority = if was_listed {
+        HASH_CHANGED
+    } else {
+        HASH_SCHEDULED
+    };
+    diff.write(conn, drive_id, folder, folders, priority, now)?;
+    hash_queue::reconcile_missing_children(conn, folder, now)?;
     conn.execute(
         "UPDATE entry SET listed = 1, status = 'unloaded', error = NULL WHERE id = ?1",
         [folder],
@@ -1082,6 +1129,7 @@ fn apply_listing<'a>(
     if was_listed && invalidate_hash {
         clear_hash_up(conn, folder)?;
     }
+    hash_queue::enqueue(conn, folder, priority, now)?;
     Ok(if was_listed {
         ListingSave::Changed
     } else {
@@ -1191,13 +1239,15 @@ impl<'a> ListingDiff<'a> {
             let content_changed = previous.kind != kind
                 || previous.size != size
                 || previous.mtime != entry.mtime_ms
+                || previous.file_id != file_id
+                || previous.cloud_only != entry.cloud_only
+                || previous.other_volume != entry.other_volume
                 || previous.merged != row.merged
                 || previous.merged_verified != merged_verified;
             hash_changed |= content_changed;
             if content_changed
                 || previous.pos != pos
                 || previous.name_nfc != entry.name_nfc
-                || previous.file_id != file_id
                 || previous.nlink != nlink
                 || previous.cloud_only != entry.cloud_only
                 || previous.other_volume != entry.other_volume
@@ -1227,6 +1277,8 @@ impl<'a> ListingDiff<'a> {
         drive_id: &str,
         folder: i64,
         folders: &mut Vec<(&'a OsStr, i64)>,
+        priority: i64,
+        now: i64,
     ) -> Result<()> {
         if !self.inserts.is_empty() {
             let mut insert = conn.prepare_cached(
@@ -1267,6 +1319,8 @@ impl<'a> ListingDiff<'a> {
                 )?;
                 if entry.kind == Kind::Dir {
                     folders.push((&entry.name, id));
+                } else if entry.kind == Kind::File && !entry.cloud_only && !merged_verified {
+                    hash_queue::enqueue(conn, id, priority, now)?;
                 }
             }
         }
@@ -1309,6 +1363,17 @@ impl<'a> ListingDiff<'a> {
                     merged,
                     merged_verified
                 ])?;
+                if content_changed {
+                    if entry.kind == Kind::File && !entry.cloud_only && !merged_verified {
+                        hash_queue::enqueue(conn, id, HASH_CHANGED, now)?;
+                    } else {
+                        conn.prepare_cached("DELETE FROM hash_queue WHERE entry_id = ?1")?
+                            .execute([id])?;
+                        if entry.kind == Kind::Dir {
+                            hash_queue::enqueue(conn, id, HASH_CHANGED, now)?;
+                        }
+                    }
+                }
             }
         }
         if !self.deletes.is_empty() {
@@ -1578,8 +1643,8 @@ mod tests {
             db.save_listing("test:1", &tmp.0, &sub, &read(&sub))
                 .unwrap()
         );
-        // 変わったファイル、親の一覧状態、親と祖先のハッシュだけを書く。
-        assert_eq!(db.conn.total_changes() - changes_before, 4);
+        // エントリ 4 行と、変わったファイル・親のキュー 2 行だけを書く。
+        assert_eq!(db.conn.total_changes() - changes_before, 6);
         let root = db.drive_root("test:1").unwrap().unwrap();
         assert!(root.hash.is_none());
         let sub_row = &db.children(root.id).unwrap()[0];
@@ -1784,7 +1849,9 @@ mod tests {
         writer
             .save_listing("test:1", &mount, &mount, &read())
             .unwrap();
-        let error = diff.write(&tx, "test:1", root, &mut folders).unwrap_err();
+        let error = diff
+            .write(&tx, "test:1", root, &mut folders, HASH_CHANGED, now_ms())
+            .unwrap_err();
         assert!(matches!(
             error,
             Error::SqliteFailure(error, _) if error.extended_code == rusqlite::ffi::SQLITE_BUSY_SNAPSHOT

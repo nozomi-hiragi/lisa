@@ -13,6 +13,12 @@ use std::time::{Duration, Instant};
 use crate::db::{self, Db, Stored};
 use crate::listing::Kind;
 
+mod queue;
+pub use queue::{
+    HASH_BATCH_SIZE, HASH_THREADS, HashBatch, HashFailure, hash_queue_batch,
+    hash_queue_batch_checked, hash_retry_delay_ms,
+};
+
 /// ハッシュのアルゴリズム（DB の `algo`）。
 pub const ALGO: &str = "blake3";
 /// 確定する間隔。
@@ -210,6 +216,53 @@ pub(crate) fn tree_bytes_with_markers(
     tree_bytes(&parts)
 }
 
+/// 子の保存済みハッシュがそろっていれば、ファイルを開かずにフォルダの中身を作る。
+pub(crate) fn ready_tree_bytes(children: &[Stored]) -> Option<Vec<u8>> {
+    if children.iter().any(|child| {
+        child.hash.is_none()
+            && child.error.is_none()
+            && !child.cloud_only
+            && !child.merged_verified
+            && (child.kind == Kind::File || (child.kind == Kind::Dir && !child.other_volume))
+    }) {
+        return None;
+    }
+    Some(stored_tree_bytes(children))
+}
+
+fn stored_tree_bytes(children: &[Stored]) -> Vec<u8> {
+    if children.iter().any(|child| child.merged_verified) {
+        let real = children
+            .iter()
+            .filter(|child| !child.merged_verified)
+            .map(|child| NamedChild {
+                name: child.name_nfc.clone(),
+                raw_name: child.name_raw.clone(),
+                kind: child.kind,
+                hash: child.hash,
+                size: child.size,
+            })
+            .collect();
+        let markers = children
+            .iter()
+            .filter(|child| child.merged_verified)
+            .filter_map(|child| child.merged.as_ref())
+            .collect();
+        tree_bytes_with_markers(real, markers)
+    } else {
+        let parts: Vec<_> = children
+            .iter()
+            .map(|child| Child {
+                kind: child.kind,
+                name_nfc: &child.name_nfc,
+                hash: child.hash.as_ref(),
+                size: child.size,
+            })
+            .collect();
+        tree_bytes(&parts)
+    }
+}
+
 /// ハッシュの進み具合。
 pub enum Event<'a> {
     /// このフォルダの中のファイルをハッシュし始める。
@@ -256,54 +309,6 @@ pub fn hash_folder(
         return Ok(());
     };
     walk(db, threads, on, pace, &folder, path.to_path_buf())
-}
-
-/// 子の保存済みハッシュがそろっていれば、ファイルを開かずにフォルダの中身を作る。
-pub(crate) fn ready_tree_bytes(children: &[Stored]) -> Option<Vec<u8>> {
-    if children.iter().any(|child| {
-        child.hash.is_none()
-            && child.error.is_none()
-            && !child.cloud_only
-            && !child.other_volume
-            && !child.merged_verified
-            && matches!(child.kind, Kind::File | Kind::Dir)
-    }) {
-        return None;
-    }
-    Some(stored_tree_bytes(children))
-}
-
-fn stored_tree_bytes(children: &[Stored]) -> Vec<u8> {
-    if children.iter().any(|child| child.merged_verified) {
-        let real = children
-            .iter()
-            .filter(|child| !child.merged_verified)
-            .map(|child| NamedChild {
-                name: child.name_nfc.clone(),
-                raw_name: child.name_raw.clone(),
-                kind: child.kind,
-                hash: child.hash,
-                size: child.size,
-            })
-            .collect();
-        let markers = children
-            .iter()
-            .filter(|child| child.merged_verified)
-            .filter_map(|child| child.merged.as_ref())
-            .collect();
-        tree_bytes_with_markers(real, markers)
-    } else {
-        let parts: Vec<_> = children
-            .iter()
-            .map(|child| Child {
-                kind: child.kind,
-                name_nfc: &child.name_nfc,
-                hash: child.hash.as_ref(),
-                size: child.size,
-            })
-            .collect();
-        tree_bytes(&parts)
-    }
 }
 
 fn walk(

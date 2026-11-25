@@ -123,10 +123,7 @@ impl Plugin for ScanPlugin {
                 node,
                 // DB が無ければ、どのドライブも残さない。
                 drive_id: volume.id.clone().filter(|_| db.is_some()),
-                mount_identity: std::fs::symlink_metadata(&volume.mount_path)
-                    .ok()
-                    .as_ref()
-                    .and_then(worker::directory_identity),
+                mount_identity: lisa_core::volumes::mount_identity(&volume.mount_path),
                 mount: volume.mount_path.clone(),
                 listed: tree.nodes[node].listed,
             })
@@ -211,7 +208,7 @@ struct Root {
     node: NodeId,
     drive_id: Option<String>,
     mount: PathBuf,
-    mount_identity: Option<(u64, u64)>,
+    mount_identity: Option<lisa_core::volumes::MountIdentity>,
     /// DB で、一番上を読み終えている（続きから読む）。
     listed: bool,
 }
@@ -362,6 +359,7 @@ pub struct Progress {
     pub finished: Option<Instant>,
     /// ハッシュの進み具合（読み終えたあとに始める）。
     pub hash: HashProgress,
+    pub hash_queue: Option<lisa_core::remote::HashQueueState>,
 }
 
 #[derive(Default)]
@@ -703,6 +701,9 @@ fn start_workers(
         progress: progress.0.clone(),
         control: control.clone(),
         dirty: false,
+        hash_retry_needed: false,
+        hash_stats_at: None,
+        pending_visible: None,
         hints: Default::default(),
         skip_dirs,
     };

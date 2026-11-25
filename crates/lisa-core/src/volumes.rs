@@ -71,6 +71,35 @@ pub fn lan_address() -> Option<std::net::IpAddr> {
     (!ip.is_unspecified()).then_some(ip)
 }
 
+/// マウントルートのボリュームとディレクトリの識別子。
+pub type MountIdentity = (u64, u128);
+
+/// 同じパスに別の媒体がマウントされたことを見分ける。
+pub fn mount_identity(path: &std::path::Path) -> Option<MountIdentity> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), u128::from(metadata.ino())))
+    }
+    #[cfg(windows)]
+    {
+        imp::directory_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// バッチ取得時と同じマウントにまだ到達できるか。
+pub fn mount_matches(path: &std::path::Path, expected: Option<MountIdentity>) -> bool {
+    expected.is_some() && mount_identity(path) == expected
+}
+
 /// つながっているボリュームの一覧。
 pub fn list() -> io::Result<Vec<Volume>> {
     imp::list()
@@ -231,10 +260,10 @@ mod imp {
 
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileIdInfo, GetDiskFreeSpaceExW, GetDriveTypeW,
-        GetFileInformationByHandleEx, GetLogicalDriveStringsW, GetVolumeInformationW,
-        OPEN_EXISTING,
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetDiskFreeSpaceExW,
+        GetDriveTypeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        GetLogicalDriveStringsW, GetVolumeInformationW, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::WindowsProgramming::{DRIVE_REMOTE, DRIVE_REMOVABLE};
 
@@ -376,6 +405,40 @@ mod imp {
             case_sensitive: Some(flags & FILE_CASE_SENSITIVE_SEARCH != 0),
             hidden: false,
         })
+    }
+
+    pub(super) fn directory_identity(path: &std::path::Path) -> Option<MountIdentity> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .ok()?;
+        // SAFETY: 開いたファイルのハンドルと、書き込み可能な構造体を渡す。
+        unsafe {
+            let handle = file.as_raw_handle().cast();
+            let mut file_id: FILE_ID_INFO = std::mem::zeroed();
+            if GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&mut file_id as *mut FILE_ID_INFO).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            ) != 0
+            {
+                return Some((
+                    file_id.VolumeSerialNumber,
+                    u128::from_le_bytes(file_id.FileId.Identifier),
+                ));
+            }
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            if GetFileInformationByHandle(handle, &mut info) == 0 {
+                return None;
+            }
+            let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            Some((u64::from(info.dwVolumeSerialNumber), u128::from(index)))
+        }
     }
 
     /// NTFS の 64 ビットのボリュームシリアル。一番上のフォルダを開いて聞く。

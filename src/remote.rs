@@ -938,6 +938,9 @@ fn state(
         state.bytes_hashed = progress.hash.bytes;
         state.hashing = progress.hash.folder.clone();
         state.finished = progress.finished.is_some();
+        if debug_remote_enabled() {
+            state.hash_queue = progress.hash_queue.clone();
+        }
     }
     state
 }
