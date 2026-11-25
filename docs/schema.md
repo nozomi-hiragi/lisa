@@ -5,7 +5,7 @@
 
 実装した `entry` は、この表のうち `status` 以外です（ハッシュは `hash`、`algo`、`hashed_size`、
 `hashed_mtime`。状態はハッシュとエラーから決めます）。`tree` と `snapshot` も実装しました（`tree` の
-`entries` は `hash::tree_bytes` の形で、フォルダのハッシュはその blake3）。`content` と `hash_queue` はまだです。加えて、親の中での並び（`pos`）、子を読み終えたか
+`entries` は `hash::tree_bytes` の形で、フォルダのハッシュはその blake3）。`hash_queue` も実装済みです。`content` はまだです。加えて、親の中での並び（`pos`）、子を読み終えたか
 （`listed`）、ハードリンクの数（`nlink`）、別のボリュームか（`other_volume`）を持ちます。名前は
 ディスク上のバイト列（BLOB）です。フォルダの大きさは残さず、読み出すときに子から足します。
 端末の ID は `meta` の表（`this_device`）に覚えます。
@@ -115,15 +115,19 @@ Lisa が SQLite に残すものと、残さないものをまとめます。
 
 | 列 | 中身 |
 |---|---|
-| `entry_id` | 対象 |
-| `priority` | 優先度。今画面で見ているものは高くする |
-| `reason` | `visible`（画面で見た） / `changed`（変わった） / `scheduled`（定期） / `retry`（やり直し） |
-| `due_at` | 次にやる日時 |
-| `delay` | 今の間隔（指数的に延ばす／縮める） |
-| `attempts` | 試した回数 |
-| `last_error` | 最後のエラー |
+| `entry_id` | 主キーと `entry(id)` への外部キー。対象を削除すると連鎖削除 |
+| `drive_id` | 取得を接続中のドライブに絞るためのドライブ ID |
+| `priority` | 10 は表示中、20 は変更、30 は通常走査と移行 |
+| `reason` | `visible`、`changed`、`scheduled`、`retry` |
+| `due_at` | 次に試せる UTC Unix ミリ秒。0 は即時 |
+| `delay_ms` | 今の待機間隔（ミリ秒） |
+| `attempts` | 続けて一時失敗した回数 |
+| `last_error` | 直近の一時失敗 |
+| `updated_at` | 最終更新の UTC Unix ミリ秒 |
 
-- フォルダの画像を焼く作業も、この列で一緒に扱います（ハッシュが決まったあとに続けて焼く）。
+- `hash_queue_pick` はドライブと期限、`hash_queue_due` は期限に使います。`hash_queue_priority` はドライブ・優先度ごとに `due_at, entry_id` 順の先頭を読むために使います。`hash_queue_missing` は再照合待ちのファイルに、`entry_hash_pending` は未完了の子があるかの判定に使います。
+- 一覧と同じトランザクションで、ハッシュが必要になった実体ファイルと既読フォルダを登録します。表示中や内容変更で再登録したときは待機状態をリセットし、通常走査では既存の待機状態を維持します。成功・永続失敗では同じトランザクションで列から削除します。
+- DB を開くときは表と索引を追加します。旧 DB の補完は接続中のドライブごとに裏で分割実行し、完了を `meta.hash_queue_seeded_v1:<drive_id>` に記録します。
 
 ## snapshot（スナップショット）
 

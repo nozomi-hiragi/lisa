@@ -10,7 +10,7 @@
 //! - 監視（`Request::Hint`、FSEvents など）で変わったと知らされたフォルダは、裏の分として（上の
 //!   決まりに従って）読み直す。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -20,12 +20,14 @@ use std::time::{Duration, Instant};
 use bevy::log::warn;
 use bevy::winit::EventLoopProxy;
 use bevy::winit::WinitUserEvent;
-use lisa_core::db::{Db, ErrorCode, ListingSave};
+use lisa_core::db::{
+    self, Db, ErrorCode, HASH_SCHEDULED, HASH_VISIBLE, HashQueueSeed, ListingSave,
+};
 use lisa_core::hash::{self, Pace};
 use lisa_core::listing;
 
 mod manual;
-pub(super) use manual::directory_identity;
+use lisa_core::volumes::{mount_identity, mount_matches};
 
 use super::{Message, Progress, RefreshRequest, RefreshTarget, Root, SHOWN_NEXT, readable, report};
 
@@ -34,8 +36,6 @@ const INITIAL_FOLDERS: usize = 64;
 const INITIAL_ENTRIES: usize = 512;
 const INITIAL_READ_BUDGET: Duration = Duration::from_millis(12);
 const INITIAL_WRITE_BUDGET: Duration = Duration::from_millis(20);
-/// ファイルを同時にハッシュする数。
-const HASH_THREADS: usize = 4;
 /// 休む・止めるかを見直す間隔。
 const CHECK_EVERY: Duration = Duration::from_secs(2);
 /// 前回のイベント番号を覚えておく `meta` の鍵。
@@ -401,8 +401,11 @@ pub(super) struct Worker {
     pub proxy: Option<EventLoopProxy<WinitUserEvent>>,
     pub progress: Arc<Mutex<Progress>>,
     pub control: Arc<Control>,
-    /// 読み直しでハッシュを消したので、裏でドライブ全体のハッシュをやり直す（祖先を作り直す）。
+    /// 一覧の変更や期限到達で、永続キューに実行可能な仕事がある。
     pub dirty: bool,
+    pub hash_retry_needed: bool,
+    pub hash_stats_at: Option<Instant>,
+    pub pending_visible: Option<PathBuf>,
     /// 監視から知らされた、読み直すフォルダ（同じものは 1 つにまとめる）。
     pub hints: std::collections::BTreeSet<PathBuf>,
     /// 隔離フォルダなど、読む係が飛ばすフォルダの絶対パス。
@@ -501,14 +504,14 @@ impl Worker {
         if !self.send(Message::Committed) {
             return;
         }
-        // 2. ハッシュの無いものを、下からハッシュする。
+        // 2. 旧 DB を補完し、期限が来た仕事を優先順に処理する。
         if self.db.is_some() {
             report(&self.progress, |p| p.hash.started = Some(Instant::now()));
-            if !self.hash_all(background) {
+            if !self.seed_hash_queue() || !self.hash_all(background) {
                 return;
             }
             self.control.set_active(false);
-            self.snapshot_all(background);
+            self.snapshot_all(background, true);
             report(&self.progress, |p| {
                 p.hash.folder = None;
                 p.hash.finished = Some(Instant::now());
@@ -543,20 +546,22 @@ impl Worker {
                 if !self.reread(&path, true) {
                     return;
                 }
+                self.dirty |= self.hash_ready(HASH_SCHEDULED).unwrap_or(true);
                 report(&self.progress, |p| p.done += 1);
             }
             if self.dirty && self.db.is_some() {
                 self.dirty = false;
+                let seed_again = std::mem::take(&mut self.hash_retry_needed);
                 report(&self.progress, |p| {
                     p.current = None;
                     p.finished = Some(Instant::now());
                     p.hash.started = p.finished;
                 });
-                if !self.hash_all(background) {
+                if (seed_again && !self.seed_hash_queue()) || !self.hash_all(background) {
                     return;
                 }
                 self.control.set_active(false);
-                self.snapshot_all(background);
+                self.snapshot_all(background, false);
                 report(&self.progress, |p| {
                     p.hash.folder = None;
                     p.hash.finished = Some(Instant::now());
@@ -572,12 +577,8 @@ impl Worker {
                 });
                 self.wake();
             }
-            // 知らせが続くあいだは、少しまとめてから読み直す。
-            let wait = if self.hints.is_empty() {
-                Duration::from_secs(60)
-            } else {
-                NAP
-            };
+            self.update_hash_queue_status(true);
+            let wait = self.hash_idle_wait().unwrap_or(NAP);
             match self.requests.recv_timeout(wait) {
                 Ok(request) => {
                     if !self.handle(request) {
@@ -585,7 +586,15 @@ impl Worker {
                     }
                 }
                 // 暇なときに、ここまでの変化は見たという印を付け直す（次の起動の「前回」）。
-                Err(RecvTimeoutError::Timeout) => self.remember_event_id(),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.remember_event_id();
+                    if self.refresh_hash_mounts() && !self.seed_hash_queue() {
+                        return;
+                    }
+                    self.dirty |= self.hash_retry_needed
+                        || self.pending_visible.is_some()
+                        || self.hash_ready(HASH_SCHEDULED).unwrap_or(true);
+                }
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
@@ -649,16 +658,18 @@ impl Worker {
 
     /// ハッシュがそろったドライブのスナップショットを撮る（一番上のハッシュが前と違えば）。その前に、
     /// 前の版で作ったフォルダの中身（`tree` の表）を、裏の分として埋める。
-    fn snapshot_all(&mut self, background: &Background) {
+    fn snapshot_all(&mut self, background: &Background, fill_old_trees: bool) {
         lisa_core::pace::set_thread_background(true);
         let Some(db) = self.db.as_mut() else {
             return;
         };
-        let step = || background.step(0, || false);
-        match db.fill_trees(&step) {
-            Ok(n) if n > 0 => bevy::log::info!("フォルダの中身を {n} 個残しました"),
-            Ok(_) => {}
-            Err(error) => warn!("フォルダの中身を残せませんでした: {error}"),
+        if fill_old_trees {
+            let step = || background.step(0, || false);
+            match db.fill_trees(&step) {
+                Ok(n) if n > 0 => bevy::log::info!("フォルダの中身を {n} 個残しました"),
+                Ok(_) => {}
+                Err(error) => warn!("フォルダの中身を残せませんでした: {error}"),
+            }
         }
         for root in &self.roots {
             let Some(drive_id) = &root.drive_id else {
@@ -675,37 +686,174 @@ impl Worker {
         }
     }
 
-    /// 全部のドライブの、ハッシュの無いものを裏の分としてハッシュする（やめさせられたら、頼みを
-    /// 済ませてやり直す）。UI が閉じたら false。
-    fn hash_all(&mut self, background: &Background) -> bool {
+    fn seed_hash_queue(&mut self) -> bool {
+        let mut cursors: HashMap<String, HashQueueSeed> = HashMap::new();
         for index in 0..self.roots.len() {
-            loop {
-                if !self.wait_turn(background) {
+            let Some(id) = self.roots[index].drive_id.clone() else {
+                continue;
+            };
+            while Self::mount_connected(&self.roots[index]) {
+                if !self.service_requests() {
                     return false;
                 }
-                let interrupted = AtomicBool::new(false);
-                let step = |bytes: u64| {
-                    let go = background.step(bytes, || interrupted.load(Ordering::Relaxed));
-                    if !go {
-                        interrupted.store(true, Ordering::Relaxed);
+                let Some(db) = &mut self.db else { return true };
+                match db.seed_hash_queue(&id, cursors.entry(id.clone()).or_default()) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!("ハッシュキューを補完できませんでした: {error}");
+                        self.hash_retry_needed = true;
+                        break;
                     }
-                    go
-                };
-                let priority = || background.control.apply_priority();
-                let pace = Pace {
-                    background: true,
-                    priority: Some(&priority),
-                    step: &step,
-                };
-                if !self.hash(index, None, &pace) {
-                    return false;
-                }
-                if !interrupted.load(Ordering::Relaxed) {
-                    break;
                 }
             }
         }
         true
+    }
+
+    fn mount_connected(root: &Root) -> bool {
+        mount_matches(&root.mount, root.mount_identity)
+    }
+
+    /// 抜き差しでデバイス番号が変わっても、同じボリュームだけを同じルートで再開する。
+    fn refresh_hash_mounts(&mut self) -> bool {
+        if !self
+            .roots
+            .iter()
+            .any(|root| root.drive_id.is_some() && !Self::mount_connected(root))
+        {
+            return false;
+        }
+        let volumes = super::scan_volumes();
+        let mut reconnected = false;
+        for root in &mut self.roots {
+            if root.drive_id.is_some()
+                && !Self::mount_connected(root)
+                && volumes
+                    .iter()
+                    .any(|volume| volume.id == root.drive_id && volume.mount_path == root.mount)
+            {
+                root.mount_identity = mount_identity(&root.mount);
+                reconnected |= root.mount_identity.is_some();
+            }
+        }
+        reconnected
+    }
+
+    fn hash_idle_wait(&self) -> db::Result<Duration> {
+        if !self.hints.is_empty() || self.hash_retry_needed || self.pending_visible.is_some() {
+            return Ok(NAP);
+        }
+        let Some(db) = &self.db else {
+            return Ok(Duration::from_secs(60));
+        };
+        let drives: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|root| Self::mount_connected(root))
+            .filter_map(|root| root.drive_id.as_deref())
+            .collect();
+        let now = db::now_ms();
+        if !db
+            .pick_hash_queue(&drives, now, 1, HASH_SCHEDULED)?
+            .is_empty()
+        {
+            return Ok(NAP);
+        }
+        Ok(db
+            .next_hash_due_at(&drives, now)?
+            .map_or(Duration::from_secs(60), |due| {
+                Duration::from_millis(due.saturating_sub(now).clamp(1_000, 60_000) as u64)
+            }))
+    }
+
+    fn hash_ready(&self, max_priority: i64) -> db::Result<bool> {
+        let Some(db) = &self.db else { return Ok(false) };
+        let drives: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|root| Self::mount_connected(root))
+            .filter_map(|root| root.drive_id.as_deref())
+            .collect();
+        Ok(!db
+            .pick_hash_queue(&drives, db::now_ms(), 1, max_priority)?
+            .is_empty())
+    }
+
+    fn update_hash_queue_status(&mut self, force: bool) {
+        if !crate::remote::debug_remote_enabled()
+            || (!force && self.hash_stats_at.is_some_and(|at| at.elapsed() < NAP))
+        {
+            return;
+        }
+        let Some(db) = &self.db else { return };
+        let drives: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|root| Self::mount_connected(root))
+            .filter_map(|root| root.drive_id.as_deref())
+            .collect();
+        let now = db::now_ms();
+        if let (Ok(counts), Ok(next_due_at)) = (
+            db.hash_queue_counts(&drives, now),
+            db.next_hash_due_at(&drives, now),
+        ) {
+            let (active, boosted, _) = self.control.boost_status();
+            self.hash_stats_at = Some(Instant::now());
+            report(&self.progress, |p| {
+                p.hash_queue = Some(lisa_core::remote::HashQueueState {
+                    ready: counts.total - counts.waiting,
+                    waiting: counts.waiting,
+                    next_due_at,
+                    active,
+                    boosted,
+                });
+            });
+            self.wake();
+        }
+    }
+
+    /// 表示中の仕事を先に済ませ、残りは裏の分のペースで処理する。
+    fn hash_all(&mut self, background: &Background) -> bool {
+        loop {
+            if !self.service_requests() || !self.hash_visible() {
+                return false;
+            }
+            match self.hash_ready(HASH_SCHEDULED) {
+                Ok(false) => return true,
+                Ok(true) => {}
+                Err(error) => {
+                    warn!("ハッシュキューを読めませんでした: {error}");
+                    self.hash_retry_needed = true;
+                    return true;
+                }
+            }
+            if !self.wait_turn(background) {
+                return false;
+            }
+            let interrupted = AtomicBool::new(false);
+            let step = |bytes| {
+                let go = background.step(bytes, || interrupted.load(Ordering::Relaxed));
+                if !go {
+                    interrupted.store(true, Ordering::Relaxed);
+                }
+                go
+            };
+            let priority = || background.control.apply_priority();
+            let pace = Pace {
+                background: true,
+                priority: Some(&priority),
+                step: &step,
+            };
+            match self.hash_batch(HASH_SCHEDULED, &pace) {
+                Some(batch) if batch.picked > 0 => {
+                    if !self.publish_hash_batch(batch) {
+                        return false;
+                    }
+                }
+                _ => return true,
+            }
+        }
     }
 
     /// 親が確定したフォルダを、同じドライブから少しだけ先読みする。
@@ -844,14 +992,8 @@ impl Worker {
     /// 裏の分を進めてよくなるまで、頼みを済ませながら待つ。UI が閉じたら false。
     fn wait_turn(&mut self, background: &Background) -> bool {
         loop {
-            if !self.run_manual_queue() {
+            if !self.service_requests() {
                 return false;
-            }
-            // 待っている頼みを先に済ませる。
-            while let Ok(request) = self.requests.try_recv() {
-                if !self.handle(request) {
-                    return false;
-                }
             }
             self.control.apply_priority();
             if background.rest() == Rest::No {
@@ -875,6 +1017,24 @@ impl Worker {
                 Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
+    }
+
+    fn service_requests(&mut self) -> bool {
+        if !self.run_manual_queue() {
+            return false;
+        }
+        while let Ok(request) = self.requests.try_recv() {
+            if !self.handle(request) {
+                return false;
+            }
+        }
+        if self.pending_visible.is_some() {
+            self.retry_visible();
+            if self.pending_visible.is_none() {
+                return self.hash_visible();
+            }
+        }
+        true
     }
 
     /// 頼みを済ませる（決まりにかからず、すぐ）。UI が閉じたら false。
@@ -903,24 +1063,79 @@ impl Worker {
         }
     }
 
-    /// 見ているフォルダ `path` を 1 段読み直し（下は、裏の深さ優先がたどる）、ハッシュの無いものを
-    /// ハッシュする。変わっていたら、裏で祖先のハッシュも作り直す。
+    /// 見ているフォルダを一段読み直して、直下の仕事を優先する。
     fn visible(&mut self, path: &Path) -> bool {
         if !self.reread(path, false) {
             return false;
         }
-        let Some(index) = self.root_of(path) else {
-            return true;
+        self.promote_visible(path);
+        self.hash_visible()
+    }
+
+    fn promote_visible(&mut self, path: &Path) {
+        self.pending_visible = Some(path.to_path_buf());
+        self.retry_visible();
+    }
+
+    fn retry_visible(&mut self) {
+        let Some(path) = self.pending_visible.take() else {
+            return;
         };
+        let Some(index) = self.root_of(&path).filter(|_| !self.is_skipped(&path)) else {
+            return;
+        };
+        let root = &self.roots[index];
+        let (Some(db), Some(drive_id)) = (&mut self.db, &root.drive_id) else {
+            return;
+        };
+        let result = db
+            .find_folder(drive_id, &root.mount, &path)
+            .and_then(|folder| {
+                if let Some(folder) = folder {
+                    db.promote_hash_queue(folder)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            warn!("表示中のハッシュを優先できませんでした: {error}");
+            if matches!(
+                error.sqlite_error_code(),
+                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            ) {
+                self.pending_visible = Some(path);
+            }
+        } else {
+            self.dirty = true;
+        }
+    }
+
+    fn hash_visible(&mut self) -> bool {
         let control = self.control.clone();
-        let step = |_| !control.manual_pending.load(Ordering::Relaxed);
+        let step = |_| {
+            !control.manual_pending.load(Ordering::Relaxed)
+                && !control.closed.load(Ordering::Relaxed)
+        };
         let pace = Pace {
             step: &step,
             ..Pace::FREE
         };
-        let alive = self.hash(index, Some(path), &pace);
-        self.dirty |= control.manual_pending.load(Ordering::Relaxed);
-        alive
+        while step(0) {
+            let Some(batch) = self.hash_batch(HASH_VISIBLE, &pace) else {
+                break;
+            };
+            if batch.picked == 0 {
+                break;
+            }
+            let interrupted = batch.interrupted;
+            if !self.publish_hash_batch(batch) {
+                return false;
+            }
+            if interrupted {
+                self.dirty = true;
+                break;
+            }
+        }
+        !control.closed.load(Ordering::Relaxed)
     }
 
     /// フォルダ `path` を 1 段読み直す（`background` なら I/O を後回しに）。変わっていたら、新しく
@@ -938,7 +1153,11 @@ impl Worker {
         let Some(index) = self.root_of(path) else {
             return true;
         };
-        if self.roots[index].drive_id.is_none() || self.db.is_none() || !path.is_dir() {
+        if self.roots[index].drive_id.is_none()
+            || self.db.is_none()
+            || !Self::mount_connected(&self.roots[index])
+            || !path.is_dir()
+        {
             return true;
         }
         let StoreOutcome::Published {
@@ -952,12 +1171,14 @@ impl Worker {
         if !alive {
             return false;
         }
-        self.dirty |= changed;
-        // 子の保存が Busy で延期された場合、ヒントからの初回保存でも新しい配下をたどる。
-        if (changed || first) && !self.fill_unlisted(index, path, background) {
-            return false;
+        self.dirty |= changed || first;
+        if !background {
+            if changed || first {
+                self.hints.insert(path.to_path_buf());
+            }
+            return true;
         }
-        true
+        self.fill_unlisted(index, path, background)
     }
 
     /// 検証用: `reread` と同じ経路で読み直し、`changed = true` として `Changed -> Listed -> Committed` を流す。
@@ -1033,58 +1254,58 @@ impl Worker {
         true
     }
 
-    /// ドライブ `index` の、`folder`（無ければ全体）のハッシュの無いものをハッシュする。UI が閉じたら false。
-    fn hash(&mut self, index: usize, folder: Option<&Path>, pace: &Pace) -> bool {
-        let Some(drive_id) = self.roots[index].drive_id.clone() else {
-            return true;
-        };
-        let mount = self.roots[index].mount.clone();
-        let Some(db) = self.db.as_mut() else {
-            return true;
-        };
-        let closed = &self.control.closed;
-        let (sender, proxy, progress) = (&self.sender, &self.proxy, &self.progress);
-        let mut on = |event: hash::Event| {
-            let message = match event {
-                hash::Event::Folder(path) => {
-                    report(progress, |p| p.hash.folder = Some(path.to_path_buf()));
-                    return;
-                }
-                hash::Event::File { bytes } => {
-                    report(progress, |p| {
-                        p.hash.files += 1;
-                        p.hash.bytes += bytes;
-                    });
-                    return;
-                }
-                hash::Event::FolderDone(path) => Message::Hashed {
-                    path: path.to_path_buf(),
-                },
-                hash::Event::Committed => Message::Committed,
-            };
-            if sender.send(message).is_err() {
-                closed.store(true, Ordering::Relaxed);
+    fn hash_batch(&mut self, max_priority: i64, pace: &Pace) -> Option<hash::HashBatch> {
+        let db = self.db.as_mut()?;
+        let mounts: Vec<_> = self
+            .roots
+            .iter()
+            .filter(|root| Self::mount_connected(root))
+            .filter_map(|root| Some((root.drive_id.as_deref()?, root.mount.as_path())))
+            .collect();
+        match hash::hash_queue_batch_checked(db, &mounts, max_priority, pace, |drive, mount| {
+            self.roots.iter().any(|root| {
+                root.drive_id.as_deref() == Some(drive)
+                    && root.mount == mount
+                    && Self::mount_connected(root)
+            })
+        }) {
+            Ok(batch) => Some(batch),
+            Err(error) => {
+                warn!("ハッシュを DB に書けませんでした: {error}");
+                self.hash_retry_needed = true;
+                None
             }
-            if let Some(proxy) = proxy {
-                let _ = proxy.send_event(WinitUserEvent::WakeUp);
-            }
-        };
-        let step = |bytes| !closed.load(Ordering::Relaxed) && (pace.step)(bytes);
-        let pace = Pace {
-            background: pace.background,
-            priority: pace.priority,
-            step: &step,
-        };
-        let result = match folder {
-            Some(path) => {
-                hash::hash_folder(db, &drive_id, &mount, path, HASH_THREADS, &mut on, &pace)
-            }
-            None => hash::hash_drive(db, &drive_id, &mount, HASH_THREADS, &mut on, &pace),
-        };
-        if let Err(error) = result {
-            warn!("ハッシュを DB に書けませんでした: {error}");
         }
-        !closed.load(Ordering::Relaxed)
+    }
+
+    fn publish_hash_batch(&mut self, batch: hash::HashBatch) -> bool {
+        report(&self.progress, |p| {
+            if let Some((path, _)) = batch.files.last() {
+                p.hash.folder = path.parent().map(Path::to_path_buf);
+            }
+            p.hash.files += batch.files.len() as u64;
+            p.hash.bytes += batch.files.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        });
+        for hint in batch.hints {
+            if let Some(root) = self.root_of(&hint).map(|index| &self.roots[index])
+                && Self::mount_connected(root)
+                && let Some(parent) = hint
+                    .ancestors()
+                    .take_while(|path| path.starts_with(&root.mount))
+                    .find(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
+            {
+                self.hints.insert(parent.to_path_buf());
+            }
+        }
+        self.update_hash_queue_status(false);
+        for path in batch.folders {
+            if !self.send(Message::Hashed { path }) {
+                return false;
+            }
+        }
+        let alive = self.send(Message::Committed);
+        self.wake();
+        alive
     }
 
     fn store_reread(&mut self, index: usize, path: &Path, force_changed: bool) -> StoreOutcome {

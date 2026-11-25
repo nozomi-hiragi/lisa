@@ -207,7 +207,7 @@ pub fn mtime_ms(meta: &Metadata) -> Option<i64> {
 }
 
 #[cfg(unix)]
-fn file_id(meta: &Metadata) -> Option<u64> {
+pub(crate) fn file_id(meta: &Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     Some(meta.ino())
 }
@@ -227,7 +227,7 @@ fn other_volume(dir: &Metadata, child: &Metadata) -> bool {
 // TODO: Windows のファイル ID とハードリンクの数は、std ではまだ取れない（unstable）。
 // `windows` crate の GetFileInformationByHandle で取る（docs/scan.md）。
 #[cfg(not(unix))]
-fn file_id(_meta: &Metadata) -> Option<u64> {
+pub(crate) fn file_id(_meta: &Metadata) -> Option<u64> {
     None
 }
 

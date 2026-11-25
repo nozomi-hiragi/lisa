@@ -49,21 +49,6 @@ fn fingerprint(meta: &Metadata) -> (u64, Option<SystemTime>, Option<(u64, u64, i
     (meta.len(), meta.modified().ok(), identity)
 }
 
-pub(in crate::scan) fn directory_identity(meta: &Metadata) -> Option<(u64, u64)> {
-    if !meta.is_dir() {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some((meta.dev(), meta.ino()))
-    }
-    #[cfg(not(unix))]
-    {
-        Some((0, 0))
-    }
-}
-
 impl Worker {
     pub(super) fn run_manual_queue(&mut self) -> bool {
         loop {
@@ -143,13 +128,7 @@ impl Worker {
             return Some("ローカルドライブの更新対象を確認できませんでした".into());
         }
         let mount = root.mount.clone();
-        if root.mount_identity.is_none()
-            || fs::symlink_metadata(&mount)
-                .ok()
-                .as_ref()
-                .and_then(directory_identity)
-                != root.mount_identity
-        {
+        if !Self::mount_connected(root) {
             return Some("ドライブの接続を確認できませんでした".into());
         }
         #[cfg(all(windows, not(test)))]
@@ -179,7 +158,7 @@ impl Worker {
         &mut self,
         request: &RefreshRequest,
         mount: &Path,
-        mount_identity: Option<(u64, u64)>,
+        mount_identity: Option<lisa_core::volumes::MountIdentity>,
     ) -> Option<String> {
         let target = &request.target;
         let first = if target.subtree {
@@ -209,12 +188,7 @@ impl Worker {
             if request.created.is_none() && !self.service_created() {
                 break;
             }
-            if fs::symlink_metadata(mount)
-                .ok()
-                .as_ref()
-                .and_then(directory_identity)
-                != mount_identity
-            {
+            if !lisa_core::volumes::mount_matches(mount, mount_identity) {
                 return Some("手動更新中にドライブの接続が変わりました".into());
             }
             self.control.apply_priority();
@@ -243,6 +217,7 @@ impl Worker {
                             && !self.is_skipped(&path)
                         {
                             self.store_reread(index, &path, false);
+                            self.promote_visible(&path);
                             self.hints.insert(path);
                             self.dirty = true;
                         }
@@ -283,6 +258,11 @@ impl Worker {
             }
             parent = path.parent();
         }
+        let mount_identity = self
+            .roots
+            .iter()
+            .find(|root| root.mount == mount)
+            .and_then(|root| root.mount_identity);
         let db = self.db.as_mut().expect("手動更新の DB");
         let superseded = |queue: &super::ManualQueue, path: &Path| {
             request.created.is_none()
@@ -422,8 +402,6 @@ impl Worker {
                 {
                     return Ok(());
                 }
-                let meta =
-                    |error: io::Error| Failure::Permanent(format!("{}: {error}", path.display()));
                 let before = fs::symlink_metadata(path);
                 let changed = match &before {
                     Ok(before) => {
@@ -436,6 +414,11 @@ impl Worker {
                 };
                 if changed {
                     let result = Self::read_dir_filtered(&self.skip_dirs, parent);
+                    if !lisa_core::volumes::mount_matches(mount, mount_identity) {
+                        return Err(Failure::Permanent(
+                            "手動更新中にドライブの接続が変わりました".into(),
+                        ));
+                    }
                     reserve(path, true)?;
                     let saved = db.save_listing_at(drive, mount, parent, &result, Some(version))?;
                     if matches!(saved, ListingSave::Changed) {
@@ -455,51 +438,75 @@ impl Worker {
                         path.display()
                     )));
                 }
-                let before_fingerprint = fingerprint(&before.map_err(meta)?);
-                let hash = hash::hash_regular_file_paced(
-                    path,
-                    |meta| fingerprint(meta) == before_fingerprint && !listing::cloud_only(meta),
-                    &|_| {
-                        !self.control.closed.load(Ordering::Relaxed)
-                            && self.control.urgent.load(Ordering::Relaxed) == 0
-                            && !self.control.created_pending.load(Ordering::Relaxed)
-                            && !newer(path)
-                    },
-                );
-                let after = fs::symlink_metadata(path)
-                    .map_err(|error| Failure::Retry(format!("{}: {error}", path.display())))?;
-                if hash
-                    .as_ref()
-                    .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
-                    || before_fingerprint != fingerprint(&after)
-                    || !after.is_file()
-                    || listing::cloud_only(&after)
-                {
-                    return Err(Failure::Retry(format!(
-                        "読込中にファイルが変わりました: {}",
-                        path.display()
-                    )));
-                }
+                let result = before.and_then(|before| {
+                    let before_fingerprint = fingerprint(&before);
+                    let hash = hash::hash_regular_file_paced(
+                        path,
+                        |meta| {
+                            fingerprint(meta) == before_fingerprint && !listing::cloud_only(meta)
+                        },
+                        &|_| {
+                            !self.control.closed.load(Ordering::Relaxed)
+                                && self.control.urgent.load(Ordering::Relaxed) == 0
+                                && !self.control.created_pending.load(Ordering::Relaxed)
+                                && !newer(path)
+                        },
+                    )?;
+                    let after = fs::symlink_metadata(path)?;
+                    if !after.is_file() || listing::cloud_only(&after) {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    if before_fingerprint != fingerprint(&after) {
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
+                    Ok(hash)
+                });
                 if newer(path) || self.control.closed.load(Ordering::Relaxed) {
                     return Err(Failure::Superseded);
                 }
-                if hash
-                    .as_ref()
-                    .is_err_and(|error| error.kind() == io::ErrorKind::Interrupted)
-                {
+                let classified = result.as_ref().err().map(hash::HashFailure::of);
+                if classified == Some(hash::HashFailure::Interrupted) {
                     return Err(Failure::Yield);
                 }
                 reserve(path, true)?;
-                let hash = hash.map_err(|error| format!("{}: {error}", path.display()));
-                let result = hash.as_ref().map_err(String::as_str);
-                if !db.save_refreshed_hash(&entry, version, result)? {
+                let saved = match &classified {
+                    None => db.save_refreshed_hash(
+                        &entry,
+                        version,
+                        result.as_ref().map_err(|_| unreachable!()),
+                    )?,
+                    Some(hash::HashFailure::Temporary(reason)) => {
+                        db.defer_refreshed_hash(entry.id, version, reason, lisa_core::db::now_ms())?
+                    }
+                    Some(hash::HashFailure::Permanent(reason)) => {
+                        db.save_refreshed_hash(&entry, version, Err(reason))?
+                    }
+                    Some(hash::HashFailure::Missing) => {
+                        if !lisa_core::volumes::mount_matches(mount, mount_identity) {
+                            return Err(Failure::Permanent(
+                                "手動更新中にドライブの接続が変わりました".into(),
+                            ));
+                        }
+                        self.hints.insert(parent.to_path_buf());
+                        db.defer_refreshed_hash(
+                            entry.id,
+                            version,
+                            "NotFound",
+                            lisa_core::db::now_ms(),
+                        )?
+                    }
+                    Some(
+                        hash::HashFailure::Interrupted | hash::HashFailure::FingerprintChanged,
+                    ) => unreachable!(),
+                };
+                if !saved {
                     return Err(Failure::Retry(format!(
                         "ハッシュの保存前に一覧が変わりました: {}",
                         path.display()
                     )));
                 }
-                if let Err(error) = hash {
-                    return Err(Failure::Permanent(error));
+                if let Err(error) = result {
+                    return Err(Failure::Permanent(format!("{}: {error}", path.display())));
                 }
             }
             Job::Aggregate(path) => {
@@ -583,6 +590,111 @@ mod tests {
     }
 
     #[test]
+    fn 表示優先の失敗後は最後のフォルダを再試行する() {
+        use lisa_core::db::HASH_SCHEDULED;
+
+        let fixture = Fixture(
+            std::env::temp_dir().join(format!("lisa-visible-retry-{}", std::process::id())),
+        );
+        let mount = fixture.0.join("volume");
+        let first = mount.join("first");
+        let latest = mount.join("latest");
+        for folder in [&first, &latest] {
+            fs::create_dir_all(folder).unwrap();
+            fs::write(folder.join("file"), b"content").unwrap();
+        }
+        let db_path = fixture.0.join("test.db");
+        let drive = "test:visible";
+        let mut db = Db::open(&db_path).unwrap();
+        let device = db.this_device("test", "test", "test").unwrap();
+        db.upsert_drive(
+            &device,
+            &lisa_core::volumes::Volume {
+                id: Some(drive.into()),
+                mount_path: mount.clone(),
+                ..crate::scan::root_volume()
+            },
+        )
+        .unwrap();
+        for folder in [&mount, &first, &latest] {
+            db.save_listing(
+                drive,
+                &mount,
+                folder,
+                &Ok(listing::read_dir(folder).unwrap()),
+            )
+            .unwrap();
+        }
+        let queued_file = |db: &Db, folder: &Path| {
+            let id = db.find_folder_ref(drive, &mount, folder).unwrap().unwrap();
+            db.children(id).unwrap()[0].id
+        };
+        let first_id = queued_file(&db, &first);
+        let latest_id = queued_file(&db, &latest);
+        db.set_busy_timeout(Duration::ZERO).unwrap();
+        let mut blocker = Db::open(&db_path).unwrap();
+        blocker.begin().unwrap();
+        blocker.set_meta("fixture-lock", "held").unwrap();
+        let (_normal, requests) = channel();
+        let (sender, _messages) = channel();
+        let mut worker = Worker {
+            db: Some(db),
+            roots: vec![Root {
+                drive_id: Some(drive.into()),
+                mount: mount.clone(),
+                mount_identity: lisa_core::volumes::mount_identity(&mount),
+                node: 0,
+                listed: true,
+            }],
+            sender,
+            requests,
+            proxy: None,
+            progress: Arc::new(Mutex::default()),
+            control: Arc::new(Default::default()),
+            dirty: false,
+            hash_retry_needed: false,
+            hash_stats_at: None,
+            pending_visible: None,
+            hints: Default::default(),
+            skip_dirs: vec![],
+        };
+        worker.promote_visible(&first);
+        assert_eq!(worker.pending_visible.as_ref(), Some(&first));
+        worker.promote_visible(&latest);
+        assert_eq!(worker.pending_visible.as_ref(), Some(&latest));
+        blocker.commit().unwrap();
+        worker.control.paused.store(true, Ordering::Relaxed);
+        assert!(worker.service_requests());
+        assert!(worker.pending_visible.is_none());
+        let items = worker
+            .db
+            .as_ref()
+            .unwrap()
+            .pick_hash_queue(&[drive], i64::MAX, 32, HASH_SCHEDULED)
+            .unwrap();
+        assert!(!items.iter().any(|item| item.entry_id == latest_id));
+        assert!(
+            worker
+                .db
+                .as_ref()
+                .unwrap()
+                .entry(latest_id)
+                .unwrap()
+                .unwrap()
+                .hash
+                .is_some()
+        );
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.entry_id == first_id)
+                .unwrap()
+                .priority,
+            HASH_SCHEDULED
+        );
+    }
+
+    #[test]
     fn 更新は同サイズ同時刻の単体と既読階層を再計算する() {
         let fixture =
             Fixture(std::env::temp_dir().join(format!("lisa-manual-{}", std::process::id())));
@@ -641,7 +753,7 @@ mod tests {
             roots: vec![Root {
                 drive_id: Some(drive.into()),
                 mount: mount.clone(),
-                mount_identity: directory_identity(&fs::symlink_metadata(mount).unwrap()),
+                mount_identity: lisa_core::volumes::mount_identity(mount),
                 node: 0,
                 listed: true,
             }],
@@ -651,6 +763,9 @@ mod tests {
             progress: Arc::new(Mutex::default()),
             control: Arc::new(Default::default()),
             dirty: false,
+            hash_retry_needed: false,
+            hash_stats_at: None,
+            pending_visible: None,
             hints: Default::default(),
             skip_dirs: vec![],
         };
@@ -703,14 +818,17 @@ mod tests {
             }
             background.step(bytes, || false)
         };
-        assert!(worker.hash(
-            0,
-            Some(&normal_dir),
-            &Pace {
-                step: &step,
-                ..Pace::FREE
-            }
-        ));
+        let batch = worker
+            .hash_batch(
+                lisa_core::db::HASH_SCHEDULED,
+                &Pace {
+                    step: &step,
+                    ..Pace::FREE
+                },
+            )
+            .unwrap();
+        assert!(batch.interrupted);
+        assert!(worker.publish_hash_batch(batch));
         let generation = generation.load(Ordering::Relaxed);
         assert_ne!(generation, 0);
         let normal_hash = |worker: &Worker| {
@@ -750,6 +868,12 @@ mod tests {
             })
         );
 
+        // 見ているルートは直下だけを優先し、孫のファイルは裏のキューから再開する。
+        assert_eq!(normal_hash(&worker), None);
+        let batch = worker
+            .hash_batch(lisa_core::db::HASH_SCHEDULED, &Pace::FREE)
+            .unwrap();
+        assert!(worker.publish_hash_batch(batch));
         assert_eq!(
             normal_hash(&worker),
             Some(hash::hash_file(&normal_file).unwrap())
