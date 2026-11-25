@@ -323,6 +323,7 @@ enum Event {
     Moved {
         from: PathBuf,
         to: PathBuf,
+        is_dir: bool,
     },
     Touched(Vec<PathBuf>),
     Notice(String),
@@ -394,9 +395,9 @@ pub(crate) fn receive_events(
                     state.selected_details = Some(details);
                 }
             }
-            Event::Moved { from, to } => {
+            Event::Moved { from, to, is_dir } => {
                 if let Some(previews) = previews.as_deref_mut() {
-                    previews.images.moved(&from, &to);
+                    previews.moved(&from, &to, is_dir);
                 }
             }
             Event::Renamed { from, to } => {
@@ -894,8 +895,18 @@ fn notify_plan_moves(db: &Db, id: i64, state: OpState, send: &impl Fn(Event) -> 
         } else {
             (op.src, dst)
         };
+        let is_dir_fs = to.symlink_metadata().is_ok_and(|meta| meta.is_dir());
+        let is_dir = is_dir_fs
+            || [from.as_path(), to.as_path()].iter().any(|path| {
+                lisa_core::query::locate(db, path)
+                    .ok()
+                    .flatten()
+                    .and_then(|found| found.chain.last().copied())
+                    .and_then(|id| lisa_core::query::item(db, id).ok().flatten())
+                    .is_some_and(|item| item.kind == "dir")
+            });
         // ファイルシステムが名前を正規化した場合は、実際に保存された綴りを使う。
-        let to = if to.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        let to = if is_dir_fs {
             to.canonicalize()
                 .ok()
                 .and_then(|path| path.file_name().map(|name| to.with_file_name(name)))
@@ -906,6 +917,7 @@ fn notify_plan_moves(db: &Db, id: i64, state: OpState, send: &impl Fn(Event) -> 
         send(Event::Moved {
             from: from.clone(),
             to: to.clone(),
+            is_dir,
         });
         if renamed {
             send(Event::Renamed { from, to });

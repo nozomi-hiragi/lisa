@@ -370,6 +370,15 @@ impl Worker {
                     result,
                     stored: true,
                 });
+                let target = &request.target;
+                let first = if target.subtree {
+                    Some(target.path.as_path())
+                } else {
+                    target.path.parent()
+                };
+                if request.created.is_none() && first == Some(path.as_path()) {
+                    self.send(Message::RefreshListed(request.clone()));
+                }
                 self.send(Message::Committed);
                 self.wake();
                 if let Some(reason) = failure {

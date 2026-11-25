@@ -308,7 +308,7 @@ pub(crate) fn scan_volumes() -> Vec<lisa_core::volumes::Volume> {
 }
 
 /// ドライブの一覧が取れない OS（開発用の Linux など）では、「/」だけを出す。
-fn root_volume() -> lisa_core::volumes::Volume {
+pub(crate) fn root_volume() -> lisa_core::volumes::Volume {
     lisa_core::volumes::Volume {
         id: None,
         label: "/".into(),
@@ -606,6 +606,47 @@ fn quarantine_skip_dirs() -> Vec<PathBuf> {
 #[derive(Resource, Default)]
 pub(crate) struct RefreshStatus {
     pub last: Option<RefreshCompletion>,
+    disk: HashMap<u64, Mutex<Receiver<bool>>>,
+    awaiting_disk: Vec<(RefreshCompletion, Mutex<Receiver<bool>>)>,
+}
+
+impl RefreshStatus {
+    fn publish(&mut self, completion: RefreshCompletion) {
+        if let Some(error) = &completion.error {
+            warn!(
+                "手動更新が未完了（{}、世代 {}）: {error}",
+                completion.target.path.display(),
+                completion.generation
+            );
+        }
+        if self
+            .last
+            .as_ref()
+            .is_none_or(|last| last.generation < completion.generation)
+        {
+            self.last = Some(completion);
+        }
+    }
+
+    fn receive_disk(&mut self) {
+        let mut pending = Vec::new();
+        for (mut completion, mut result) in std::mem::take(&mut self.awaiting_disk) {
+            match result.get_mut().expect("ファイル画像の更新結果").try_recv() {
+                Ok(true) => self.publish(completion),
+                Err(std::sync::mpsc::TryRecvError::Empty) => pending.push((completion, result)),
+                _ => {
+                    let disk_error =
+                        "ファイル画像のディスク更新が未完了です。更新を再実行できます。";
+                    completion.error = Some(match completion.error {
+                        Some(error) => format!("{error}\n{disk_error}"),
+                        None => disk_error.into(),
+                    });
+                    self.publish(completion);
+                }
+            }
+        }
+        self.awaiting_disk = pending;
+    }
 }
 
 pub(crate) struct RefreshCompletion {
@@ -655,6 +696,7 @@ enum Message {
         path: PathBuf,
     },
     RefreshStarted(RefreshRequest),
+    RefreshListed(RefreshRequest),
     RefreshFolder(PathBuf),
     RefreshFinished {
         request: RefreshRequest,
@@ -799,10 +841,11 @@ fn receive(
     mut tree: ResMut<FileTree>,
     mut changed: ResMut<TreeChanged>,
     nav: Res<crate::view::Nav>,
-    (location, store, cache): (
+    (location, store, cache, occluded): (
         Res<crate::view::Location>,
         Res<Store>,
         Res<crate::render::cache::ImageCache>,
+        Option<Res<crate::view::WindowOccludedState>>,
     ),
     layouts: Res<Layouts>,
     (mut sync, mut dups, mut previews, mut images, mut capture, mut refresh_status): (
@@ -813,6 +856,7 @@ fn receive(
         ResMut<crate::render::cache::ThumbnailCapture>,
         ResMut<RefreshStatus>,
     ),
+    mut redraw: MessageWriter<bevy::window::RequestRedraw>,
     animating: Option<Res<crate::view::Animating>>,
     fades: Query<(), With<crate::view::Fade>>,
     gesture: Res<crate::input::gesture::Gesture>,
@@ -824,6 +868,7 @@ fn receive(
         return;
     }
     let scanner = &mut *scanner;
+    refresh_status.receive_disk();
     let messages: Vec<Message> = scanner
         .results
         .get_mut()
@@ -834,33 +879,68 @@ fn receive(
     let mut any = false;
     let mut structure_reset = false;
     let mut invalidated = HashSet::new();
+    let collect_refresh_invalidations =
+        |target: &RefreshTarget,
+         folders: &HashMap<PathBuf, NodeId>,
+         include_children: bool,
+         invalidated: &mut HashSet<PathBuf>| {
+            if let Some(mount) = store
+                .roots
+                .values()
+                .find_map(|(id, mount)| (id.as_ref() == Some(&target.drive_id)).then_some(mount))
+            {
+                let first = if target.subtree {
+                    Some(target.path.as_path())
+                } else {
+                    target.path.parent()
+                };
+                if let Some(first) = first {
+                    invalidated.extend(preview_ancestors(first, mount).map(Path::to_path_buf));
+                }
+                if include_children && target.subtree {
+                    invalidated.extend(
+                        folders
+                            .keys()
+                            .filter(|path| path.parent() == Some(target.path.as_path()))
+                            .cloned(),
+                    );
+                }
+            }
+        };
     for message in messages {
         match message {
             Message::RefreshStarted(request) => {
-                let target = request.target;
                 if let Some((created, _)) = &request.created {
                     invalidated.insert(created.clone());
-                } else {
-                    previews.images.invalidate(&target);
-                }
-                if let Some(mount) = store.roots.values().find_map(|(id, mount)| {
-                    (id.as_ref() == Some(&target.drive_id)).then_some(mount)
-                }) {
-                    let first = if target.subtree {
-                        Some(target.path.as_path())
-                    } else {
-                        target.path.parent()
-                    };
-                    if let Some(first) = first {
-                        invalidated.extend(preview_ancestors(first, mount).map(Path::to_path_buf));
-                    }
-                    invalidated.extend(
-                        scanner
-                            .folders
-                            .keys()
-                            .filter(|path| request.created.is_none() && target.contains(path))
-                            .cloned(),
+                    collect_refresh_invalidations(
+                        &request.target,
+                        &scanner.folders,
+                        false,
+                        &mut invalidated,
                     );
+                }
+                sync.request_redraw();
+            }
+            Message::RefreshListed(request) => {
+                if let Some(result) = previews.images.invalidate(&request.target) {
+                    refresh_status
+                        .disk
+                        .insert(request.generation, Mutex::new(result));
+                }
+                collect_refresh_invalidations(
+                    &request.target,
+                    &scanner.folders,
+                    true,
+                    &mut invalidated,
+                );
+                let folder = crate::view::scene_path(&nav, &tree)
+                    .last()
+                    .map(|l| l.node)
+                    .unwrap_or(FileTree::ROOT);
+                if request.target.subtree
+                    && request.target.path.parent() == tree.nodes[folder].path.as_deref()
+                {
+                    capture.refresh_visible_child(request.target.path);
                 }
                 sync.request_redraw();
             }
@@ -868,19 +948,17 @@ fn receive(
                 invalidated.insert(path);
             }
             Message::RefreshFinished { request, error } => {
-                if let Some(error) = &error {
-                    warn!(
-                        "手動更新が未完了（{}、世代 {}）: {error}",
-                        request.target.path.display(),
-                        request.generation
-                    );
-                }
                 if request.created.is_none() {
-                    refresh_status.last = Some(RefreshCompletion {
+                    let completion = RefreshCompletion {
                         generation: request.generation,
                         target: request.target,
                         error,
-                    });
+                    };
+                    if let Some(result) = refresh_status.disk.remove(&completion.generation) {
+                        refresh_status.awaiting_disk.push((completion, result));
+                    } else {
+                        refresh_status.publish(completion);
+                    }
                 }
                 if dups.scope == crate::dups::remote::Scope::default() {
                     dups.invalidate();
@@ -977,6 +1055,10 @@ fn receive(
                 tree.preview_generations.insert(path, generation);
             }
         }
+    }
+    refresh_status.receive_disk();
+    if !refresh_status.awaiting_disk.is_empty() && !occluded.is_some_and(|o| o.0) {
+        redraw.write(bevy::window::RequestRedraw);
     }
     if structure_reset {
         sync.request_reset();
@@ -1265,6 +1347,315 @@ pub(crate) fn stored_item(store: &Store, path: &Path) -> Option<lisa_core::query
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 全走査で閉じたフォルダの画像を要求しない() {
+        let temp = crate::preview::TestTemp::new();
+        let mount = temp.0.join("volume");
+        let folder = mount.join("closed");
+        std::fs::create_dir_all(&folder).unwrap();
+        image::RgbImage::new(16, 8)
+            .save(folder.join("sample.png"))
+            .unwrap();
+        let volume = lisa_core::volumes::Volume {
+            id: Some("test:full-scan".into()),
+            mount_path: mount.clone(),
+            ..root_volume()
+        };
+        let mut db = Db::open(&temp.0.join("test.db")).unwrap();
+        let device = db.this_device("test", "test", "test").unwrap();
+        db.upsert_drive(&device, &volume).unwrap();
+        let drive_id = volume.id.clone();
+        let tree = FileTree::this_device("test", &[volume]);
+        let drive = tree.nodes[FileTree::ROOT + 1].children[0];
+        let (requests, request_rx) = channel();
+        let (sender, results) = channel();
+        let control = Arc::new(worker::Control::default());
+        control
+            .rest_on_battery
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let worker = worker::Worker {
+            db: Some(db),
+            roots: vec![Root {
+                node: drive,
+                drive_id: drive_id.clone(),
+                mount: mount.clone(),
+                mount_identity: lisa_core::volumes::mount_identity(&mount),
+                listed: false,
+            }],
+            sender,
+            requests: request_rx,
+            proxy: None,
+            progress: progress.clone(),
+            control: control.clone(),
+            dirty: false,
+            hash_retry_needed: false,
+            hash_stats_at: None,
+            pending_visible: None,
+            hints: Default::default(),
+            skip_dirs: vec![],
+        };
+        let mut scanner = Scanner {
+            control,
+            results: Mutex::new(results),
+            pending: HashMap::new(),
+            recent: HashMap::new(),
+            folders: HashMap::new(),
+            hashed: HashSet::new(),
+            stale: HashSet::new(),
+        };
+        scanner.track(&tree, drive);
+        let mut world = World::new();
+        let mut previews = crate::preview::PreviewRegistry::default();
+        crate::preview::cartridges::register(&mut previews);
+        world.insert_resource(crate::layout::layout(
+            &tree,
+            FileTree::ROOT,
+            crate::layout::anchor_body(),
+            crate::layout::EarSpec::new(&crate::settings::Settings::default()),
+        ));
+        world.insert_resource(tree);
+        world.insert_resource(scanner);
+        world.insert_resource(previews);
+        world.insert_resource(crate::view::Nav {
+            stack: vec![crate::view::Level {
+                node: FileTree::ROOT,
+            }],
+        });
+        world.insert_resource(crate::view::Location::root());
+        world.insert_resource(Store {
+            reader: None,
+            roots: HashMap::from([(drive, (drive_id, mount))]),
+        });
+        world.insert_resource(crate::render::cache::ImageCache::with_dir(None));
+        world.init_resource::<TreeChanged>();
+        world.init_resource::<RefreshStatus>();
+        world.init_resource::<crate::view::SyncRequest>();
+        world.init_resource::<crate::dups::Dups>();
+        world.init_resource::<crate::render::cache::FolderImages>();
+        world.init_resource::<crate::render::cache::ThumbnailCapture>();
+        world.init_resource::<crate::input::gesture::Gesture>();
+        world.init_resource::<Assets<Image>>();
+        world.init_resource::<bevy::ecs::message::Messages<bevy::window::RequestRedraw>>();
+        let mut schedule = Schedule::default();
+        schedule.add_systems((receive, crate::preview::update_previews).chain());
+        schedule.run(&mut world);
+        drop(requests);
+        worker.run();
+        schedule.run(&mut world);
+        assert_eq!(progress.lock().unwrap().done, 2);
+        assert_eq!(progress.lock().unwrap().hash.files, 1);
+        assert!(progress.lock().unwrap().hash.finished.is_some());
+        assert_eq!(
+            world
+                .resource::<crate::preview::PreviewRegistry>()
+                .images
+                .requests_issued(),
+            0
+        );
+    }
+
+    #[test]
+    fn 手動更新は_refresh_listed_までフォルダ画像を失効させない() {
+        let temp = crate::preview::TestTemp::new();
+        let mount = temp.0.join("volume");
+        let folder_path = mount.join("sub");
+        std::fs::create_dir_all(&folder_path).unwrap();
+        let file_path = folder_path.join("a.png");
+        let volume = lisa_core::volumes::Volume {
+            id: Some("test:order".into()),
+            mount_path: mount.clone(),
+            ..root_volume()
+        };
+        let drive_id = volume.id.clone();
+        let mut tree = FileTree::this_device("test", &[volume]);
+        let drive = tree.nodes[FileTree::ROOT + 1].children[0];
+        tree.add_listing(
+            drive,
+            listing::read_dir(&mount).map_err(|error| error.to_string()),
+        );
+        let folder = tree.nodes[drive].children[0];
+        let (sender, results) = channel();
+        let mut scanner = Scanner {
+            control: Arc::new(worker::Control::default()),
+            results: Mutex::new(results),
+            pending: HashMap::new(),
+            recent: HashMap::new(),
+            folders: HashMap::new(),
+            hashed: HashSet::new(),
+            stale: HashSet::new(),
+        };
+        scanner.track(&tree, drive);
+        scanner.track(&tree, folder);
+
+        let mut world = World::new();
+        let mut previews = crate::preview::PreviewRegistry::default();
+        crate::preview::cartridges::register(&mut previews);
+        world.insert_resource(crate::layout::layout(
+            &tree,
+            FileTree::ROOT,
+            crate::layout::anchor_body(),
+            crate::layout::EarSpec::new(&crate::settings::Settings::default()),
+        ));
+        world.insert_resource(tree);
+        world.insert_resource(scanner);
+        world.insert_resource(previews);
+        world.insert_resource(crate::view::Nav {
+            stack: vec![
+                crate::view::Level {
+                    node: FileTree::ROOT,
+                },
+                crate::view::Level { node: folder },
+            ],
+        });
+        world.insert_resource(crate::view::Location::root());
+        world.insert_resource(Store {
+            reader: None,
+            roots: HashMap::from([(drive, (drive_id, mount.clone()))]),
+        });
+        world.insert_resource(crate::render::cache::ImageCache::with_dir(None));
+        world.init_resource::<TreeChanged>();
+        world.init_resource::<RefreshStatus>();
+        world.init_resource::<crate::view::SyncRequest>();
+        world.init_resource::<crate::dups::Dups>();
+        world.init_resource::<crate::render::cache::FolderImages>();
+        world.init_resource::<crate::render::cache::ThumbnailCapture>();
+        world.init_resource::<crate::input::gesture::Gesture>();
+        world.init_resource::<bevy::ecs::message::Messages<bevy::window::RequestRedraw>>();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(receive);
+
+        let request = RefreshRequest {
+            generation: 1,
+            target: RefreshTarget {
+                drive_id: "test:order".into(),
+                path: file_path,
+                subtree: false,
+            },
+            created: None,
+        };
+        sender
+            .send(Message::RefreshStarted(request.clone()))
+            .unwrap();
+        schedule.run(&mut world);
+        {
+            let tree = world.resource::<FileTree>();
+            assert_eq!(
+                tree.preview_revision, 0,
+                "RefreshStarted だけではフォルダ画像を失効させない"
+            );
+            assert!(!tree.preview_generations.contains_key(&folder_path));
+        }
+
+        sender.send(Message::RefreshListed(request)).unwrap();
+        schedule.run(&mut world);
+        {
+            let tree = world.resource::<FileTree>();
+            assert_eq!(tree.preview_revision, 1);
+            assert_eq!(tree.preview_generations.get(&folder_path), Some(&1));
+            assert_eq!(tree.preview_generations.get(&mount), Some(&1));
+        }
+    }
+
+    #[test]
+    fn ディスク失効待ちのあいだ再描画を要求し完了後に公開する() {
+        let mount = std::env::temp_dir().join(format!("lisa-await-disk-{}", std::process::id()));
+        let volume = lisa_core::volumes::Volume {
+            id: Some("test:await".into()),
+            mount_path: mount.clone(),
+            ..root_volume()
+        };
+        let drive_id = volume.id.clone();
+        let tree = FileTree::this_device("test", &[volume]);
+        let drive = tree.nodes[FileTree::ROOT + 1].children[0];
+        let (sender, results) = channel();
+        let scanner = Scanner {
+            control: Arc::new(worker::Control::default()),
+            results: Mutex::new(results),
+            pending: HashMap::new(),
+            recent: HashMap::new(),
+            folders: HashMap::new(),
+            hashed: HashSet::new(),
+            stale: HashSet::new(),
+        };
+        let mut world = World::new();
+        world.insert_resource(crate::layout::layout(
+            &tree,
+            FileTree::ROOT,
+            crate::layout::anchor_body(),
+            crate::layout::EarSpec::new(&crate::settings::Settings::default()),
+        ));
+        world.insert_resource(tree);
+        world.insert_resource(scanner);
+        world.init_resource::<crate::preview::PreviewRegistry>();
+        world.insert_resource(crate::view::Nav {
+            stack: vec![crate::view::Level {
+                node: FileTree::ROOT,
+            }],
+        });
+        world.insert_resource(crate::view::Location::root());
+        world.insert_resource(Store {
+            reader: None,
+            roots: HashMap::from([(drive, (drive_id, mount.clone()))]),
+        });
+        world.insert_resource(crate::render::cache::ImageCache::with_dir(None));
+        world.init_resource::<TreeChanged>();
+        let (disk_tx, disk_rx) = channel();
+        let mut status = RefreshStatus::default();
+        status.disk.insert(7, Mutex::new(disk_rx));
+        world.insert_resource(status);
+        world.init_resource::<crate::view::SyncRequest>();
+        world.init_resource::<crate::dups::Dups>();
+        world.init_resource::<crate::render::cache::FolderImages>();
+        world.init_resource::<crate::render::cache::ThumbnailCapture>();
+        world.init_resource::<crate::input::gesture::Gesture>();
+        world.init_resource::<crate::view::WindowOccludedState>();
+        world.init_resource::<bevy::ecs::message::Messages<bevy::window::RequestRedraw>>();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(receive);
+
+        let request = RefreshRequest {
+            generation: 7,
+            target: RefreshTarget {
+                drive_id: "test:await".into(),
+                path: mount.join("a.png"),
+                subtree: false,
+            },
+            created: None,
+        };
+        sender
+            .send(Message::RefreshFinished {
+                request,
+                error: None,
+            })
+            .unwrap();
+        schedule.run(&mut world);
+        assert!(world.resource::<RefreshStatus>().last.is_none());
+        assert!(!world.resource::<RefreshStatus>().awaiting_disk.is_empty());
+        assert!(
+            !world
+                .resource::<bevy::ecs::message::Messages<bevy::window::RequestRedraw>>()
+                .is_empty(),
+            "awaiting_disk が残っているあいだ再描画を要求する"
+        );
+
+        world
+            .resource_mut::<bevy::ecs::message::Messages<bevy::window::RequestRedraw>>()
+            .clear();
+        disk_tx.send(true).unwrap();
+        schedule.run(&mut world);
+        let status = world.resource::<RefreshStatus>();
+        assert!(status.awaiting_disk.is_empty());
+        let last = status.last.as_ref().expect("ディスク完了後に公開される");
+        assert_eq!(last.generation, 7);
+        assert!(last.error.is_none());
+        assert!(
+            world
+                .resource::<bevy::ecs::message::Messages<bevy::window::RequestRedraw>>()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn preview_invalidation_stops_at_each_drive_and_excludes_siblings() {

@@ -1038,7 +1038,11 @@ pub(crate) fn local_path(tree: &FileTree, id: NodeId) -> Option<PathBuf> {
         if node.depth <= 2 {
             return None;
         }
-        names.push(node.name.clone());
+        names.push(
+            node.local_name
+                .as_deref()
+                .unwrap_or_else(|| std::ffi::OsStr::new(&node.name)),
+        );
         cur = node.parent?;
     }
 }

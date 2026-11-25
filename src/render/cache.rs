@@ -214,8 +214,13 @@ fn loaded_image(rgba: Vec<u8>) -> Image {
 }
 
 enum DiskWrite {
-    Save(Key, Vec<u8>),
+    Save(Key, Vec<u8>, Option<Key>),
     Invalidate(Key, u64),
+    Validate(
+        Key,
+        crate::preview::FolderFingerprintInput,
+        Sender<(Key, bool)>,
+    ),
 }
 
 /// ディスクの画像の置き場と、書く係・読む係・読み戻し結果のやりとり。
@@ -235,7 +240,7 @@ impl ImageCache {
         Self::with_dir(crate::scan::cache_dir().map(|dir| dir.join("folder-images")))
     }
 
-    fn with_dir(dir: Option<PathBuf>) -> Self {
+    pub(crate) fn with_dir(dir: Option<PathBuf>) -> Self {
         if let Some(dir) = &dir {
             let _ = std::fs::create_dir_all(dir);
             // 使われなくなった画像を、裏で消す。
@@ -262,13 +267,22 @@ impl ImageCache {
                 for request in save_rx {
                     if let Some(dir) = &writer_dir {
                         match request {
-                            DiskWrite::Save(key, rgba) => write_webp(dir, &key, &rgba),
+                            DiskWrite::Save(key, rgba, stamp) => {
+                                write_folder_record(dir, &key, &rgba, stamp)
+                            }
                             DiskWrite::Invalidate(key, ticket) => {
-                                let _ = std::fs::remove_file(dir.join(file_name(&key)));
+                                let path = dir.join(file_name(&key));
+                                let _ = std::fs::remove_file(path.with_extension("stamp"));
+                                let _ = std::fs::remove_file(path);
                                 let mut pending = writer_invalidating.lock().expect("画像の無効化");
                                 if pending.1.get(&key) == Some(&ticket) {
                                     pending.1.remove(&key);
                                 }
+                            }
+                            DiskWrite::Validate(key, input, result) => {
+                                let stamp = input.compute();
+                                let valid = valid_folder_record(dir, &key, &stamp);
+                                let _ = result.send((stamp, valid));
                             }
                         }
                     }
@@ -332,6 +346,18 @@ impl ImageCache {
         }
         self.dir.as_ref().map(|dir| dir.join(file_name(key)))
     }
+
+    fn validate(
+        &self,
+        key: Key,
+        input: crate::preview::FolderFingerprintInput,
+    ) -> Receiver<(Key, bool)> {
+        let (tx, rx) = channel();
+        if let Ok(save) = self.save.lock() {
+            let _ = save.send(DiskWrite::Validate(key, input, tx));
+        }
+        rx
+    }
 }
 
 fn file_name(key: &Key) -> String {
@@ -363,7 +389,12 @@ fn straighten_alpha(rgba: &mut [u8]) {
     }
 }
 
-fn write_webp(dir: &std::path::Path, key: &Key, rgba: &[u8]) {
+#[cfg(test)]
+fn write_webp(dir: &Path, key: &Key, rgba: &[u8]) {
+    write_folder_record(dir, key, rgba, None);
+}
+
+fn write_folder_record(dir: &Path, key: &Key, rgba: &[u8], stamp: Option<Key>) {
     let expected = (IMAGE_WIDTH * image_height() * 4) as usize;
     if rgba.len() != expected {
         warn!(
@@ -375,9 +406,35 @@ fn write_webp(dir: &std::path::Path, key: &Key, rgba: &[u8]) {
     let encoded = webp::Encoder::from_rgba(rgba, IMAGE_WIDTH, image_height()).encode_lossless();
     let path = dir.join(file_name(key));
     let tmp = path.with_extension("webp.tmp");
-    if std::fs::write(&tmp, &*encoded).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+    if std::fs::write(&tmp, &*encoded).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        let record = path.with_extension("stamp");
+        if let Some(stamp) = stamp {
+            let stamp_tmp = path.with_extension("stamp.tmp");
+            let mut bytes = Vec::from(*b"LFS1");
+            bytes.extend_from_slice(&stamp);
+            bytes.extend_from_slice(blake3::hash(&encoded).as_bytes());
+            if std::fs::write(&stamp_tmp, bytes).is_err()
+                || std::fs::rename(&stamp_tmp, record).is_err()
+            {
+                let _ = std::fs::remove_file(&stamp_tmp);
+            }
+        } else {
+            let _ = std::fs::remove_file(record);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
     }
+}
+
+fn valid_folder_record(dir: &Path, key: &Key, stamp: &Key) -> bool {
+    let path = dir.join(file_name(key));
+    let Ok(record) = std::fs::read(path.with_extension("stamp")) else {
+        return false;
+    };
+    if record.len() != 68 || &record[..4] != b"LFS1" || &record[4..36] != stamp {
+        return false;
+    }
+    std::fs::read(path).is_ok_and(|webp| blake3::hash(&webp).as_bytes() == &record[36..])
 }
 
 fn read_webp(path: &std::path::Path) -> Option<Vec<u8>> {
@@ -418,6 +475,12 @@ fn sweep(dir: &std::path::Path, now: SystemTime, keep: Duration, max_bytes: u64)
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
+            if name.ends_with(".stamp.tmp")
+                || (name.ends_with(".stamp") && !path.with_extension("webp").is_file())
+            {
+                let _ = std::fs::remove_file(path);
+                return None;
+            }
             if !(name.ends_with(".webp") || name.ends_with(".webp.tmp")) {
                 return None;
             }
@@ -434,6 +497,9 @@ fn sweep(dir: &std::path::Path, now: SystemTime, keep: Duration, max_bytes: u64)
         let tmp = path.extension().is_some_and(|e| e == "tmp");
         if old || tmp || kept + size > max_bytes {
             if std::fs::remove_file(&path).is_ok() {
+                if !tmp {
+                    let _ = std::fs::remove_file(path.with_extension("stamp"));
+                }
                 removed += 1;
                 removed_bytes += size;
             }
@@ -461,6 +527,17 @@ pub struct ThumbnailCapture {
     capture_ticket: u64,
     in_flight_captures: HashMap<Key, u64>,
     preview_request: Option<(Key, std::time::Instant)>,
+    /// 一覧から明示的に更新した子。撮影に必要な直下のファイルだけを読み直す。
+    refresh_children: HashSet<PathBuf>,
+    open_check: Option<OpenCheck>,
+}
+
+struct OpenCheck {
+    folder: NodeId,
+    visit: u64,
+    signature: u64,
+    stamp: Option<Key>,
+    pending: Option<Mutex<Receiver<(Key, bool)>>>,
 }
 
 struct CapturedImage {
@@ -468,6 +545,7 @@ struct CapturedImage {
     folder: NodeId,
     key: Key,
     rgba: Vec<u8>,
+    stamp: Option<Key>,
 }
 
 struct ActiveCapture {
@@ -482,9 +560,14 @@ struct ActiveCapture {
     frames: u32,
     readback_sent: bool,
     refresh: bool,
+    stamp: Option<Key>,
 }
 
 impl ThumbnailCapture {
+    pub(crate) fn refresh_visible_child(&mut self, path: PathBuf) {
+        self.refresh_children.insert(path);
+    }
+
     pub(crate) fn invalidate_local(&mut self, path: &Path) {
         let key = local_disk_key(path);
         self.in_flight_reads.remove(&key);
@@ -533,7 +616,7 @@ impl ThumbnailCapture {
 pub(crate) struct ThumbContext<'w, 's> {
     fonts: Res<'w, Assets<Font>>,
     font: Res<'w, LabelFont>,
-    tree: Res<'w, FileTree>,
+    tree: ResMut<'w, FileTree>,
     layouts: Res<'w, Layouts>,
     settings: Res<'w, Settings>,
     theme: Res<'w, UiThemeAssets>,
@@ -570,6 +653,79 @@ pub(crate) fn update_thumbnails(
     let path = scene_path(&ctx.nav, &ctx.tree);
     let scene_folder = path[path.len() - 1].node;
 
+    let scene_node = &ctx.tree.nodes[scene_folder];
+    capture.refresh_children.retain(|path| {
+        path.parent() == scene_node.path.as_deref()
+            && scene_node
+                .children
+                .iter()
+                .any(|&id| ctx.tree.nodes[id].path.as_ref() == Some(path))
+    });
+    if cache.dir.is_some() && scene_node.loaded && scene_node.path.is_some() {
+        let signature = crate::preview::files_signature(&ctx.tree, scene_folder);
+        if !capture.open_check.as_ref().is_some_and(|check| {
+            check.folder == scene_folder
+                && check.visit == ctx.visit.0
+                && check.signature == signature
+        }) {
+            let pending = disk_key(&ctx.tree, scene_folder).map(|key| {
+                let input = ctx
+                    .previews
+                    .folder_fingerprint_input(&ctx.tree, scene_folder);
+                Mutex::new(cache.validate(key, input))
+            });
+            capture.open_check = Some(OpenCheck {
+                folder: scene_folder,
+                visit: ctx.visit.0,
+                signature,
+                stamp: None,
+                pending,
+            });
+        }
+    } else {
+        capture.open_check = None;
+    }
+    if let Some(check) = &mut capture.open_check
+        && let Some(pending) = &mut check.pending
+    {
+        match pending.get_mut().expect("フォルダ画像の照合").try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if !ctx.occluded.0 {
+                    redraw.write(RequestRedraw);
+                }
+            }
+            result => {
+                check.pending = None;
+                let valid = match result {
+                    Ok((stamp, valid)) => {
+                        check.stamp = Some(stamp);
+                        valid
+                    }
+                    Err(_) => true,
+                };
+                if !valid {
+                    let mut paths = Vec::new();
+                    let mut id = Some(scene_folder);
+                    while let Some(folder) = id {
+                        let node = &ctx.tree.nodes[folder];
+                        let Some(path) = &node.path else { break };
+                        paths.push(path.clone());
+                        id = node.parent;
+                    }
+                    ctx.tree.preview_revision += 1;
+                    let generation = ctx.tree.preview_revision;
+                    for path in paths {
+                        cache.invalidate_local(&path);
+                        images.invalidate_local(&path);
+                        capture.invalidate_local(&path);
+                        ctx.tree.preview_generations.insert(path, generation);
+                    }
+                    sync.request_redraw();
+                }
+            }
+        }
+    }
+
     // 1a. 撮影の読み戻し結果を反映する。
     let mut updated_keys: Vec<Key> = Vec::new();
     if let Ok(rx) = cache.capture_rx.lock() {
@@ -578,6 +734,7 @@ pub(crate) fn update_thumbnails(
             folder,
             key,
             rgba,
+            stamp,
         } in rx.try_iter()
         {
             if capture.in_flight_captures.get(&key) != Some(&ticket) {
@@ -590,6 +747,9 @@ pub(crate) fn update_thumbnails(
             let expected = (IMAGE_WIDTH * image_height() * 4) as usize;
             if rgba.len() == expected {
                 if let Some(disk_key) = disk_key(&ctx.tree, folder) {
+                    if let Some(path) = &ctx.tree.nodes[folder].path {
+                        capture.refresh_children.remove(path);
+                    }
                     if let Some(generation) = preview_generation(&ctx.tree, folder) {
                         if capture.refreshed.len() >= MAX_DISK_CHECKS {
                             capture.refreshed.clear();
@@ -598,7 +758,7 @@ pub(crate) fn update_thumbnails(
                         debug!("サムネを更新: {}", ctx.tree.nodes[folder].name);
                     }
                     if let Ok(tx) = cache.save.lock() {
-                        let _ = tx.send(DiskWrite::Save(disk_key, rgba.clone()));
+                        let _ = tx.send(DiskWrite::Save(disk_key, rgba.clone(), stamp));
                     }
                 }
                 let handle = assets.add(loaded_image(rgba));
@@ -740,6 +900,7 @@ pub(crate) fn update_thumbnails(
         if active.frames == CAPTURE_FRAMES && !active.readback_sent {
             let key = active.key;
             let folder = active.folder;
+            let stamp = active.stamp;
             capture.capture_ticket = capture.capture_ticket.wrapping_add(1);
             let ticket = capture.capture_ticket;
             let mem = cache.capture_tx.lock().expect("画像を受け取る係").clone();
@@ -753,6 +914,7 @@ pub(crate) fn update_thumbnails(
                         folder,
                         key,
                         rgba: data,
+                        stamp,
                     });
                     commands.entity(event.entity).despawn();
                 });
@@ -844,7 +1006,19 @@ pub(crate) fn update_thumbnails(
     let Some((folder, key, visit)) = target_folder else {
         return;
     };
-    if needs_refresh(folder) {
+    if folder == scene_folder
+        && capture
+            .open_check
+            .as_ref()
+            .is_some_and(|check| check.pending.is_some())
+    {
+        return;
+    }
+    let explicit_child = ctx.tree.nodes[folder]
+        .path
+        .as_ref()
+        .is_some_and(|path| capture.refresh_children.contains(path));
+    if folder == scene_folder || requested == Some(folder) || explicit_child {
         if !capture
             .preview_request
             .is_some_and(|(pending, _)| pending == key)
@@ -937,6 +1111,11 @@ pub(crate) fn update_thumbnails(
         frames: 0,
         readback_sent: false,
         refresh: needs_refresh(folder),
+        stamp: capture
+            .open_check
+            .as_ref()
+            .filter(|check| check.folder == folder && !ctx.previews.capture_pending())
+            .and_then(|check| check.stamp),
     });
     redraw.write(RequestRedraw);
 }
@@ -1003,6 +1182,34 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["mid.webp", "new.webp", "other.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn フォルダ付帯記録は子の指紋の不一致と欠落を検出し本体と一緒に掃除される() {
+        let dir = std::env::temp_dir().join(format!("lisa-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (w, h) = (IMAGE_WIDTH as usize, image_height() as usize);
+        let rgba = vec![9u8; w * h * 4];
+        let (key, stamp, other) = ([5u8; 32], [6u8; 32], [7u8; 32]);
+        write_folder_record(&dir, &key, &rgba, Some(stamp));
+        assert!(valid_folder_record(&dir, &key, &stamp));
+        assert!(
+            !valid_folder_record(&dir, &key, &other),
+            "子の構成が変わった"
+        );
+        // 付帯記録のない旧記録と、本体が差し替わった記録は照合に失敗して再撮影になる。
+        write_folder_record(&dir, &key, &rgba, None);
+        assert!(!valid_folder_record(&dir, &key, &stamp));
+        write_folder_record(&dir, &key, &rgba, Some(stamp));
+        std::fs::write(dir.join(file_name(&key)), b"replaced").unwrap();
+        assert!(!valid_folder_record(&dir, &key, &stamp));
+        // 本体が無くなった付帯記録・書きかけの付帯記録は掃除される。
+        std::fs::remove_file(dir.join(file_name(&key))).unwrap();
+        std::fs::write(dir.join("half.stamp.tmp"), b"x").unwrap();
+        sweep(&dir, SystemTime::now(), Duration::from_secs(3600), u64::MAX);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

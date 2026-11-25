@@ -34,6 +34,8 @@ pub struct Node {
     pub(crate) remote_mount: Option<PathBuf>,
     pub(crate) drive_id: Option<String>,
     pub name: String,
+    /// ローカルの一覧が持つ、正規化前の名前。
+    pub(crate) local_name: Option<std::ffi::OsString>,
     /// バイト数。フォルダは子の合計。
     pub size: u64,
     pub depth: usize,
@@ -480,6 +482,7 @@ impl FileTree {
             let is_dir = row.kind == Kind::Dir;
             let readable = is_dir && !row.cloud_only && !row.other_volume;
             let child = self.push(&row.name_nfc, row.size, Some(id), device, is_dir);
+            self.nodes[child].local_name = Some(lisa_core::name::from_raw_bytes(&row.name_raw));
             if alias {
                 self.nodes[child].entry = Some(row.id);
             } else {
@@ -540,6 +543,7 @@ impl FileTree {
                     let is_dir = entry.kind == Kind::Dir;
                     let size = if is_dir { 0 } else { entry.size };
                     let child = self.push(&entry.name_nfc, size, Some(id), device, is_dir);
+                    self.nodes[child].local_name = Some(entry.name.clone());
                     // ファイルはハッシュができるまで未読み込み。ハッシュしないもの（クラウドのみ、リンク、
                     // 中に入らないフォルダ）は読み込み済み。中に入って読むフォルダは、中を読むまで未読み込み。
                     self.nodes[child].state = if entry.kind == Kind::File && !entry.cloud_only {
@@ -836,6 +840,7 @@ impl FileTree {
             remote_mount: None,
             drive_id: None,
             name: name.to_string(),
+            local_name: None,
             size,
             depth,
             parent,
