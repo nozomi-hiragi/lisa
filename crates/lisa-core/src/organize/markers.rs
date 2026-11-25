@@ -144,6 +144,7 @@ pub(super) fn prepare(
     };
     save(db, &journal)?;
     let update = links::Update {
+        previous_source: None,
         marker: journal.marker.clone(),
         generation: 1,
         state: links::State::Reserved,
@@ -180,6 +181,7 @@ fn change_link(db: &mut Db, journal: &Journal, state: links::State) -> Result<()
     links::apply(
         db,
         &links::Update {
+            previous_source: None,
             marker: journal.marker.clone(),
             generation,
             state,
@@ -198,7 +200,14 @@ pub(super) fn abandon(db: &mut Db, op: &PlanOp) -> Result<(), String> {
 }
 
 pub fn flush_links(db: &mut Db, ctx: &super::Context) -> Result<(), String> {
-    check_for_removed_markers(db)?;
+    {
+        let Ok(_lock) = super::apply::try_lock_plans(&ctx.data_dir) else {
+            return Ok(());
+        };
+        super::linked_move::flush_moves(db, ctx)?;
+        check_for_removed_markers(db)?;
+    }
+    super::linked_move::flush_retargets(db, ctx, None)?;
     let Some(client) = ctx.link_client else {
         return Ok(());
     };
@@ -231,6 +240,20 @@ fn check_for_removed_markers(db: &mut Db) -> Result<(), String> {
          ON j.plan_id=json_extract(l.marker,'$.plan_id') AND j.seq=json_extract(l.marker,'$.item_id')
          WHERE l.state='active' AND l.source_device=(SELECT value FROM meta WHERE key='this_device')
            AND l.link_id=json_extract(j.journal,'$.marker.link_id')
+           AND NOT EXISTS (SELECT 1 FROM merged_link_rewrite r WHERE r.link_id=l.link_id)
+           AND NOT EXISTS (SELECT 1 FROM merged_link_move_retry r WHERE r.link_id=l.link_id)
+           AND NOT EXISTS (
+               SELECT 1 FROM merged_link_move_undo u
+               JOIN plan_op p ON p.plan_id=u.plan_id AND p.seq=u.seq
+               JOIN json_each(u.movements) movement ON movement.key=l.link_id
+               WHERE p.state='done'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM merged_link_move m
+               JOIN plan_op p ON p.plan_id=m.plan_id AND p.seq=m.seq
+               JOIN json_each(m.movements) movement ON movement.key=l.link_id
+               WHERE p.state='running'
+           )
          ORDER BY l.marker_checked_at, l.link_id LIMIT 128"
     ).map_err(error)?.query_map([], |row| row.get(0)).map_err(error)?
         .collect::<rusqlite::Result<_>>().map_err(error)?;

@@ -33,6 +33,8 @@ pub struct Update {
     pub marker: Marker,
     pub generation: i64,
     pub state: State,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_source: Option<Location>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -101,7 +103,17 @@ fn apply_in(
             };
         }
         let old: Marker = serde_json::from_str(&old_json).map_err(error)?;
-        if old.source != marker.source
+        let moved_source = state == State::Active.as_str()
+            && update.state == State::Active
+            && old.source.device_id == marker.source.device_id
+            && generation.checked_add(1) == Some(update.generation)
+            && update.previous_source.as_ref() == Some(&old.source)
+            && {
+                let mut expected = old.clone();
+                expected.source = marker.source.clone();
+                expected == *marker
+            };
+        if (old.source != marker.source && !moved_source)
             || old.target != marker.target
             || old.kind != marker.kind
             || old.hash != marker.hash
@@ -144,7 +156,18 @@ fn apply_in(
         ],
     )
     .map_err(error)?;
-    if send_later {
+    if send_later && update.previous_source.is_some() {
+        conn.execute(
+            "INSERT INTO merged_link_source_outbox VALUES (?1,?2,?3,?4)",
+            params![
+                id,
+                update.generation,
+                serde_json::to_string(update).map_err(error)?,
+                now
+            ],
+        )
+        .map_err(error)?;
+    } else if send_later {
         conn.execute(
             "INSERT INTO merged_link_outbox(link_id,generation,queued_at) VALUES (?1,?2,?3)
              ON CONFLICT(link_id) DO UPDATE SET generation=excluded.generation, queued_at=excluded.queued_at",
@@ -204,7 +227,13 @@ pub fn acknowledge(db: &mut Db, link_id: &str, generation: i64) -> Result<(), St
             params![link_id, generation],
         )
         .map_err(error)?;
-    if changed != 0 {
+    let moved = tx
+        .execute(
+            "DELETE FROM merged_link_source_outbox WHERE link_id=?1 AND generation=?2",
+            params![link_id, generation],
+        )
+        .map_err(error)?;
+    if changed + moved != 0 {
         tx.execute(
             "UPDATE merged_link SET sync_state='confirmed', sync_reason=NULL, checked_at=?3
              WHERE link_id=?1 AND generation=?2",
@@ -215,32 +244,53 @@ pub fn acknowledge(db: &mut Db, link_id: &str, generation: i64) -> Result<(), St
     tx.commit().map_err(error)
 }
 
+pub(crate) fn pending_source(db: &Db, id: &str, generation: i64) -> Result<Option<Update>, String> {
+    let json: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT update_json FROM merged_link_source_outbox WHERE link_id=?1 AND generation=?2",
+            params![id, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(error)?;
+    json.map(|json| serde_json::from_str(&json).map_err(error))
+        .transpose()
+}
+
 pub fn pending(db: &Db) -> Result<Vec<Update>, String> {
     db.conn()
         .prepare_cached(
-            "SELECT marker, m.generation, state FROM merged_link_outbox o
-         JOIN merged_link m ON m.link_id=o.link_id AND m.generation=o.generation
-         ORDER BY o.queued_at, m.link_id LIMIT 32",
+            "SELECT marker, m.generation, state, NULL, o.queued_at, o.link_id
+             FROM merged_link_outbox o
+             JOIN merged_link m ON m.link_id=o.link_id AND m.generation=o.generation
+             WHERE NOT EXISTS (SELECT 1 FROM merged_link_source_outbox s WHERE s.link_id=o.link_id)
+             UNION ALL
+             SELECT NULL, generation, NULL, update_json, queued_at, link_id
+             FROM merged_link_source_outbox s
+             WHERE generation=(SELECT MIN(generation) FROM merged_link_source_outbox WHERE link_id=s.link_id)
+             ORDER BY 5,6 LIMIT 32",
         )
         .map_err(error)?
         .query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })
         .map_err(error)?
         .map(|row| {
-            let (json, generation, state) = row.map_err(error)?;
+            let (marker, generation, state, update) = row.map_err(error)?;
+            if let Some(json) = update {
+                return serde_json::from_str(&json).map_err(error);
+            }
             Ok(Update {
-                marker: serde_json::from_str(&json).map_err(error)?,
+                marker: serde_json::from_str(&marker.ok_or("目印の記録がありません")?).map_err(error)?,
                 generation,
-                state: if state == "removed" {
-                    State::Removed
-                } else {
-                    State::Active
-                },
+                state: if state.as_deref() == Some("removed") { State::Removed } else { State::Active },
+                previous_source: None,
             })
         })
         .collect()
@@ -287,6 +337,171 @@ pub(crate) fn stored_source(
         ))
     })
     .transpose()
+}
+
+pub fn retargeted_marker(old: &Marker, target: &Location) -> Result<Marker, String> {
+    let mut updated = old.clone();
+    updated.target = target.clone();
+    if !old.valid()
+        || !updated.valid()
+        || old.target.device_id != target.device_id
+        || old.target == *target
+    {
+        return Err("移動後の実体の所在が正しくありません".into());
+    }
+    Ok(updated)
+}
+
+pub fn retarget_receipt(
+    db: &Db,
+    operation: &str,
+    old: &Marker,
+    target: &Location,
+    generation: i64,
+) -> Result<Option<Location>, String> {
+    let digest = retarget_request_digest(old, target, generation)?;
+    let json: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT receipt.source FROM merged_link_retarget_receipt receipt
+         JOIN merged_link_relay permit ON permit.link_id=?3
+         WHERE receipt.operation=?1 AND receipt.request_hash=?2
+           AND permit.revoked=0 AND permit.state='active' AND permit.generation=?4",
+            params![
+                operation,
+                digest.as_bytes().as_slice(),
+                old.link_id,
+                generation + 2
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(error)?;
+    json.map(|json| serde_json::from_str(&json).map_err(error))
+        .transpose()
+}
+
+fn retarget_request_digest(
+    old: &Marker,
+    target: &Location,
+    generation: i64,
+) -> Result<blake3::Hash, String> {
+    Ok(blake3::hash(
+        &serde_json::to_vec(&(old, target, generation)).map_err(error)?,
+    ))
+}
+
+pub fn finish_merged_retarget(
+    db: &mut Db,
+    operation: &str,
+    old: &Marker,
+    target: &Location,
+    generation: i64,
+    source: &Location,
+) -> Result<(), String> {
+    let mut combined = retargeted_marker(old, target)?;
+    if !source.valid() || source.device_id != old.source.device_id || source == &old.source {
+        return Err("中継された目印の所在が一致しません".into());
+    }
+    combined.source = source.clone();
+    let tx = db
+        .conn_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(error)?;
+    let changed = tx.execute(
+        "UPDATE merged_link_relay SET marker_hash=?2,generation=?3,relocation_operation=NULL
+         WHERE link_id=?1 AND generation=?4 AND relocation_operation=?5 AND state='active' AND revoked=0",
+        params![old.link_id,marker_digest(&combined)?.as_bytes().as_slice(),generation+2,generation,operation],
+    ).map_err(error)?;
+    if changed != 1 {
+        return Err("中継で合流後の世代を確定できません".into());
+    }
+    tx.execute(
+        "INSERT INTO merged_link_retarget_receipt VALUES (?1,?2,?3)",
+        params![
+            operation,
+            retarget_request_digest(old, target, generation)?
+                .as_bytes()
+                .as_slice(),
+            serde_json::to_string(source).map_err(error)?
+        ],
+    )
+    .map_err(error)?;
+    tx.commit().map_err(error)
+}
+
+pub(crate) fn acknowledge_merged_source(
+    db: &mut Db,
+    id: &str,
+    source_generation: i64,
+) -> Result<(), String> {
+    let tx = db.conn_mut().transaction().map_err(error)?;
+    tx.execute(
+        "DELETE FROM merged_link_source_outbox WHERE link_id=?1 AND generation=?2",
+        params![id, source_generation],
+    )
+    .map_err(error)?;
+    tx.execute(
+        "UPDATE merged_link SET sync_state='confirmed' WHERE link_id=?1 AND generation=?2",
+        params![id, source_generation + 1],
+    )
+    .map_err(error)?;
+    tx.commit().map_err(error)
+}
+
+pub(crate) fn merge_retarget_reply(
+    conn: &Connection,
+    old: &Marker,
+    target: &Location,
+    generation: i64,
+    source: &Location,
+) -> Result<(), String> {
+    let expected = retargeted_marker(old, target)?;
+    if !source.valid()
+        || source.device_id != old.source.device_id
+        || source == &old.source
+        || generation >= i64::MAX - 1
+    {
+        return Err("合流した目印の所在が正しくありません".into());
+    }
+    let mut combined = expected.clone();
+    combined.source = source.clone();
+    let changed = conn.execute(
+        "UPDATE merged_link SET marker=?2,generation=?3,sync_state='confirmed',sync_reason=NULL
+         WHERE link_id=?1 AND generation=?4 AND marker=?5 AND state='active' AND sync_state='pending'",
+        params![old.link_id,serde_json::to_string(&combined).map_err(error)?,generation+2,
+            generation+1,serde_json::to_string(&expected).map_err(error)?],
+    ).map_err(error)?;
+    if changed != 1 {
+        return Err("合流する世代が変わりました".into());
+    }
+    Ok(())
+}
+
+pub fn retarget_permitted(
+    db: &Db,
+    old: &Marker,
+    new: &Marker,
+    generation: i64,
+    operation: &str,
+) -> Result<Authorization, String> {
+    let applied = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM merged_link_relay
+         WHERE link_id=?1 AND generation=?2 AND marker_hash=?3 AND revoked=0 AND state='active')",
+            params![
+                old.link_id,
+                generation + 1,
+                marker_digest(new)?.as_bytes().as_slice()
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(error)?;
+    if applied {
+        return Ok(Authorization::AlreadyApplied);
+    }
+    relocation_permitted(db, old, generation, operation, true, false)
 }
 
 pub fn relocation_permitted(
@@ -606,6 +821,68 @@ pub(crate) fn remove_received(
     Ok(())
 }
 
+pub(crate) fn move_source(
+    conn: &Connection,
+    previous: &Link,
+    updated: &Marker,
+    relay: Option<&str>,
+) -> Result<(), String> {
+    let result = apply_in(
+        conn,
+        &Update {
+            marker: updated.clone(),
+            generation: previous.generation + 1,
+            state: State::Active,
+            previous_source: Some(previous.marker.source.clone()),
+        },
+        relay,
+        relay.is_some(),
+        db::now_ms(),
+    )?;
+    if result == Applied::Stale {
+        return Err("リンクの世代が変わりました".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn active_link(db: &Db, id: &str) -> Result<Option<(Link, Option<String>)>, String> {
+    let row = db
+        .conn()
+        .query_row(
+            "SELECT marker,generation,checked_at,sync_state,sync_reason,relay_device
+         FROM merged_link WHERE link_id=?1 AND state='active'",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(error)?;
+    row.map(
+        |(json, generation, checked_at, sync_state, sync_reason, relay)| {
+            Ok((
+                Link {
+                    marker: serde_json::from_str(&json).map_err(error)?,
+                    generation,
+                    state: State::Active,
+                    checked_at,
+                    sync_state,
+                    sync_reason,
+                },
+                relay,
+            ))
+        },
+    )
+    .transpose()
+}
+
 pub(crate) fn retarget(
     conn: &Connection,
     previous: &Link,
@@ -613,8 +890,9 @@ pub(crate) fn retarget(
     relay: Option<&str>,
 ) -> Result<(), String> {
     if previous.marker.link_id != updated.link_id
-        || previous.marker.source != updated.source
+        || previous.marker.source.device_id != updated.source.device_id
         || previous.marker.hash != updated.hash
+        || (previous.marker.source != updated.source && relay.is_some())
     {
         return Err("リンクの付け替え先が一致しません".into());
     }
@@ -763,23 +1041,47 @@ pub fn authorize(
         return Err("リンク中継の要求が一致しません".into());
     }
     let expected = marker_digest(marker)?;
+    let previous = if let Some(source_before) = &update.previous_source {
+        if update.state != State::Active
+            || source_before.device_id != source
+            || !source_before.valid()
+        {
+            return Err("リンク元の移動要求が一致しません".into());
+        }
+        let mut old = marker.clone();
+        old.source = source_before.clone();
+        marker_digest(&old)?
+    } else {
+        expected
+    };
     let stored = db.conn().query_row(
-        "SELECT generation, state, revoked FROM merged_link_relay
-         WHERE link_id=?1 AND source_device=?2 AND target_device=?3 AND secret_hash=?4 AND marker_hash=?5",
+        "SELECT generation, state, revoked, marker_hash, relocation_operation FROM merged_link_relay
+         WHERE link_id=?1 AND source_device=?2 AND target_device=?3 AND secret_hash=?4",
         params![marker.link_id, source, marker.target.device_id,
-            blake3::hash(secret.as_bytes()).as_bytes().as_slice(), expected.as_bytes().as_slice()],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
+            blake3::hash(secret.as_bytes()).as_bytes().as_slice()],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                  row.get::<_, Vec<u8>>(3)?, row.get::<_, Option<String>>(4)?)),
     ).optional().map_err(error)?;
     match stored {
-        Some((generation, state, revoked))
-            if update.generation > 1
+        Some((generation, state, revoked, digest, _))
+            if digest == expected.as_bytes()
+                && update.generation > 1
                 && update.generation == generation
                 && state == update.state.as_str()
                 && revoked != 1 =>
         {
             Ok(Authorization::AlreadyApplied)
         }
-        Some((generation, _, 0)) if update.generation > generation => Ok(Authorization::Forward),
+        Some((generation, state, 0, digest, operation))
+            if digest == previous.as_bytes()
+                && update.generation > generation
+                && (update.previous_source.is_none()
+                    || (state == State::Active.as_str()
+                        && operation.is_none()
+                        && update.generation == generation + 1)) =>
+        {
+            Ok(Authorization::Forward)
+        }
         _ => Err("リンク中継許可を確認できません".into()),
     }
 }
@@ -787,13 +1089,14 @@ pub fn authorize(
 pub fn forwarded(db: &Db, update: &Update) -> Result<(), String> {
     db.conn()
         .execute(
-            "UPDATE merged_link_relay SET generation=?2, revoked=?3, state=?4
+            "UPDATE merged_link_relay SET generation=?2, revoked=?3, state=?4, marker_hash=?5
          WHERE link_id=?1 AND generation<?2 AND revoked=0",
             params![
                 update.marker.link_id.to_string(),
                 update.generation,
                 if update.state == State::Removed { 2 } else { 0 },
-                update.state.as_str()
+                update.state.as_str(),
+                marker_digest(&update.marker)?.as_bytes().as_slice(),
             ],
         )
         .map_err(error)?;
@@ -832,6 +1135,7 @@ mod tests {
     fn duplicate_and_older_generations_cannot_restore_removed_link() {
         let mut db = Db::open_in_memory().unwrap();
         let mut update = Update {
+            previous_source: None,
             marker: marker(),
             generation: 1,
             state: State::Reserved,
@@ -883,6 +1187,7 @@ mod tests {
         let secret = "a".repeat(64);
         issue(&db, &marker, &Uuid::new_v4().to_string(), &secret).unwrap();
         let mut update = Update {
+            previous_source: None,
             marker,
             generation: 2,
             state: State::Removed,

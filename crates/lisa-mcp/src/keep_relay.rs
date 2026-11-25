@@ -200,11 +200,74 @@ impl Server {
     fn forward_transfer(&self, request: &TransferRequest) -> Result<TransferReply, String> {
         let mut db = self.db()?;
         let now = lisa_core::db::now_ms();
-        if !(0..=120_000).contains(&request.expires_at.saturating_sub(now)) {
+        if !(0..=120_000).contains(&request.expires_at.saturating_sub(now))
+            || !(1..i64::MAX).contains(&request.generation)
+        {
             return Err("転送許可の期限が切れています".into());
         }
         if matches!(request.action, TransferAction::AddSource { .. }) {
             return Err("新しい実体の逆引きは中継で確かめてから登録します".into());
+        }
+        if let TransferAction::Retarget { target } = &request.action {
+            if request.generation >= i64::MAX - 1 {
+                return Err("目印の世代が正しくありません".into());
+            }
+            if let Some(source) = links::retarget_receipt(
+                &db,
+                &request.operation_id,
+                &request.marker,
+                target,
+                request.generation,
+            )? {
+                return Ok(TransferReply {
+                    published: true,
+                    moved_source: Some(source),
+                    ..TransferReply::default()
+                });
+            }
+            let updated = links::retargeted_marker(&request.marker, target)?;
+            if links::retarget_permitted(
+                &db,
+                &request.marker,
+                &updated,
+                request.generation,
+                &request.operation_id,
+            )? == links::Authorization::AlreadyApplied
+            {
+                return Ok(TransferReply {
+                    published: true,
+                    ..TransferReply::default()
+                });
+            }
+            let destination = peer(&self.data_dir, &request.marker.source.device_id)?;
+            let result = call_keep(
+                &destination,
+                "lisa_merged_receive_transfer",
+                json!({ "request": request }),
+            )?;
+            let reply: TransferReply = serde_json::from_value(result).map_err(err)?;
+            if !reply.published {
+                return Err("移動後の目印を確認できません".into());
+            }
+            if let Some(source) = &reply.moved_source {
+                links::finish_merged_retarget(
+                    &mut db,
+                    &request.operation_id,
+                    &request.marker,
+                    target,
+                    request.generation,
+                    source,
+                )?;
+            } else {
+                links::finish_repoint(
+                    &mut db,
+                    &request.marker,
+                    &updated,
+                    request.generation,
+                    &request.operation_id,
+                )?;
+            }
+            return Ok(reply);
         }
         let repoint = match &request.action {
             TransferAction::Repoint { chosen } => {
@@ -220,6 +283,7 @@ impl Server {
                         published: true,
                         received: 0,
                         offsets: Vec::new(),
+                        moved_source: None,
                     });
                 }
                 Some((published, generation))
@@ -244,6 +308,7 @@ impl Server {
                 published: true,
                 received: request.marker.size,
                 offsets: Vec::new(),
+                moved_source: None,
             });
         }
         let destination = peer(&self.data_dir, &request.marker.source.device_id)?;
@@ -394,7 +459,9 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str, String> {
 }
 
 fn call_keep(endpoint: &Endpoint, tool: &str, mut arguments: Value) -> Result<Value, String> {
-    let seconds = if tool == "lisa_merged_receive_transfer" {
+    let seconds = if tool == "lisa_merged_receive_transfer"
+        && arguments["request"]["action"]["action"] != "retarget"
+    {
         100
     } else {
         20
@@ -529,7 +596,9 @@ fn exchange(data_dir: &Path, route: &relay::Route, body: Value) -> Result<Value,
 
 fn exchange_at(address: SocketAddr, body: Value) -> Result<Value, String> {
     // 付け替えの小分け（数 MiB を 2 段で中継）は、遅い回線でも待てるよう長めにする。
-    let seconds = if body.get("transfer").is_some() {
+    let seconds = if body.get("transfer").is_some()
+        && body["transfer"]["request"]["action"]["action"] != "retarget"
+    {
         120
     } else {
         12

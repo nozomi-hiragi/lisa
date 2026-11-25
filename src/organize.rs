@@ -418,8 +418,7 @@ pub(crate) fn receive_events(
                 dups.refresh_after_scan = true;
                 if let Some(control) = &control {
                     for folder in folders {
-                        control.visible(folder.clone());
-                        control.hint(folder);
+                        control.refresh_after_organize(folder);
                     }
                 }
             }

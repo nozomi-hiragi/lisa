@@ -243,6 +243,54 @@ CREATE TABLE IF NOT EXISTS merged_link_transfer_progress (
     total INTEGER NOT NULL,
     touched_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS merged_link_move (
+    plan_id INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    movements TEXT NOT NULL,
+    undo_size INTEGER,
+    undo_mtime INTEGER,
+    PRIMARY KEY(plan_id,seq),
+    FOREIGN KEY(plan_id,seq) REFERENCES plan_op(plan_id,seq) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS merged_link_move_undo (
+    plan_id INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    movements TEXT NOT NULL,
+    identity TEXT,
+    copied_identity TEXT,
+    PRIMARY KEY(plan_id,seq),
+    FOREIGN KEY(plan_id,seq) REFERENCES plan_op(plan_id,seq) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS merged_link_move_retry (
+    operation TEXT NOT NULL,
+    link_id TEXT NOT NULL,
+    movement TEXT NOT NULL,
+    undo INTEGER NOT NULL,
+    attempted_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(operation,link_id)
+);
+CREATE INDEX IF NOT EXISTS merge_marker_published_path
+    ON merge_marker(json_extract(journal, '$.state.Published.path'));
+CREATE TABLE IF NOT EXISTS merged_link_source_outbox (
+    link_id TEXT NOT NULL REFERENCES merged_link(link_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    update_json TEXT NOT NULL,
+    queued_at INTEGER NOT NULL,
+    PRIMARY KEY(link_id,generation)
+);
+CREATE TABLE IF NOT EXISTS merged_link_retarget_receipt (
+    operation TEXT PRIMARY KEY,
+    request_hash BLOB NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS merged_link_retarget_outbox (
+    link_id TEXT NOT NULL REFERENCES merged_link(link_id) ON DELETE CASCADE,
+    generation INTEGER NOT NULL,
+    relay_device TEXT NOT NULL,
+    request TEXT NOT NULL,
+    attempted_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(link_id,generation)
+);
 CREATE TABLE IF NOT EXISTS merged_link_rewrite (
     operation_id TEXT NOT NULL,
     link_id TEXT NOT NULL,
@@ -577,7 +625,7 @@ impl Db {
             if folder.kind != Kind::Dir || !folder.listed || folder.error.is_some() {
                 return Ok(false);
             }
-            let children = {
+            let mut children = {
                 let mut statement = tx.prepare_cached(&format!(
                     "SELECT {COLUMNS} FROM entry WHERE parent_id = ?1 ORDER BY pos"
                 ))?;
@@ -585,7 +633,7 @@ impl Db {
                     .query_map([id], row_to_stored)?
                     .collect::<Result<Vec<_>>>()?
             };
-            let Some(entries) = crate::hash::ready_tree_bytes(&children) else {
+            let Some(entries) = crate::hash::ready_tree_bytes(&mut children) else {
                 return Ok(false);
             };
             let hash = blake3::hash(&entries);
@@ -978,6 +1026,121 @@ impl Db {
             .extend(folders.into_iter().map(|(name, id)| (path.join(name), id)));
     }
 
+    pub(crate) fn entry_move_version(&self) -> Result<i64> {
+        Ok(self
+            .meta("entry_move_version")?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// 物理リネーム後に、同じドライブ内で走査済みの項目を引き継ぐ。
+    pub(crate) fn move_entry(
+        &mut self,
+        drive_id: &str,
+        mount: &Path,
+        src: &Path,
+        dst: &Path,
+    ) -> Result<()> {
+        let parents = move_parents(mount, src, dst);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::move_entry_in(&tx, drive_id, mount, src, dst, parents)?;
+        tx.commit()?;
+        self.folders.clear();
+        Ok(())
+    }
+
+    /// 監視が物理リネームと行の引き継ぎの間に旧行を削除しないよう、書き込み権を先に取る。
+    pub(crate) fn rename_preserving_entry(
+        &mut self,
+        drive_id: &str,
+        mount: &Path,
+        src: &Path,
+        dst: &Path,
+        rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    ) -> std::io::Result<Option<Error>> {
+        let parents = move_parents(mount, src, dst);
+        let result = match self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+        {
+            Ok(tx) => {
+                rename(src, dst)?;
+                Self::move_entry_in(&tx, drive_id, mount, src, dst, parents)
+                    .and_then(|()| tx.commit())
+            }
+            Err(error) => {
+                rename(src, dst)?;
+                Err(error)
+            }
+        };
+        self.folders.clear();
+        Ok(result.err())
+    }
+
+    fn move_entry_in(
+        conn: &Connection,
+        drive_id: &str,
+        mount: &Path,
+        src: &Path,
+        dst: &Path,
+        parents: Option<(PathBuf, Vec<std::ffi::OsString>)>,
+    ) -> Result<()> {
+        let (Some((old_parent, parent_names)), Some(old_name), Some(new_name)) =
+            (parents, src.file_name(), dst.file_name())
+        else {
+            return Ok(());
+        };
+        let Ok(metadata) = std::fs::symlink_metadata(dst) else {
+            return Ok(());
+        };
+        let new_name = stored_name(dst).unwrap_or_else(|| new_name.to_owned());
+        let Some(old_parent) = folder_id_at(conn, drive_id, mount, &old_parent)? else {
+            return Ok(());
+        };
+        let Some((id, old_raw)) = conn
+            .query_row(
+                "SELECT id, name FROM entry
+             WHERE parent_id = ?1 AND (name = ?2 OR name_nfc = ?3) AND file_id IS ?4
+               AND (kind != 'file' OR (size = ?5 AND mtime IS ?6))
+             ORDER BY name = ?2 DESC LIMIT 1",
+                params![
+                    old_parent,
+                    crate::name::raw_bytes(old_name),
+                    crate::name::nfc(old_name),
+                    crate::listing::file_id(&metadata).map(|id| id as i64),
+                    metadata.len() as i64,
+                    crate::listing::mtime_ms(&metadata)
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        let Some(parent) = ensure_move_parent(conn, drive_id, mount, &parent_names)? else {
+            return Ok(());
+        };
+        let raw = crate::name::raw_bytes(&new_name);
+        if old_parent == parent && raw == old_raw {
+            return Ok(());
+        }
+        conn.execute(
+            "DELETE FROM entry WHERE parent_id = ?1 AND name = ?2 AND id != ?3",
+            params![parent, raw, id],
+        )?;
+        conn.execute(
+            "UPDATE entry SET parent_id = ?1, name = ?2, name_nfc = ?3,
+                 pos = COALESCE((SELECT MAX(pos) + 1 FROM entry WHERE parent_id = ?1), 0)
+             WHERE id = ?4",
+            params![parent, raw, crate::name::nfc(&new_name), id],
+        )?;
+        clear_hash_up_for_move(conn, old_parent)?;
+        clear_hash_up_for_move(conn, parent)?;
+        bump_entry_move_version(conn)
+    }
+
     /// `id` とその祖先のハッシュを消す（中が変わったので、作り直しが要る）。
     pub fn clear_hash_up(&mut self, id: i64) -> Result<()> {
         clear_hash_up(&self.conn, id)
@@ -1000,6 +1163,77 @@ impl Db {
         }
         Ok(())
     }
+}
+
+fn move_parents(
+    mount: &Path,
+    src: &Path,
+    dst: &Path,
+) -> Option<(PathBuf, Vec<std::ffi::OsString>)> {
+    let old = src.parent()?;
+    let new = dst.parent()?;
+    let mut resolved = HashMap::new();
+    let old_names = stored_components_cached(mount, old, &mut resolved)?;
+    let new_names = stored_components_cached(mount, new, &mut resolved)?;
+    let old_path = old_names
+        .iter()
+        .fold(mount.to_owned(), |path, name| path.join(name));
+    Some((old_path, new_names))
+}
+
+pub(crate) fn stored_components(mount: &Path, path: &Path) -> Option<Vec<std::ffi::OsString>> {
+    stored_components_cached(mount, path, &mut HashMap::new())
+}
+
+fn stored_components_cached(
+    mount: &Path,
+    path: &Path,
+    resolved: &mut HashMap<PathBuf, std::ffi::OsString>,
+) -> Option<Vec<std::ffi::OsString>> {
+    let mut current = mount.to_path_buf();
+    Some(
+        path.strip_prefix(mount)
+            .ok()?
+            .components()
+            .map(|component| {
+                current.push(component);
+                let name = resolved
+                    .entry(current.clone())
+                    .or_insert_with(|| {
+                        stored_name(&current).unwrap_or_else(|| component.as_os_str().to_owned())
+                    })
+                    .clone();
+                current.set_file_name(&name);
+                name
+            })
+            .collect(),
+    )
+}
+
+/// 一覧に保存される名前を取得する。別名のハードリンクは除外する。
+pub(crate) fn stored_name(path: &Path) -> Option<std::ffi::OsString> {
+    let name = path.file_name()?;
+    if std::fs::symlink_metadata(path).ok()?.is_symlink() {
+        return None;
+    }
+    let identity = crate::organize::file_identity(path)?;
+    let folded = crate::name::nfc(name).to_lowercase();
+    let mut alias = None;
+    for item in std::fs::read_dir(path.parent()?).ok()?.flatten() {
+        let candidate = item.file_name();
+        if candidate == name {
+            return Some(candidate);
+        }
+        if crate::name::nfc(&candidate).to_lowercase() == folded
+            && crate::organize::file_identity(&item.path()) == Some(identity)
+        {
+            if alias.is_some() {
+                return None;
+            }
+            alias = Some(candidate);
+        }
+    }
+    alias
 }
 
 fn folder_id_at(
@@ -1031,7 +1265,122 @@ fn folder_id_at(
     Ok(id)
 }
 
+fn ensure_move_parent(
+    conn: &Connection,
+    drive_id: &str,
+    mount: &Path,
+    parent_names: &[std::ffi::OsString],
+) -> Result<Option<i64>> {
+    let Some(mut parent) = folder_id_at(conn, drive_id, mount, mount)? else {
+        return Ok(None);
+    };
+    for name in parent_names {
+        let raw = crate::name::raw_bytes(name);
+        let child = conn
+            .query_row(
+                "SELECT id FROM entry WHERE parent_id = ?1 AND name = ?2 AND kind = 'dir'",
+                params![parent, raw],
+                |row| row.get(0),
+            )
+            .optional()?;
+        parent = if let Some(child) = child {
+            child
+        } else {
+            clear_hash_up(conn, parent)?;
+            conn.query_row(
+                    "INSERT INTO entry (drive_id, parent_id, pos, name, name_nfc, kind, size,
+                                        cloud_only, other_volume, status, listed)
+                     VALUES (?1, ?2, COALESCE((SELECT MAX(pos) + 1 FROM entry WHERE parent_id = ?2), 0),
+                             ?3, ?4, 'dir', 0, 0, 0, 'unloaded', 0) RETURNING id",
+                    params![drive_id, parent, raw, crate::name::nfc(name)],
+                    |row| row.get(0),
+                )?
+        };
+    }
+    Ok(Some(parent))
+}
+
+pub(crate) fn save_moved_marker(
+    conn: &Connection,
+    path: &Path,
+    marker: &crate::merged::Marker,
+    metadata: &std::fs::Metadata,
+) -> Result<()> {
+    let drive_id = &marker.source.volume_id;
+    let mount: Option<String> = conn
+        .query_row(
+            "SELECT last_mount_path FROM drive WHERE id=?1",
+            [drive_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let (Some(mount), Some(parent), Some(name)) = (mount, path.parent(), path.file_name()) else {
+        return Ok(());
+    };
+    let mount = Path::new(&mount);
+    let parent = if let Some(id) = folder_id_at(conn, drive_id, mount, parent)? {
+        id
+    } else {
+        let Some(names) = stored_components(mount, parent) else {
+            return Ok(());
+        };
+        let Some(id) = ensure_move_parent(conn, drive_id, mount, &names)? else {
+            return Ok(());
+        };
+        id
+    };
+    let raw = crate::name::raw_bytes(name);
+    conn.execute(
+        "DELETE FROM entry WHERE parent_id=?1 AND name=?2 AND kind<>'file'",
+        params![parent, raw],
+    )?;
+    let json = serde_json::to_string(marker)
+        .map_err(|error| Error::ToSqlConversionFailure(Box::new(error)))?;
+    let size = metadata.len() as i64;
+    let mtime = crate::listing::mtime_ms(metadata);
+    let file_id = crate::listing::file_id(metadata).map(|id| id as i64);
+    // UPSERT の UPDATE はカタログのトリガー内の OR IGNORE を上書きするため、文を分ける。
+    let updated = conn.query_row(
+        "UPDATE entry SET size=?3, mtime=?4, file_id=?5, error=NULL, merged=?6, merged_verified=1
+         WHERE parent_id=?1 AND name=?2 RETURNING id",
+        params![parent, raw, size, mtime, file_id, json],
+        |row| row.get(0),
+    ).optional()?;
+    let id = if let Some(id) = updated {
+        id
+    } else {
+        conn.query_row(
+            "INSERT INTO entry (drive_id, parent_id, pos, name, name_nfc, kind, size, mtime,
+                                file_id, cloud_only, other_volume, status, listed, merged, merged_verified)
+             VALUES (?1, ?2, COALESCE((SELECT MAX(pos) + 1 FROM entry WHERE parent_id = ?2), 0),
+                     ?3, ?4, 'file', ?5, ?6, ?7, 0, 0, 'unloaded', 0, ?8, 1) RETURNING id",
+            params![drive_id, parent, raw, crate::name::nfc(name), size, mtime, file_id, json],
+            |row| row.get(0),
+        )?
+    };
+    clear_hash_up_for_move(conn, id)?;
+    bump_entry_move_version(conn)
+}
+
+fn bump_entry_move_version(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta VALUES ('entry_move_version', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    )?;
+    Ok(())
+}
+
 fn clear_hash_up(conn: &Connection, id: i64) -> Result<()> {
+    clear_hash_ancestors(conn, id, None)
+}
+
+fn clear_hash_up_for_move(conn: &Connection, id: i64) -> Result<()> {
+    clear_hash_ancestors(conn, id, Some(now_ms()))
+}
+
+fn clear_hash_ancestors(conn: &Connection, id: i64, enqueue_at: Option<i64>) -> Result<()> {
     let mut cur = Some(id);
     while let Some(i) = cur {
         cur = conn
@@ -1039,6 +1388,9 @@ fn clear_hash_up(conn: &Connection, id: i64) -> Result<()> {
             .query_row([i], |r| r.get(0))
             .optional()?
             .flatten();
+        if let Some(now) = enqueue_at {
+            hash_queue::enqueue(conn, i, HASH_CHANGED, now)?;
+        }
     }
     Ok(())
 }
@@ -1818,6 +2170,101 @@ mod tests {
         writer.conn.execute_batch("ROLLBACK").unwrap();
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn an_entry_created_while_waiting_for_the_db_lock_is_not_replaced() {
+        for reverse in [false, true] {
+            let tmp = TempDir::new("rename-collision");
+            let a = tmp.0.join("a");
+            let b = tmp.0.join("b");
+            fs::create_dir(&a).unwrap();
+            fs::create_dir(&b).unwrap();
+            let (from, to) = if reverse { (b, a) } else { (a, b) };
+            let src = from.join("source");
+            let dst = to.join("destination");
+            fs::write(&src, b"source").unwrap();
+            let db_path = tmp.0.join("test.db");
+            let locked = Db::open(&db_path).unwrap();
+            let mut mover = Db::open(&db_path).unwrap();
+            locked.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (ready, wait) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let src = &src;
+                let dst = &dst;
+                let mount = &tmp.0;
+                let task = scope.spawn(move || {
+                    assert!(!dst.exists());
+                    ready.send(()).unwrap();
+                    mover.rename_preserving_entry(
+                        "test:1",
+                        mount,
+                        src,
+                        dst,
+                        crate::organize::rename_without_replace,
+                    )
+                });
+                wait.recv().unwrap();
+                assert!(!task.is_finished());
+                fs::write(dst, b"external").unwrap();
+                locked.conn.execute_batch("COMMIT").unwrap();
+                assert_eq!(
+                    task.join().unwrap().unwrap_err().kind(),
+                    std::io::ErrorKind::AlreadyExists
+                );
+                assert_eq!(fs::read(src).unwrap(), b"source");
+                assert_eq!(fs::read(dst).unwrap(), b"external");
+            });
+        }
+    }
+
+    #[test]
+    fn scan_cannot_delete_the_row_between_rename_and_hash_preservation() {
+        let tmp = TempDir::new("rename-scan-lock");
+        let mount = tmp.0.join("mount");
+        fs::create_dir(&mount).unwrap();
+        let (src, dst) = (mount.join("old"), mount.join("new"));
+        fs::write(&src, b"data").unwrap();
+        let path = tmp.0.join("test.db");
+        let mut writer = Db::open(&path).unwrap();
+        let device = writer.this_device("test", "test", "test").unwrap();
+        writer.upsert_drive(&device, &volume(&mount)).unwrap();
+        writer
+            .save_listing("test:1", &mount, &mount, &Ok(read_dir(&mount).unwrap()))
+            .unwrap();
+        let root = writer.drive_root("test:1").unwrap().unwrap().id;
+        let old = writer.children(root).unwrap().remove(0);
+        writer
+            .set_hash(old.id, &[3; 32], old.size, old.mtime)
+            .unwrap();
+        let mut scan = Db::open(&path).unwrap();
+        scan.conn.busy_timeout(Duration::ZERO).unwrap();
+
+        let warning = writer
+            .rename_preserving_entry("test:1", &mount, &src, &dst, |src, dst| {
+                fs::rename(src, dst)?;
+                let listing = Ok(read_dir(&mount).unwrap());
+                let queued = scan.save_listing_at(
+                    "test:1",
+                    &mount,
+                    &mount,
+                    &listing,
+                    Some(scan.listing_version().unwrap()),
+                );
+                assert!(
+                    matches!(queued, Ok(ListingSave::Retry))
+                        || matches!(queued, Err(Error::SqliteFailure(err, _))
+                    if err.code == ErrorCode::DatabaseBusy)
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(warning.is_none());
+        let renamed = scan.children(root).unwrap().remove(0);
+        assert_eq!(renamed.name_nfc, "new");
+        assert_eq!(renamed.id, old.id);
+        assert_eq!(renamed.hash, Some([3; 32]));
+    }
+
     #[test]
     fn a_committed_rename_cannot_be_reverted_by_an_older_listing() {
         let tmp = TempDir::new("concurrent-rename");
@@ -1847,7 +2294,7 @@ mod tests {
         assert_eq!(diff.inserts.len(), 1);
         fs::rename(mount.join("old"), mount.join("new")).unwrap();
         writer
-            .save_listing("test:1", &mount, &mount, &read())
+            .move_entry("test:1", &mount, &mount.join("old"), &mount.join("new"))
             .unwrap();
         let error = diff
             .write(&tx, "test:1", root, &mut folders, HASH_CHANGED, now_ms())
@@ -1877,7 +2324,7 @@ mod tests {
             ));
             read()
         }).unwrap();
-        assert!(matches!(saved, ListingSave::Unchanged));
+        assert!(matches!(saved, ListingSave::Changed));
         writer.set_meta("writer", "released").unwrap();
         let rows = scan.children(root).unwrap();
         let entries = &current_listing.unwrap().entries;

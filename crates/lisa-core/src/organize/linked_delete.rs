@@ -158,6 +158,8 @@ struct Restored {
 struct Rewrite {
     link_id: String,
     identity: Identity,
+    #[serde(default)]
+    old_identity: Option<Identity>,
 }
 
 fn load_progress(db: &Db, op: &PlanOp) -> Result<Option<Progress>, String> {
@@ -339,6 +341,7 @@ pub(super) fn prepare_delete(
         links::apply(
             db,
             &links::Update {
+                previous_source: None,
                 marker: chosen.marker.clone(),
                 generation: chosen.generation + 1,
                 state: links::State::Removed,
@@ -564,44 +567,97 @@ fn rewrite_link(
     relay: Option<&str>,
     save: impl Fn(&Db, &Progress) -> Result<(), String>,
 ) -> Result<Option<PathBuf>, String> {
+    let mut updated = previous.marker.clone();
+    updated.target = target.clone();
+    rewrite_marker(
+        db, operation, previous, updated, None, progress, relay, save,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_marker(
+    db: &mut Db,
+    operation: &str,
+    previous: &links::Link,
+    updated: Marker,
+    relocated: Option<(&Path, Identity)>,
+    progress: &mut Progress,
+    relay: Option<&str>,
+    save: impl Fn(&Db, &Progress) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
     let (mut journal, path, old_identity) = owned_marker(db, &previous.marker)?;
+    let moved = relocated.is_some();
+    let (path, old_identity) = relocated.map_or((path, old_identity), |(path, identity)| {
+        (path.to_path_buf(), identity)
+    });
     let parent = path
         .parent()
         .ok_or("リンク元の親が見つかりません")?
         .to_path_buf();
-    if file_identity(&parent) != Some(journal.parent) {
+    if !moved && file_identity(&parent) != Some(journal.parent) {
         return Err(format!("リンク元の親が変わりました: {}", parent.display()));
-    }
-    let mut updated = previous.marker.clone();
-    updated.target = target.clone();
-    if journal.marker == updated {
-        verify_marker(&path, &updated, old_identity)?;
-        return Ok(Some(parent));
     }
     let link_id = &previous.marker.link_id;
     let staged = parent.join(format!(".lisa-restore-{operation}-{link_id}.tmp"));
     let backup = parent.join(format!(".lisa-restore-{operation}-{link_id}.old"));
-    let new_identity = if let Some(rewrite) = progress
+    let prior = progress
         .rewrites
         .iter()
-        .find(|item| &item.link_id == link_id)
-    {
+        .find(|item| &item.link_id == link_id);
+    if journal.marker == updated {
+        verify_marker(&path, &updated, old_identity)?;
+        if let Some(identity) = prior.and_then(|item| item.old_identity)
+            && file_identity(&backup) == Some(identity)
+            && verify_marker(&backup, &previous.marker, identity).is_ok()
+        {
+            fs::remove_file(backup).map_err(error)?;
+        }
+        return Ok(Some(parent));
+    }
+    let old_identity = prior
+        .and_then(|item| item.old_identity)
+        .unwrap_or(old_identity);
+    let new_identity = if let Some(rewrite) = prior {
         rewrite.identity
     } else {
         verify_marker(&path, &previous.marker, old_identity)?;
-        let mut file = OpenOptions::new()
+        match OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staged)
-            .map_err(error)?;
-        file.write_all(&serde_json::to_vec_pretty(&updated).map_err(error)?)
-            .map_err(error)?;
-        file.sync_all().map_err(error)?;
-        drop(file);
+        {
+            Ok(mut file) => {
+                let owned = file_identity(&staged);
+                let written = (|| {
+                    file.write_all(&serde_json::to_vec_pretty(&updated).map_err(error)?)
+                        .map_err(error)?;
+                    if let Ok(modified) = fs::metadata(&path).and_then(|meta| meta.modified()) {
+                        file.set_modified(modified).map_err(error)?;
+                    }
+                    file.sync_all().map_err(error)
+                })();
+                drop(file);
+                if let Err(reason) = written {
+                    if owned.is_some() && file_identity(&staged) == owned {
+                        let _ = fs::remove_file(&staged);
+                    }
+                    return Err(reason);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                let identity = file_identity(&staged).ok_or("新しいリンクを識別できません")?;
+                verify_marker(&staged, &updated, identity)?;
+                fs::File::open(&staged)
+                    .and_then(|file| file.sync_all())
+                    .map_err(error)?;
+            }
+            Err(err) => return Err(error(err)),
+        }
         let identity = file_identity(&staged).ok_or("新しいリンクを識別できません")?;
         progress.rewrites.push(Rewrite {
             link_id: link_id.clone(),
             identity,
+            old_identity: Some(old_identity),
         });
         save(db, progress)?;
         identity
@@ -615,17 +671,99 @@ fn rewrite_link(
         apply::rename_without_replace(&staged, &path).map_err(error)?;
     }
     verify_marker(&path, &updated, new_identity)?;
+    let path = Location::local_for_path(db, &path)
+        .map_or(path, |location| PathBuf::from(location.display_path));
     journal.marker = updated.clone();
+    journal.parent = file_identity(&parent).ok_or("リンク元の親を識別できません")?;
+    let metadata = fs::symlink_metadata(&path).map_err(error)?;
     journal.state = markers::State::Published {
-        path,
+        path: path.clone(),
         identity: new_identity,
     };
-    let tx = db.conn_mut().transaction().map_err(error)?;
-    links::retarget(&tx, previous, &updated, relay)?;
-    markers::save_journal(&tx, &journal)?;
-    tx.commit().map_err(error)?;
+    let persist = (|| {
+        let tx = db.conn_mut().transaction().map_err(error)?;
+        if previous.marker.source != updated.source && previous.marker.target == updated.target {
+            links::move_source(&tx, previous, &updated, relay)?;
+        } else {
+            links::retarget(&tx, previous, &updated, relay)?;
+        }
+        markers::save_journal(&tx, &journal)?;
+        crate::db::save_moved_marker(&tx, &path, &updated, &metadata).map_err(error)?;
+        tx.commit().map_err(error)
+    })();
+    if let Err(reason) = persist {
+        if let markers::State::Published { path, .. } = &journal.state
+            && verify_marker(path, &updated, new_identity).is_ok()
+            && verify_marker(&backup, &previous.marker, old_identity).is_ok()
+            && apply::rename_without_replace(path, &staged).is_ok()
+        {
+            apply::rename_without_replace(&backup, path)
+                .map_err(|rollback| format!("{reason}／元の目印を戻せません: {rollback}"))?;
+        }
+        return Err(reason);
+    }
     fs::remove_file(backup).map_err(error)?;
     Ok(Some(parent))
+}
+
+pub(super) fn rewrite_moved_link(
+    db: &mut Db,
+    operation: &str,
+    previous: &links::Link,
+    updated: Marker,
+    relocated: Option<(&Path, Identity)>,
+    relay: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let link_id = &previous.marker.link_id;
+    let record: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT progress FROM merged_link_rewrite WHERE operation_id=?1 AND link_id=?2",
+            params![operation, link_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(error)?;
+    let mut progress = record
+        .map(|json| serde_json::from_str(&json).map_err(error))
+        .transpose()?
+        .unwrap_or(Progress {
+            links: Vec::new(),
+            destination: None,
+            rewrites: Vec::new(),
+            chosen_removed: false,
+            peer_published: false,
+        });
+    let touched = rewrite_marker(
+        db,
+        operation,
+        previous,
+        updated,
+        relocated,
+        &mut progress,
+        relay,
+        |db, progress| {
+            db.conn()
+                .execute(
+                    "INSERT INTO merged_link_rewrite VALUES (?1,?2,?3)
+                 ON CONFLICT(operation_id,link_id) DO UPDATE SET progress=excluded.progress",
+                    params![
+                        operation,
+                        link_id,
+                        serde_json::to_string(progress).map_err(error)?
+                    ],
+                )
+                .map_err(error)?;
+            Ok(())
+        },
+    )?;
+    db.conn()
+        .execute(
+            "DELETE FROM merged_link_rewrite WHERE operation_id=?1 AND link_id=?2",
+            params![operation, link_id],
+        )
+        .map_err(error)?;
+    Ok(touched)
 }
 
 fn owned_marker(db: &Db, marker: &Marker) -> Result<(markers::Journal, PathBuf, Identity), String> {
@@ -643,7 +781,11 @@ fn owned_marker(db: &Db, marker: &Marker) -> Result<(markers::Journal, PathBuf, 
     Ok((journal, path, identity))
 }
 
-fn verify_marker(path: &Path, marker: &Marker, identity: Identity) -> Result<(), String> {
+pub(super) fn verify_marker(
+    path: &Path,
+    marker: &Marker,
+    identity: Identity,
+) -> Result<(), String> {
     let expected = serde_json::to_vec_pretty(marker).map_err(error)?;
     let bytes = fs::symlink_metadata(path)
         .ok()
@@ -824,6 +966,9 @@ pub enum TransferAction {
     Repoint {
         chosen: Marker,
     },
+    Retarget {
+        target: Location,
+    },
     AddSource {
         source: Marker,
         generation: i64,
@@ -835,6 +980,8 @@ pub struct TransferReply {
     pub offsets: Vec<u64>,
     pub received: u64,
     pub published: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_source: Option<Location>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -857,9 +1004,16 @@ const MAX_RECEIVES: i64 = 8;
 
 pub fn receive_transfer(
     db: &mut Db,
+    data_dir: &Path,
     relay: &str,
     request: &TransferRequest,
-) -> Result<TransferReply, String> {
+) -> Result<(TransferReply, Option<PathBuf>), String> {
+    // 目印の移動とリモートからの目印更新が同じファイルを触らないようにする。
+    let _plan_lock = if matches!(request.action, TransferAction::Retarget { .. }) {
+        Some(apply::try_lock_plans(data_dir)?)
+    } else {
+        None
+    };
     // 同じ操作に並行して届く小分けが、記録した進み具合を互いに上書きしないよう 1 件ずつ受ける。
     // 別の操作（別の戻し）は待たせない。
     type Locks = std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>;
@@ -874,7 +1028,15 @@ pub fn receive_transfer(
             .clone()
     };
     let _receiving = lock.lock().unwrap_or_else(|error| error.into_inner());
-    receive_transfer_locked(db, relay, request)
+    let reply = receive_transfer_locked(db, relay, request)?;
+    let touched = if reply.published && matches!(request.action, TransferAction::Retarget { .. }) {
+        owned_marker(db, &request.marker)
+            .ok()
+            .and_then(|(_, path, _)| path.parent().map(Path::to_path_buf))
+    } else {
+        None
+    };
+    Ok((reply, touched))
 }
 
 fn receive_transfer_locked(
@@ -885,6 +1047,7 @@ fn receive_transfer_locked(
     if uuid::Uuid::parse_str(&request.operation_id)
         .ok()
         .is_none_or(|id| id.is_nil() || id.to_string() != request.operation_id)
+        || !(1..i64::MAX).contains(&request.generation)
         || !(0..=120_000).contains(&request.expires_at.saturating_sub(crate::db::now_ms()))
     {
         return Err("転送許可の操作 ID または期限が正しくありません".into());
@@ -892,6 +1055,9 @@ fn receive_transfer_locked(
     let marker = &request.marker;
     if let TransferAction::Repoint { chosen } = &request.action {
         return receive_repoint(db, relay, request, chosen);
+    }
+    if let TransferAction::Retarget { target } = &request.action {
+        return receive_retarget(db, relay, request, target);
     }
     // 片付けられなかった一時フォルダは次回に回す（転送は止めない）。
     clean_expired_receives(db)?;
@@ -917,6 +1083,7 @@ fn receive_transfer_locked(
             published: true,
             received: marker.size,
             offsets: Vec::new(),
+            moved_source: None,
         });
     }
     let (current, generation, allowed_relay) =
@@ -992,7 +1159,9 @@ fn receive_transfer_locked(
     let stage = state.directory.join("entry");
     let mut reply = TransferReply::default();
     match &request.action {
-        TransferAction::Inspect | TransferAction::Repoint { .. } => unreachable!(),
+        TransferAction::Inspect
+        | TransferAction::Repoint { .. }
+        | TransferAction::Retarget { .. } => unreachable!(),
         TransferAction::Begin { manifest } => {
             if &state.manifest != manifest {
                 if state.staged_identity.is_some() {
@@ -1098,6 +1267,7 @@ fn receive_transfer_locked(
                 links::apply(
                     db,
                     &links::Update {
+                        previous_source: None,
                         marker: source.clone(),
                         generation: 1,
                         state: links::State::Reserved,
@@ -1109,6 +1279,7 @@ fn receive_transfer_locked(
             links::apply(
                 db,
                 &links::Update {
+                    previous_source: None,
                     marker: source.clone(),
                     generation: *generation,
                     state: links::State::Active,
@@ -1149,6 +1320,79 @@ fn receive_transfer_locked(
     Ok(reply)
 }
 
+fn receive_retarget(
+    db: &mut Db,
+    relay: &str,
+    request: &TransferRequest,
+    target: &Location,
+) -> Result<TransferReply, String> {
+    let mut updated = links::retargeted_marker(&request.marker, target)?;
+    let old = &request.marker;
+    if request.generation >= i64::MAX - 1
+        || db.meta("this_device").map_err(error)?.as_deref() != Some(&old.source.device_id)
+    {
+        return Err("目印を持つ端末または世代が一致しません".into());
+    }
+    let (mut previous, allowed) =
+        links::active_link(db, &old.link_id)?.ok_or("目印が確定していません")?;
+    if allowed.as_deref() != Some(relay) {
+        return Err("目印の中継端末が一致しません".into());
+    }
+
+    let mut moved_source = None;
+    if previous.marker.source != old.source {
+        let source_generation = request.generation + 1;
+        let mut source_only = old.clone();
+        source_only.source = previous.marker.source.clone();
+        updated.source = source_only.source.clone();
+        let accepted = previous.marker == updated && previous.generation == source_generation + 1;
+        let queued =
+            links::pending_source(db, &old.link_id, source_generation)?.is_some_and(|update| {
+                update.generation == source_generation
+                    && update.marker == source_only
+                    && update.previous_source.as_ref() == Some(&old.source)
+            });
+        if !accepted
+            && !(queued
+                && previous.marker == source_only
+                && previous.generation == source_generation
+                && previous.sync_state == "pending")
+        {
+            return Err("目印の移動前の本文を確認できません".into());
+        }
+        moved_source = Some(updated.source.clone());
+        if accepted {
+            previous.marker = source_only;
+            previous.generation = source_generation;
+        }
+    } else if previous.marker == updated && previous.generation == request.generation + 1 {
+        previous.marker = old.clone();
+        previous.generation = request.generation;
+    } else if previous.marker != *old
+        || previous.generation != request.generation
+        || previous.sync_state != "confirmed"
+    {
+        return Err("目印の世代が一致しません".into());
+    }
+
+    rewrite_moved_link(
+        db,
+        &request.operation_id,
+        &previous,
+        updated,
+        None,
+        Some(relay),
+    )?;
+    if moved_source.is_some() {
+        links::acknowledge_merged_source(db, &old.link_id, request.generation + 1)?;
+    }
+    Ok(TransferReply {
+        published: true,
+        moved_source,
+        ..TransferReply::default()
+    })
+}
+
 fn receive_repoint(
     db: &mut Db,
     relay: &str,
@@ -1173,25 +1417,6 @@ fn receive_repoint(
     {
         return Err("付け替えの世代または中継端末が一致しません".into());
     }
-    let record: Option<String> = db
-        .conn()
-        .query_row(
-            "SELECT progress FROM merged_link_rewrite WHERE operation_id=?1 AND link_id=?2",
-            params![request.operation_id, old.link_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(error)?;
-    let mut progress = record
-        .map(|json| serde_json::from_str::<Progress>(&json).map_err(error))
-        .transpose()?
-        .unwrap_or(Progress {
-            links: Vec::new(),
-            destination: None,
-            rewrites: Vec::new(),
-            chosen_removed: false,
-            peer_published: false,
-        });
     let previous = links::Link {
         marker: old.clone(),
         generation: request.generation,
@@ -1200,39 +1425,19 @@ fn receive_repoint(
         sync_state: "confirmed".into(),
         sync_reason: None,
     };
-    rewrite_link(
+    rewrite_moved_link(
         db,
         &request.operation_id,
         &previous,
-        &chosen.source,
-        &mut progress,
+        updated,
+        None,
         Some(relay),
-        |db, progress| {
-            db.conn()
-                .execute(
-                    "INSERT INTO merged_link_rewrite VALUES (?1,?2,?3)
-             ON CONFLICT(operation_id,link_id) DO UPDATE SET progress=excluded.progress",
-                    params![
-                        request.operation_id,
-                        old.link_id,
-                        serde_json::to_string(progress).map_err(error)?
-                    ],
-                )
-                .map_err(error)?;
-            Ok(())
-        },
     )?;
-    // 再送は目印の中身が一致することで済むので、進み具合の記録は残さない。
-    db.conn()
-        .execute(
-            "DELETE FROM merged_link_rewrite WHERE operation_id=?1 AND link_id=?2",
-            params![request.operation_id, old.link_id],
-        )
-        .map_err(error)?;
     Ok(TransferReply {
         published: true,
         received: 0,
         offsets: Vec::new(),
+        moved_source: None,
     })
 }
 

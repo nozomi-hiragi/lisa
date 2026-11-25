@@ -3,11 +3,14 @@
 //! - 計画を作って DB（`plan`、`plan_op`）に残すところまでは、ファイルに一切触らない。
 //! - 人が許可した計画だけを `mkdir` → `move` → `trash` の順に 1 件ずつ記録しながら実行する。
 //! - 消す操作はまず同じボリュームの隔離フォルダ（`<data_dir>/trash` または `<ドライブ>/.lisa-trash`）へ移す。
-//! - `entry` の表には直接書かず、触ったフォルダの一覧（`touched_folders`）を返す。
+//! - 同じドライブ内の移動は `entry` を引き継ぎ、再走査するフォルダの一覧を返す。
 
 mod apply;
+#[cfg(test)]
+pub(crate) use apply::rename_without_replace;
 mod check;
 mod linked_delete;
+mod linked_move;
 pub(crate) mod markers;
 mod plan;
 mod quarantine;
@@ -328,6 +331,108 @@ mod tests {
         }
     }
 
+    fn entry_at(h: &Harness, path: &Path) -> crate::db::Stored {
+        let loc = query::locate(&h.db, path).unwrap().unwrap();
+        h.db.entry(*loc.chain.last().unwrap()).unwrap().unwrap()
+    }
+
+    fn assert_no_file_hashes(h: &mut Harness) {
+        let mut count = 0;
+        hash::hash_drive(
+            &mut h.db,
+            "test:vol1",
+            &h.drive,
+            2,
+            &mut |event| count += usize::from(matches!(event, hash::Event::File { .. })),
+            &Pace::FREE,
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    fn approve_and_move(h: &mut Harness, from: &Path, to: &Path) -> i64 {
+        let created = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "test",
+            None,
+            &[OpInput::Move {
+                from: from.to_owned(),
+                to: to.to_owned(),
+            }],
+            false,
+        )
+        .unwrap();
+        let id = created.id.unwrap_or_else(|| panic!("{:?}", created.checks));
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+        id
+    }
+
+    #[test]
+    fn moving_hashed_subtrees_updates_only_ancestor_hashes() {
+        let mut h = Harness::new("move-merkle");
+        let source = h.drive.join("from");
+        let destination = h.drive.join("to");
+        let tree = source.join("tree");
+        let moved_tree = destination.join("moved");
+        let leaf = tree.join("nested/item.txt");
+        let moved_leaf = moved_tree.join("nested/item.txt");
+        let renamed_leaf = source.join("renamed.txt");
+        fs::create_dir_all(leaf.parent().unwrap()).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(&leaf, b"preserved").unwrap();
+        fs::write(destination.join("z.txt"), b"sort order").unwrap();
+        h.scan(true);
+        let entry = entry_at(&h, &leaf);
+        let subtree = entry_at(&h, &tree);
+        let before = [&source, &destination, &h.drive].map(|path| entry_at(&h, path).hash);
+        let folder_move = approve_and_move(&mut h, &tree, &moved_tree);
+        assert_eq!(entry_at(&h, &moved_leaf).id, entry.id);
+        assert_eq!(entry_at(&h, &moved_leaf).hash, entry.hash);
+        assert_eq!(entry_at(&h, &moved_tree).hash, subtree.hash);
+        // 一覧の再走査やキューの再構築を待たず、変更された祖先を集約できる。
+        let mut hashed = std::collections::BTreeSet::new();
+        loop {
+            let batch = hash::hash_queue_batch_checked(
+                &mut h.db,
+                &[("test:vol1", &h.drive)],
+                crate::db::HASH_CHANGED,
+                &Pace::FREE,
+                |_, _| true,
+            )
+            .unwrap();
+            assert!(batch.files.is_empty());
+            if batch.picked == 0 {
+                break;
+            }
+            hashed.extend(batch.folders);
+        }
+        assert_eq!(
+            hashed,
+            [&source, &destination, &h.drive]
+                .into_iter()
+                .cloned()
+                .collect()
+        );
+        assert_no_file_hashes(&mut h);
+        for (path, old) in [&source, &destination, &h.drive].into_iter().zip(before) {
+            let updated = entry_at(&h, path).hash;
+            assert!(updated.is_some());
+            assert_ne!(updated, old);
+        }
+
+        let file_move = approve_and_move(&mut h, &moved_leaf, &renamed_leaf);
+        assert_eq!(entry_at(&h, &renamed_leaf).hash, entry.hash);
+        assert_no_file_hashes(&mut h);
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, file_move).unwrap().undone, 1);
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, folder_move).unwrap().undone, 1);
+        h.scan(false);
+        assert_no_file_hashes(&mut h);
+        assert_eq!(entry_at(&h, &leaf).id, entry.id);
+        assert_eq!(entry_at(&h, &h.drive).hash, before[2]);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn case_only_rename_and_undo_on_case_insensitive_volume() {
@@ -376,11 +481,13 @@ mod tests {
             }
             assert_names("A.txt");
             assert_eq!(fs::read(&upper).unwrap(), b"original");
-            h.scan(true);
+            assert!(entry_at(&h, &upper).hash.is_some());
+            assert_no_file_hashes(&mut h);
             let report = undo_plan(&mut h.db, &h.ctx, id).unwrap();
             assert_eq!(report.undone, 1, "{report:?}");
             assert_names("a.txt");
             assert_eq!(fs::read(&lower).unwrap(), b"original");
+            assert_no_file_hashes(&mut h);
         }
     }
 
@@ -445,6 +552,11 @@ mod tests {
         let report = result.expect("ハッシュ中でも名前を変更できる");
         assert_eq!(report.done, 1, "{report:?}");
         assert_eq!(fs::read(&to).unwrap(), b"rename me");
+        assert!(entry_at(&h, &to).hash.is_some());
+        // 古い一覧から集めた名前でルートハッシュを確定していないこと。
+        assert!(entry_at(&h, &h.drive).hash.is_none());
+        h.scan(true);
+        assert!(entry_at(&h, &h.drive).hash.is_some());
     }
 
     #[cfg(unix)]
@@ -645,6 +757,9 @@ mod tests {
         assert_eq!(report.state, PlanState::Done);
         assert_eq!(report.done, 3);
         assert!(dst.exists() && !src.exists() && !dup1.exists());
+        assert!(entry_at(&h, &dst).hash.is_some());
+        h.scan(false);
+        assert_no_file_hashes(&mut h);
 
         // 取り消しは trash → move → mkdir の順なので、sub も archive も空になって消える。
         let undo = undo_plan(&mut h.db, &h.ctx, id).unwrap();
@@ -985,6 +1100,10 @@ mod tests {
         assert!(!a.exists() && a2.exists());
         assert!(!b.exists() && b2.exists());
         assert!(!c.exists() && c2.exists());
+        for path in [&a2, &b2, &c2] {
+            assert!(entry_at(&h, path).hash.is_some());
+        }
+        assert_no_file_hashes(&mut h);
     }
 
     fn execute_moves_for_undo(h: &mut Harness) -> i64 {
@@ -1534,6 +1653,384 @@ mod tests {
         );
     }
 
+    fn publish_marker(h: &mut Harness, source: &Path, keep: &Path) -> i64 {
+        let created = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "test",
+            None,
+            &[OpInput::Trash {
+                path: source.to_owned(),
+                keep: Some(keep.to_owned()),
+            }],
+            false,
+        )
+        .unwrap();
+        let id = created.id.unwrap_or_else(|| panic!("{:?}", created.checks));
+        approve_plan(&mut h.db, id, false).unwrap();
+        assert_eq!(execute_plan(&mut h.db, &h.ctx, id).unwrap().done, 1);
+        h.scan(true);
+        id
+    }
+
+    #[test]
+    fn undo_discovers_new_links_and_recovers_after_rename() {
+        for interrupted in [false, true] {
+            let mut h = Harness::new("undo-new-links");
+            let original = h.drive.join("old");
+            let moved = h.drive.join("moved");
+            let copy = h.drive.join("copy");
+            for path in [&original, &copy] {
+                fs::write(path, b"same").unwrap();
+            }
+            h.scan(true);
+            let id = approve_and_move(&mut h, &original, &moved);
+            h.scan(true);
+            publish_marker(&mut h, &copy, &moved);
+            let path = h.drive.join("copy.lmf");
+            let marker = crate::merged::read(&path).unwrap();
+            h.db.conn()
+                .execute(
+                    "UPDATE merged_link SET sync_state='pending' WHERE link_id=?1",
+                    [&marker.link_id],
+                )
+                .unwrap();
+            let postponed = undo_plan(&mut h.db, &h.ctx, id).unwrap();
+            assert_eq!(postponed.undone, 0);
+            assert_eq!(postponed.state, PlanState::Done);
+            assert!(moved.exists());
+            h.db.conn()
+                .execute(
+                    "UPDATE merged_link SET sync_state='confirmed' WHERE link_id=?1",
+                    [&marker.link_id],
+                )
+                .unwrap();
+            if interrupted {
+                let op = plan_ops(&h.db, id).unwrap().remove(0);
+                super::linked_move::prepare_undo(&h.db, &op, &moved).unwrap();
+                fs::rename(&moved, &original).unwrap();
+            }
+            assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+            let marker = crate::merged::read(&path).unwrap();
+            assert_eq!(marker.target.relative_path, ["old"]);
+            assert!(crate::merged::resolve_target(&h.db, &marker).is_ok());
+            assert_no_file_hashes(&mut h);
+        }
+    }
+
+    #[test]
+    fn periodic_flush_retries_a_local_rewrite_after_an_io_failure() {
+        let mut h = Harness::new("move-rewrite-retry");
+        let old = h.drive.join("old");
+        let new = h.drive.join("moved");
+        let copy = h.drive.join("copy");
+        for path in [&old, &copy] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        let merge = publish_marker(&mut h, &copy, &old);
+        let path = h.drive.join("copy.lmf");
+        let original = crate::merged::read(&path).unwrap();
+        let blocked = h.drive.join(format!(
+            ".lisa-restore-move-{}-0-0-{}.tmp",
+            merge + 1,
+            original.link_id
+        ));
+        fs::write(&blocked, b"external").unwrap();
+        let id = approve_and_move(&mut h, &old, &new);
+        assert_eq!(id, merge + 1);
+        assert_eq!(crate::merged::read(&path).unwrap(), original);
+        flush_links(&mut h.db, &h.ctx).unwrap();
+        fs::remove_file(blocked).unwrap();
+        // 別接続で再開しても、永続化した書き換えを続けられる。
+        let mut reopened = Db::open(&h.data_dir.join("lisa.db")).unwrap();
+        flush_links(&mut reopened, &h.ctx).unwrap();
+        let updated = crate::merged::read(&path).unwrap();
+        assert_eq!(updated.target.relative_path, ["moved"]);
+        assert!(crate::merged::resolve_target(&reopened, &updated).is_ok());
+    }
+
+    #[test]
+    fn deletion_check_preserves_a_remote_rewrite_between_backup_and_publish() {
+        let mut h = Harness::new("remote-rewrite-recovery");
+        let old = h.drive.join("old");
+        let new = h.drive.join("moved");
+        let copy = h.drive.join("copy");
+        for path in [&old, &copy] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        publish_marker(&mut h, &copy, &old);
+        let path = h.drive.join("copy.lmf");
+        let original = crate::merged::read(&path).unwrap();
+        h.db.conn()
+            .execute(
+                "UPDATE merged_link SET relay_device='relay' WHERE link_id=?1",
+                [&original.link_id],
+            )
+            .unwrap();
+        let (link, _) = crate::merged::links::active_link(&h.db, &original.link_id)
+            .unwrap()
+            .unwrap();
+        let target = crate::merged::Location::local_for_path(&h.db, &new).unwrap();
+        let updated = crate::merged::links::retargeted_marker(&original, &target).unwrap();
+        let operation = uuid::Uuid::new_v4().to_string();
+        let staged = path.with_file_name(format!(
+            ".lisa-restore-{operation}-{}.tmp",
+            original.link_id
+        ));
+        let backup = path.with_file_name(format!(
+            ".lisa-restore-{operation}-{}.old",
+            original.link_id
+        ));
+        fs::write(&staged, serde_json::to_vec_pretty(&updated).unwrap()).unwrap();
+        let progress = serde_json::json!({
+            "links": [], "destination": null, "chosen_removed": false,
+            "rewrites": [{"link_id": original.link_id, "identity": file_identity(&staged).unwrap(),
+                          "old_identity": file_identity(&path).unwrap()}]
+        });
+        h.db.conn()
+            .execute(
+                "INSERT INTO merged_link_rewrite VALUES (?1,?2,?3)",
+                rusqlite::params![operation, original.link_id, progress.to_string()],
+            )
+            .unwrap();
+        fs::rename(&path, &backup).unwrap();
+        flush_links(&mut h.db, &h.ctx).unwrap();
+        assert!(
+            crate::merged::links::active_link(&h.db, &original.link_id)
+                .unwrap()
+                .is_some()
+        );
+        let request = TransferRequest {
+            operation_id: operation,
+            marker: original,
+            generation: link.generation,
+            expires_at: crate::db::now_ms() + 60_000,
+            action: TransferAction::Retarget { target },
+        };
+        let (reply, _) = receive_transfer(&mut h.db, &h.data_dir, "relay", &request).unwrap();
+        assert!(reply.published);
+        assert_eq!(crate::merged::read(&path).unwrap(), updated);
+        assert!(!backup.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retarget_uses_the_stored_names_of_destination_ancestors() {
+        let mut h = Harness::new("normalized-destination");
+        let old = h.drive.join("old");
+        let copy = h.drive.join("copy");
+        let parent = h.drive.join("Café").join("Child");
+        fs::create_dir_all(&parent).unwrap();
+        for path in [&old, &copy] {
+            fs::write(path, b"same").unwrap();
+        }
+        let alias = h.drive.join("CAFÉ").join("child");
+        if !alias.is_dir() {
+            return;
+        }
+        h.scan(true);
+        publish_marker(&mut h, &copy, &old);
+        let moved = alias.join("moved");
+        let id = approve_and_move(&mut h, &old, &moved);
+        let marker = crate::merged::read(&h.drive.join("copy.lmf")).unwrap();
+        assert_eq!(
+            marker.target.display_path,
+            parent.join("moved").to_str().unwrap()
+        );
+        assert!(crate::merged::resolve_target(&h.db, &marker).is_ok());
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+    }
+
+    #[test]
+    fn moving_targets_updates_the_marker_and_undo_reverses_it() {
+        for (directory, parent) in [(false, false), (true, false), (false, true)] {
+            let mut h = Harness::new("move-target");
+            let old = h.drive.join("old");
+            let new = h.drive.join("new");
+            let source = h.drive.join("copy");
+            let keep = if parent {
+                old.join("keep")
+            } else {
+                old.clone()
+            };
+            if directory {
+                for path in [&source, &keep] {
+                    fs::create_dir(path).unwrap();
+                    fs::write(path.join("item"), b"same").unwrap();
+                }
+            } else {
+                if parent {
+                    fs::create_dir(&old).unwrap();
+                }
+                for path in [&source, &keep] {
+                    fs::write(path, b"same").unwrap();
+                }
+            }
+            h.scan(true);
+            publish_marker(&mut h, &source, &keep);
+            let marker_path = h
+                .drive
+                .join(if directory { "copy.lmd" } else { "copy.lmf" });
+            let id = approve_and_move(&mut h, &old, &new);
+            let marker = crate::merged::read(&marker_path).unwrap();
+            assert_eq!(
+                marker.target.relative_path,
+                if parent {
+                    vec!["new", "keep"]
+                } else {
+                    vec!["new"]
+                }
+            );
+            assert!(crate::merged::resolve_target(&h.db, &marker).is_ok());
+            assert!(entry_at(&h, &marker_path).merged_verified);
+            assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+            let restored = crate::merged::read(&marker_path).unwrap();
+            assert_eq!(restored.target.relative_path[0], "old");
+            assert!(crate::merged::resolve_target(&h.db, &restored).is_ok());
+        }
+    }
+
+    #[test]
+    fn recovery_retargets_the_marker_after_filesystem_move() {
+        let mut h = Harness::new("recover-linked-move");
+        let keep = h.drive.join("keep");
+        let source = h.drive.join("copy");
+        let moved = h.drive.join("moved");
+        for path in [&keep, &source] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        publish_marker(&mut h, &source, &keep);
+        let id = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "test",
+            None,
+            &[OpInput::Move {
+                from: keep.clone(),
+                to: moved.clone(),
+            }],
+            false,
+        )
+        .unwrap()
+        .id
+        .unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        let op = plan_ops(&h.db, id).unwrap().remove(0);
+        super::linked_move::prepare(&h.db, &op).unwrap();
+        plan::set_plan_state(&mut h.db, id, PlanState::Running, None).unwrap();
+        plan::set_op_state(&mut h.db, id, 0, OpState::Running, None, None, None).unwrap();
+        fs::rename(&keep, &moved).unwrap();
+
+        let reports = recover_running_plans(&mut h.db, &h.ctx).unwrap();
+        assert_eq!(reports[0].done, 1);
+        let path = h.drive.join("copy.lmf");
+        let marker = crate::merged::read(&path).unwrap();
+        assert_eq!(marker.target.relative_path, ["moved"]);
+        assert!(crate::merged::resolve_target(&h.db, &marker).is_ok());
+        assert!(reports[0].touched_folders.contains(&h.drive));
+        assert_no_file_hashes(&mut h);
+    }
+
+    #[test]
+    fn a_marker_moved_before_a_crash_is_recovered_without_being_removed() {
+        let mut h = Harness::new("recover-marker-move");
+        let keep = h.drive.join("keep");
+        let source = h.drive.join("copy");
+        for path in [&keep, &source] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        publish_marker(&mut h, &source, &keep);
+        let original = h.drive.join("copy.lmf");
+        let moved = h.drive.join("renamed.lmf");
+        let created = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "test",
+            None,
+            &[OpInput::Move {
+                from: original.clone(),
+                to: moved.clone(),
+            }],
+            false,
+        )
+        .unwrap();
+        let id = created.id.unwrap();
+        approve_plan(&mut h.db, id, false).unwrap();
+        let op = plan_ops(&h.db, id).unwrap().remove(0);
+        super::linked_move::prepare(&h.db, &op).unwrap();
+        plan::set_plan_state(&mut h.db, id, PlanState::Running, None).unwrap();
+        plan::set_op_state(&mut h.db, id, 0, OpState::Running, None, None, None).unwrap();
+        fs::rename(original, &moved).unwrap();
+
+        flush_links(&mut h.db, &h.ctx).unwrap();
+        assert_eq!(recover_running_plans(&mut h.db, &h.ctx).unwrap()[0].done, 1);
+        let recovered = crate::merged::read(&moved).unwrap();
+        assert_eq!(recovered.source.relative_path, ["renamed"]);
+        assert!(entry_at(&h, &moved).merged_verified);
+    }
+
+    #[test]
+    fn moving_verified_markers_updates_their_source_and_original_undo() {
+        let mut h = Harness::new("move-marker");
+        let keep = h.drive.join("keep");
+        let source = h.drive.join("copy");
+        let folder = h.drive.join("folder");
+        let relocated = h.drive.join("relocated");
+        fs::create_dir(&folder).unwrap();
+        for path in [&source, &keep] {
+            fs::write(path, b"same").unwrap();
+        }
+        h.scan(true);
+        let trash = publish_marker(&mut h, &source, &keep);
+        // アプリではカタログの再評価トリガーも同じ DB で動く。
+        crate::catalog::db::IncrementalMatches::default()
+            .refresh(&h.db, &h.ctx.catalogs, true)
+            .unwrap();
+        let marker = h.drive.join("copy.lmf");
+        let within = folder.join("copy.lmf");
+        let move_id = approve_and_move(&mut h, &marker, &within);
+        let renamed = folder.join("renamed.lmf");
+        let rename_id = approve_and_move(&mut h, &within, &renamed);
+        h.scan(false);
+        let folder_id = approve_and_move(&mut h, &folder, &relocated);
+        let final_marker = relocated.join("renamed.lmf");
+        assert!(entry_at(&h, &final_marker).merged_verified);
+        let current = crate::merged::read(&final_marker).unwrap();
+        assert_eq!(current.source.relative_path, ["relocated", "renamed"]);
+        flush_links(&mut h.db, &h.ctx).unwrap();
+        assert_eq!(
+            crate::merged::links::sources_for_entry(&h.db, entry_at(&h, &keep).id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let refused = create_plan(
+            &mut h.db,
+            &h.ctx,
+            "test",
+            None,
+            &[OpInput::Move {
+                from: final_marker.clone(),
+                to: relocated.join("renamed.txt"),
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(!refused.created);
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, folder_id).unwrap().undone, 1);
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, rename_id).unwrap().undone, 1);
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, move_id).unwrap().undone, 1);
+        assert!(entry_at(&h, &marker).merged_verified);
+        approve_and_move(&mut h, &marker, &within);
+        assert_eq!(undo_plan(&mut h.db, &h.ctx, trash).unwrap().undone, 1);
+        assert!(!within.exists());
+        assert_eq!(fs::read(source).unwrap(), b"same");
+    }
+
     #[test]
     fn folder_target_remains_verifiable_after_a_child_becomes_a_link() {
         let mut h = Harness::new("merge-nested-marker");
@@ -1863,6 +2360,60 @@ mod tests {
         use super::*;
         use apply::timestamp_test::{FAIL_STAGING_CLEANUP, FAULT, FORCE_COPY};
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn copied_target_and_undo_retarget_the_marker() {
+            let mut h = Harness::new("copy-linked-target");
+            let keep = h.drive.join("keep");
+            let copy = h.drive.join("copy");
+            let folder = h.drive.join("folder");
+            let moved = folder.join("new");
+            fs::create_dir(&folder).unwrap();
+            for path in [&keep, &copy] {
+                fs::write(path, b"same").unwrap();
+            }
+            h.scan(true);
+            publish_marker(&mut h, &copy, &keep);
+            FORCE_COPY.set(true);
+            let id = approve_and_move(&mut h, &keep, &moved);
+            assert!(query::locate(&h.db, &moved).unwrap().is_none());
+            h.scan(true);
+            let marker_path = h.drive.join("copy.lmf");
+            let marker = crate::merged::read(&marker_path).unwrap();
+            assert_eq!(marker.target.relative_path, ["folder", "new"]);
+            assert!(crate::merged::resolve_target(&h.db, &marker).is_ok());
+            assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+            FORCE_COPY.set(false);
+            h.scan(true);
+            let marker = crate::merged::read(&marker_path).unwrap();
+            assert_eq!(marker.target.relative_path, ["keep"]);
+            assert!(crate::merged::resolve_target(&h.db, &marker).is_ok());
+        }
+
+        #[test]
+        fn interrupted_copy_undo_removes_only_the_verified_original() {
+            let mut h = Harness::new("undo-copy-recovery");
+            let original = h.drive.join("original");
+            let folder = h.drive.join("folder");
+            let moved = folder.join("moved");
+            fs::create_dir(&folder).unwrap();
+            fs::write(&original, b"contents").unwrap();
+            h.scan(true);
+            FORCE_COPY.set(true);
+            let id = approve_and_move(&mut h, &original, &moved);
+            h.scan(true);
+
+            let op = plan_ops(&h.db, id).unwrap().remove(0);
+            super::super::linked_move::prepare_undo(&h.db, &op, &moved).unwrap();
+            // コピーを正式名に置いた直後、古いコピーを取り除く前で停止。
+            apply::copy_verify_and_publish(id, op.seq, &moved, &original).unwrap();
+            super::super::linked_move::record_undo_copy(&h.db, &op, &original).unwrap();
+
+            assert_eq!(undo_plan(&mut h.db, &h.ctx, id).unwrap().undone, 1);
+            FORCE_COPY.set(false);
+            assert_eq!(fs::read(&original).unwrap(), b"contents");
+            assert!(!moved.exists());
+        }
 
         fn old_time(index: u64) -> SystemTime {
             UNIX_EPOCH + Duration::new(1_500_000_000 + index, 123_456_700)

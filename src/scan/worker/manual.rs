@@ -8,7 +8,7 @@ use lisa_core::db::{Db, ErrorCode, ListingSave};
 use lisa_core::hash;
 use lisa_core::listing::{self, Kind};
 
-use super::{Message, RefreshRequest, Request, Worker, readable};
+use super::{Message, RefreshRequest, Request, RereadMode, Worker, readable};
 
 const RETRY_WAIT: Duration = Duration::from_millis(25);
 
@@ -212,11 +212,13 @@ impl Worker {
             for _ in 0..8 {
                 match self.requests.try_recv() {
                     Ok(Request::Visible(path)) => {
-                        self.hints.remove(&path);
+                        if !self.refresh_hints.contains(&path) {
+                            self.hints.remove(&path);
+                        }
                         if let Some(index) = self.root_of(&path)
                             && !self.is_skipped(&path)
                         {
-                            self.store_reread(index, &path, false);
+                            self.store_reread(index, &path, RereadMode::Detect);
                             self.promote_visible(&path);
                             self.hints.insert(path);
                             self.dirty = true;
@@ -224,7 +226,11 @@ impl Worker {
                         self.control.urgent.fetch_sub(1, Ordering::Relaxed);
                     }
                     Ok(Request::ManualWake) => {}
-                    Ok(request @ (Request::Hint(_) | Request::DebugForceChanged(_))) => {
+                    Ok(
+                        request @ (Request::Hint(_)
+                        | Request::Refresh(_)
+                        | Request::DebugForceChanged(_)),
+                    ) => {
                         if !self.handle(request) {
                             return error;
                         }
@@ -363,7 +369,10 @@ impl Worker {
                     self.dirty = true;
                 }
                 if matches!(saved, ListingSave::Changed) {
-                    self.send(Message::Changed { path: path.clone() });
+                    self.send(Message::Changed {
+                        path: path.clone(),
+                        refresh_children: None,
+                    });
                 }
                 self.send(Message::Listed {
                     path: path.clone(),
@@ -433,6 +442,7 @@ impl Worker {
                     if matches!(saved, ListingSave::Changed) {
                         self.send(Message::Changed {
                             path: parent.to_path_buf(),
+                            refresh_children: None,
                         });
                         self.send(Message::Listed {
                             path: parent.to_path_buf(),
@@ -665,6 +675,7 @@ mod tests {
             hash_stats_at: None,
             pending_visible: None,
             hints: Default::default(),
+            refresh_hints: Default::default(),
             skip_dirs: vec![],
         };
         worker.promote_visible(&first);
@@ -776,6 +787,7 @@ mod tests {
             hash_stats_at: None,
             pending_visible: None,
             hints: Default::default(),
+            refresh_hints: Default::default(),
             skip_dirs: vec![],
         };
 
@@ -813,7 +825,7 @@ mod tests {
         };
         // 普通のハッシュの途中で手動要求を積み、次の読み取り確認で譲る。
         fs::write(&normal_file, vec![7_u8; 2 * 1024 * 1024]).unwrap();
-        worker.store_reread(0, &normal_dir, false);
+        worker.store_reread(0, &normal_dir, RereadMode::Detect);
         let _ = messages.try_iter().count();
         let control = worker.control.clone();
         let background = super::super::Background::new(control.clone());

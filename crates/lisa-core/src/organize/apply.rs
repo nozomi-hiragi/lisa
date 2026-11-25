@@ -3,7 +3,7 @@
 //! - 同時に動く計画は 1 つだけ（プロセス内の Mutex と `<data_dir>/organize.lock` の OS ロック）。
 //! - 実行の順は `mkdir` → `move` → `trash`（それぞれ計画の `seq` 順）。
 //! - 1 件ごとに `running` を DB に書いて確定してから動かし、済んだら `done`（または `skipped` / `failed`）にする。
-//! - `entry` の表には直接書かない。触ったフォルダの一覧を返すので、アプリは `Request::Hint`、CLI / MCP は `Command::Rescan` で読み直させる。
+//! - 同じドライブ内の移動では `entry` を引き継ぐ。触ったフォルダの一覧は再走査に使う。
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, TryLockError};
@@ -233,13 +233,13 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
     let drives = query::drives(db).map_err(|e| e.to_string())?;
 
     // 1. 途中で落ちて `running` のままの操作があれば、ディスクの状態から `done` か `pending` に直す。
-    recover_running_ops(db, ctx, &drives, plan_id)?;
+    let mut linked_touched = Vec::new();
+    recover_running_ops(db, ctx, &drives, plan_id, &mut linked_touched)?;
 
     // 2. `mkdir` → `move` → `trash`（それぞれ seq 順）で `pending` の操作を実行する。
     let mut ops = plan::plan_ops(db, plan_id).map_err(|e| e.to_string())?;
     ops.sort_by_key(|o| (o.op.phase(), o.seq));
 
-    let mut linked_touched = Vec::new();
     for op in &ops {
         if op.state != OpState::Pending {
             continue;
@@ -323,6 +323,20 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             .err()
             .map(|reason| format!("隔離済み／目印を作成できませんでした: {reason}"));
 
+        if let Err(reason) = super::linked_move::prepare(db, op) {
+            plan::set_op_state(
+                db,
+                plan_id,
+                op.seq,
+                OpState::Skipped,
+                None,
+                Some(&reason),
+                Some(db::now_ms()),
+            )
+            .map_err(|e| e.to_string())?;
+            continue;
+        }
+
         // 1 件ごとに「始めた（running）」を DB に確定してから動かす。
         plan::set_op_state(
             db,
@@ -357,7 +371,14 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
             }
             result
         } else {
-            run_one_op(plan_id, op, drive_mount.as_deref(), &ctx.data_dir)
+            run_one_op(
+                db,
+                &drives,
+                plan_id,
+                op,
+                drive_mount.as_deref(),
+                &ctx.data_dir,
+            )
         };
         #[cfg(all(unix, feature = "verify-remote-keep"))]
         if remote.is_some()
@@ -377,6 +398,9 @@ pub fn execute_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<ApplyRep
                     Err(_) => preparation_warning,
                 };
                 let warning = join_reasons(warning.as_deref(), marker_warning);
+                let link_warning =
+                    super::linked_move::finish(db, ctx, op, false, &mut linked_touched);
+                let warning = join_reasons(warning.as_deref(), link_warning);
                 if op.op == OpKind::Mkdir {
                     plan::set_op_result_exact_dst(
                         db,
@@ -493,6 +517,8 @@ enum OpExecOutcome {
 }
 
 fn run_one_op(
+    db: &mut Db,
+    drives: &[Drive],
     plan_id: i64,
     op: &PlanOp,
     drive_mount: Option<&Path>,
@@ -530,10 +556,10 @@ fn run_one_op(
                 .parent()
                 .ok_or_else(|| "行き先の親フォルダがありません".to_string())?;
             if op.src.parent() == Some(dst_parent) {
-                return match rename_without_replace(&op.src, dst) {
-                    Ok(()) => Ok(OpExecOutcome::Done {
+                return match rename_with_entry(db, drives, &op.src, dst, rename_without_replace) {
+                    Ok(warning) => Ok(OpExecOutcome::Done {
                         exact_dst: None,
-                        warning: None,
+                        warning,
                     }),
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(
                         OpExecOutcome::Skipped("行き先にすでにファイルやフォルダがあります".into()),
@@ -542,15 +568,20 @@ fn run_one_op(
                 };
             }
             if use_rename(&op.src, dst_parent) {
-                match fs::rename(&op.src, dst) {
-                    Ok(()) => {
+                match rename_with_entry(db, drives, &op.src, dst, rename_without_replace) {
+                    Ok(warning) => {
                         return Ok(OpExecOutcome::Done {
                             exact_dst: None,
-                            warning: None,
+                            warning,
                         });
                     }
                     Err(e) if is_cross_device_error(&e) => {
                         // 別ボリューム扱いだったのでコピーへ切り替える。
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        return Ok(OpExecOutcome::Skipped(
+                            "行き先にすでにファイルやフォルダがあります".into(),
+                        ));
                     }
                     Err(e) => return Err(format!("移動できませんでした: {e}")),
                 }
@@ -586,6 +617,7 @@ fn recover_running_ops(
     ctx: &Context,
     drives: &[Drive],
     plan_id: i64,
+    linked_touched: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let ops = plan::plan_ops(db, plan_id).map_err(|e| e.to_string())?;
     for op in ops.into_iter().filter(|o| o.state == OpState::Running) {
@@ -624,13 +656,20 @@ fn recover_running_ops(
                 };
                 match (src_exists, dst_exists) {
                     (false, true) => {
+                        let dst = dst.expect("dst_exists is true");
+                        let warning = use_rename(dst, op.src.parent().expect("move has a parent"))
+                            .then(|| preserve_entry(db, drives, &op.src, dst))
+                            .flatten();
+                        let link_warning =
+                            super::linked_move::finish(db, ctx, &op, false, linked_touched);
+                        let warning = join_reasons(warning.as_deref(), link_warning);
                         plan::set_op_state(
                             db,
                             plan_id,
                             op.seq,
                             OpState::Done,
                             None,
-                            None,
+                            warning.as_deref(),
                             Some(now),
                         )
                         .map_err(|e| e.to_string())?;
@@ -656,8 +695,25 @@ fn recover_running_ops(
                                         Some(now),
                                     )
                                 };
-                            plan::set_op_state(db, plan_id, op.seq, state, None, reason, at)
-                                .map_err(|e| e.to_string())?;
+                            let warning = (state == OpState::Done)
+                                .then(|| preserve_entry(db, drives, &op.src, dst))
+                                .flatten();
+                            let link_warning = (state == OpState::Done)
+                                .then(|| {
+                                    super::linked_move::finish(db, ctx, &op, false, linked_touched)
+                                })
+                                .flatten();
+                            let warning = join_reasons(warning.as_deref(), link_warning);
+                            plan::set_op_state(
+                                db,
+                                plan_id,
+                                op.seq,
+                                state,
+                                None,
+                                reason.or(warning.as_deref()),
+                                at,
+                            )
+                            .map_err(|e| e.to_string())?;
                         } else {
                             let result = entries_match_content(&op.src, dst)
                                 .map_err(|e| format!("中断後の照合に失敗: {e}"))
@@ -675,7 +731,10 @@ fn recover_running_ops(
                                     .map_err(|e| format!("中断後の隔離に失敗: {e}"))
                                 });
                             let (state, reason) = match result {
-                                Ok(_) => (OpState::Done, None),
+                                Ok(_) => (
+                                    OpState::Done,
+                                    super::linked_move::finish(db, ctx, &op, false, linked_touched),
+                                ),
                                 Err(e) => (OpState::Failed, Some(e)),
                             };
                             plan::set_op_state(
@@ -790,6 +849,7 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
         ));
     }
 
+    let drives = query::drives(db).map_err(|e| e.to_string())?;
     let peer_managed = plan::peer_managed_plan(db, plan_id).map_err(|e| e.to_string())?;
     let mut ops = plan::plan_ops(db, plan_id).map_err(|e| e.to_string())?;
     super::remote_keep::check_overlap(
@@ -804,16 +864,31 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
     let mut undone = 0usize;
     let mut skipped = Vec::new();
     let mut undone_ops = Vec::new();
+    let mut linked_touched = Vec::new();
 
     for op in ops.into_iter().filter(|o| o.state == OpState::Done) {
         let retryable = peer_managed && op.op == OpKind::Trash && plan.purged_at.is_none();
-        match undo_one_op(&plan, &op) {
+        if op.op == OpKind::Move && super::linked_move::unfinished_local_move(db, &op)? {
+            super::linked_move::flush_moves(db, ctx)?;
+            if super::linked_move::unfinished_local_move(db, &op)? {
+                skipped.push(UndoSkipped {
+                    seq: op.seq,
+                    src: op.src,
+                    reason: "目印の書き換えが終わるまで取り消しを保留します".into(),
+                });
+                continue;
+            }
+        }
+        match undo_one_op(db, &drives, &plan, &op) {
             Ok(warning) => {
                 super::linked_delete::update_missing(db, &op, false)?;
                 let marker_warning = super::markers::remove_after_undo(db, &op)
                     .err()
                     .map(|reason| format!("復元済み／目印が残っています: {reason}"));
                 let warning = join_reasons(warning.as_deref(), marker_warning);
+                let link_warning =
+                    super::linked_move::finish(db, ctx, &op, true, &mut linked_touched);
+                let warning = join_reasons(warning.as_deref(), link_warning);
                 let reason = if retryable {
                     warning
                 } else {
@@ -840,7 +915,13 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
                 } else {
                     append_reason(reason, op.reason.as_deref())
                 };
-                let state = if retryable {
+                let copy_published =
+                    op.op == OpKind::Move && super::linked_move::undo_copy_matches(db, &op)?;
+                let state = if retryable
+                    || copy_published
+                    || (op.op == OpKind::Move
+                        && reason.starts_with(super::linked_move::SYNCHRONIZING))
+                {
                     OpState::Done
                 } else {
                     OpState::Skipped
@@ -878,7 +959,10 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
         plan::set_plan_state(db, plan_id, new_state, None).map_err(|e| e.to_string())?;
     }
 
-    let touched = touched_folders(&undone_ops);
+    let mut touched = touched_folders(&undone_ops);
+    touched.extend(linked_touched);
+    touched.sort_unstable();
+    touched.dedup();
     Ok(UndoReport {
         plan_id,
         state: new_state,
@@ -888,7 +972,12 @@ pub fn undo_plan(db: &mut Db, ctx: &Context, plan_id: i64) -> Result<UndoReport,
     })
 }
 
-fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<Option<String>, String> {
+fn undo_one_op(
+    db: &mut Db,
+    drives: &[Drive],
+    plan: &plan::Plan,
+    op: &PlanOp,
+) -> Result<Option<String>, String> {
     match op.op {
         OpKind::Trash => {
             if plan.purged_at.is_some() {
@@ -917,6 +1006,28 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<Option<String>, String>
             let Some(dst) = op.dst.as_deref() else {
                 return Err("移動先の記録がありません".into());
             };
+            if let Some(identity) = super::linked_move::undo_identity(db, op)?
+                && !super::move_destination_exists(&op.src, dst).map_err(|err| err.to_string())?
+                && super::file_identity(&op.src) == Some(identity)
+            {
+                return Ok(preserve_entry(db, drives, dst, &op.src));
+            }
+            if !super::move_destination_exists(&op.src, dst).map_err(|err| err.to_string())?
+                && super::linked_move::undo_marker_matches(db, op)?
+            {
+                return Ok(None);
+            }
+            if super::linked_move::undo_copy_matches(db, op)? {
+                if entry_exists(dst).map_err(|err| err.to_string())? {
+                    let expected = super::linked_move::undo_identity(db, op)?;
+                    if expected.is_none() || super::file_identity(dst) != expected {
+                        return Err("取り消し元が差し替えられました".into());
+                    }
+                    entries_match_content(dst, &op.src).map_err(|err| err.to_string())?;
+                    remove_any(dst).map_err(|err| err.to_string())?;
+                }
+                return Ok(None);
+            }
             let dst_meta = fs::symlink_metadata(dst)
                 .map_err(|_| "移動先にファイルやフォルダがありません".to_string())?;
             if super::move_destination_exists(dst, &op.src)
@@ -924,27 +1035,34 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<Option<String>, String>
             {
                 return Err("戻す先にすでにファイルやフォルダがあります".into());
             }
-            verify_unchanged_for_undo(op, &dst_meta)?;
+            let (size, mtime) = super::linked_move::undo_metadata(db, op)?;
+            verify_undo_metadata(size, mtime, &dst_meta)?;
             let Some(parent) = op.src.parent() else {
                 return Err("戻す先の親フォルダがありません".into());
             };
             if !parent.is_dir() {
                 return Err("戻す先の親フォルダがありません".into());
             }
+            super::linked_move::prepare_undo(db, op, dst)?;
             if dst.parent() == Some(parent) {
-                return rename_without_replace(dst, &op.src)
-                    .map(|()| None)
+                return rename_with_entry(db, drives, dst, &op.src, rename_without_replace)
                     .map_err(|e| format!("元の名前に戻せませんでした: {e}"));
             }
             if use_rename(dst, parent) {
-                match fs::rename(dst, &op.src) {
-                    Ok(()) => return Ok(None),
+                match rename_with_entry(db, drives, dst, &op.src, rename_without_replace) {
+                    Ok(warning) => return Ok(warning),
                     Err(e) if is_cross_device_error(&e) => {}
                     Err(e) => return Err(format!("元の場所へ戻せませんでした: {e}")),
                 }
             }
             // 別ボリュームの移動を戻す: コピーの内容と日時を確かめてから移動先を消す。
-            copy_verify_and_remove_src(plan.id, op.seq, dst, &op.src)
+            let warning = copy_verify_and_publish_with(plan.id, op.seq, dst, &op.src, |staged| {
+                super::linked_move::record_undo_copy(db, op, staged)
+            })?;
+            remove_any(dst).map_err(|e| {
+                append_reason(path_error(dst, "移動先の掃除", e), warning.as_deref())
+            })?;
+            Ok(warning)
         }
         OpKind::Mkdir => {
             // 元からあったフォルダ（dst が None）は消さない。
@@ -977,14 +1095,22 @@ fn undo_one_op(plan: &plan::Plan, op: &PlanOp) -> Result<Option<String>, String>
 }
 
 fn verify_unchanged_for_undo(op: &PlanOp, meta: &fs::Metadata) -> Result<(), String> {
+    verify_undo_metadata(op.size, op.mtime, meta)
+}
+
+fn verify_undo_metadata(
+    size: Option<u64>,
+    mtime: Option<i64>,
+    meta: &fs::Metadata,
+) -> Result<(), String> {
     let kind = check::meta_kind(meta);
     if kind == Kind::File
-        && let Some(rec_size) = op.size
+        && let Some(rec_size) = size
         && meta.len() != rec_size
     {
         return Err("大きさが変わったため戻しませんでした".into());
     }
-    if op.mtime.is_some() && listing::mtime_ms(meta) != op.mtime {
+    if mtime.is_some() && listing::mtime_ms(meta) != mtime {
         return Err("更新日時が変わったため戻しませんでした".into());
     }
     Ok(())
@@ -1033,6 +1159,50 @@ pub fn touched_folders(ops: &[PlanOp]) -> Vec<PathBuf> {
     set.into_iter().collect()
 }
 
+fn rename_with_entry(
+    db: &mut Db,
+    drives: &[Drive],
+    src: &Path,
+    dst: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<Option<String>> {
+    let Some((mount, drive_id)) = same_entry_drive(drives, src, dst) else {
+        rename(src, dst)?;
+        return Ok(None);
+    };
+    db.rename_preserving_entry(drive_id, mount, src, dst, rename)
+        .map(|error| error.map(entry_preservation_warning))
+}
+
+fn preserve_entry(db: &mut Db, drives: &[Drive], src: &Path, dst: &Path) -> Option<String> {
+    let (mount, drive_id) = same_entry_drive(drives, src, dst)?;
+    db.move_entry(drive_id, mount, src, dst)
+        .err()
+        .map(entry_preservation_warning)
+}
+
+fn same_entry_drive<'a>(
+    drives: &'a [Drive],
+    src: &Path,
+    dst: &Path,
+) -> Option<(&'a Path, &'a str)> {
+    let drive_at = |path: &Path| {
+        drives
+            .iter()
+            .filter_map(|drive| Some((drive.mount.as_deref()?, drive.id.as_str())))
+            .filter(|(mount, _)| path.starts_with(mount))
+            .max_by_key(|(mount, _)| mount.components().count())
+    };
+    let drive = drive_at(src)?;
+    (drive_at(dst) == Some(drive)).then_some(drive)
+}
+
+fn entry_preservation_warning(error: db::Error) -> String {
+    let reason = format!("移動のハッシュを引き継げませんでした。再走査します: {error}");
+    eprintln!("{reason}");
+    reason
+}
+
 fn drive_mount_of(drives: &[Drive], op: &PlanOp) -> Option<PathBuf> {
     if let Some(id) = op.drive_id.as_deref()
         && let Some(m) = drives
@@ -1065,7 +1235,7 @@ fn shallowest_missing_dir(path: &Path) -> Option<PathBuf> {
 
 // 事前確認のあとに別プロセスが同名項目を作っても、上書きせずに失敗する。
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(super) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::{CString, c_char, c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
 
@@ -1113,7 +1283,7 @@ pub(super) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileW;
 
@@ -1148,7 +1318,7 @@ pub(super) fn rename_without_replace(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-pub(super) fn rename_without_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
+pub(crate) fn rename_without_replace(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
@@ -1222,24 +1392,21 @@ pub(crate) fn copy_verify_and_quarantine(
     .map(|path| (path, warning))
 }
 
-/// 別ボリュームからの取り消し: 検証したコピーを元の場所へ置き、移動先を消す。
-fn copy_verify_and_remove_src(
-    plan_id: i64,
-    seq: i64,
-    src: &Path,
-    dst: &Path,
-) -> Result<Option<String>, String> {
-    let warning = copy_verify_and_publish(plan_id, seq, src, dst)?;
-    remove_any(src)
-        .map_err(|e| append_reason(path_error(src, "移動先の掃除", e), warning.as_deref()))?;
-    Ok(warning)
-}
-
 pub(super) fn copy_verify_and_publish(
     plan_id: i64,
     seq: i64,
     src: &Path,
     dst: &Path,
+) -> Result<Option<String>, String> {
+    copy_verify_and_publish_with(plan_id, seq, src, dst, |_| Ok(()))
+}
+
+fn copy_verify_and_publish_with(
+    plan_id: i64,
+    seq: i64,
+    src: &Path,
+    dst: &Path,
+    before_publish: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
     let parent = dst
         .parent()
@@ -1262,6 +1429,7 @@ pub(super) fn copy_verify_and_publish(
             entries_match_content(src, &copied).map_err(|e| format!("コピー元の再確認: {e}"))
         })
         .and_then(|()| {
+            before_publish(&copied)?;
             rename_after_collision_check(&copied, dst)
                 .map_err(|e| path_error(dst, "正式名への確定", e))
         });

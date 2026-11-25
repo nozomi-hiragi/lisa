@@ -6,7 +6,11 @@ use std::sync::mpsc;
 use bevy::prelude::*;
 use bevy::window::RequestRedraw;
 use bevy::winit::{EventLoopProxyWrapper, WinitUserEvent};
-use lisa_core::{db::Db, merged::Marker, query::Item};
+use lisa_core::{
+    db::Db,
+    merged::{Location, Marker},
+    query::Item,
+};
 
 use crate::lan::{LanState, SavedPeer};
 use crate::model::tree::{FileTree, LoadState, NodeId};
@@ -119,6 +123,7 @@ impl Children {
 }
 
 struct CachedChildren {
+    target: Location,
     checked_at: i64,
     children: Children,
 }
@@ -126,12 +131,13 @@ struct CachedChildren {
 struct Response {
     root: NodeId,
     incarnation: u64,
+    target: Location,
     result: Result<Children, ResolveError>,
 }
 
 #[derive(Default)]
 struct MarkerView {
-    open: Option<u64>,
+    open: Option<(u64, Location)>,
     receive: Option<std::sync::Mutex<mpsc::Receiver<Response>>>,
     observed: std::collections::HashMap<u64, i64>,
     cache: std::collections::HashMap<String, CachedChildren>,
@@ -211,11 +217,24 @@ fn folder_links(
     let peer = lan
         .as_deref()
         .and_then(|lan| lan.saved_peer(&marker.target.device_id));
-    if state.open != Some(incarnation) {
+    let current = (incarnation, marker.target.clone());
+    if state.open.as_ref() != Some(&current) {
+        if state
+            .open
+            .as_ref()
+            .is_some_and(|(open, _)| *open == incarnation)
+        {
+            state.open = None;
+            clear_view(&mut tree, root);
+            state.observed.remove(&incarnation);
+            state.cache.remove(&marker.link_id);
+            changed.pending = true;
+            redraw.write(RequestRedraw);
+        }
         if state.receive.is_some() {
             return;
         }
-        state.open = Some(incarnation);
+        state.open = Some(current);
         let cyclic = nav
             .stack
             .iter()
@@ -245,6 +264,7 @@ fn folder_links(
                         result,
                         root,
                         incarnation,
+                        target: marker.target,
                     });
                     if let Some(proxy) = proxy {
                         let _ = proxy.send_event(WinitUserEvent::WakeUp);
@@ -261,10 +281,13 @@ fn folder_links(
         redraw.write(RequestRedraw);
     }
     if let Some(response) = response {
-        if response.root != root || response.incarnation != incarnation {
+        let metadata = tree.nodes[root].merged.as_ref().expect("リンクのフォルダ");
+        if response.root != root
+            || response.incarnation != incarnation
+            || response.target != metadata.target
+        {
             return;
         }
-        let metadata = tree.nodes[root].merged.as_ref().expect("リンクのフォルダ");
         let link_id = metadata.link_id.clone();
         let target_name = metadata.target.device_name.clone();
         let message = match response.result {
@@ -285,6 +308,7 @@ fn folder_links(
                     state.cache.insert(
                         link_id.clone(),
                         CachedChildren {
+                            target: response.target,
                             checked_at: now,
                             children: children.clone(),
                         },
@@ -313,7 +337,11 @@ fn folder_links(
                         "{message}／前回確認 {}（閲覧のみ）",
                         crate::ui::tooltip::format_local(*at)
                     )
-                } else if let Some(cached) = state.cache.get(&link_id) {
+                } else if let Some(cached) = state
+                    .cache
+                    .get(&link_id)
+                    .filter(|cached| cached.target == response.target)
+                {
                     cached.children.clone().attach(&mut tree, root);
                     format!(
                         "{message}／前回確認 {}（閲覧のみ）",
